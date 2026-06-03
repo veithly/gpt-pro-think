@@ -54,7 +54,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 
 `--resume` reads the per-session state file and skips stages already marked `done`; stages with an unmet precondition are re-run. See [references/script-architecture.md](references/script-architecture.md) for the state schema.
 
-### Multi-turn with `--continue`
+### Multi-turn with `--continue` (preferred when you know upfront)
 
 For conversations where later prompts depend on earlier responses, pass `--continue` (alias `-C`) on **every** turn, including the first. This:
 
@@ -64,7 +64,11 @@ For conversations where later prompts depend on earlier responses, pass `--conti
 - Implies `--keep-session` so the tab stays open between turns
 - Saves each turn to `gpt-pro-response-<createdAt>-turn-<N>.md` plus a `gpt-pro-response-<createdAt>.md` "latest" file
 
-If you forget `--continue` on turn 1, the session gets closed after that turn and the conversation is lost. There is no way to recover the ChatGPT history after the tab is closed, so make `--continue` the default for any flow that's known to need follow-ups.
+### Auto-recovery from the conversation history (when you forgot `--continue`)
+
+If you didn't use `--continue` and the script closed the tab after a run, the next run on the same `--session` will automatically recover the conversation by **navigating to the saved ChatGPT URL** and verifying messages loaded (up to 8 s wait, polled every second). The URL is captured at the end of every successful `extract` stage. If the URL is stale (conversation deleted, or you're signed out), the script falls back to **searching the sidebar by conversation title** and clicking the match.
+
+Pass `--fresh` to skip recovery and start a brand new conversation (useful when the prior thread is no longer relevant).
 
 Examples:
 ```bash

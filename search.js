@@ -153,6 +153,9 @@ function newState(session, opts) {
     promptSource: opts.promptSource || '',
     output: opts.output || '',
     model: opts.model || 'auto',
+    conversationUrl: '',
+    conversationTitle: '',
+    turns: 0,
     stages: {},
   };
 }
@@ -201,7 +204,7 @@ async function stageOpen(state, opts) {
       log(`open: reusing existing tab ${existing.tabId} (${existing.url})`);
       return { skipped: true, data: state.stages.open.data };
     }
-    log(`open: state says done but tab is gone, re-opening`);
+    log(`open: state says done but tab is gone, will attempt recovery`);
     clearStage(state, 'open');
     // also clear downstream stages since the tab context changed
     for (const n of STAGE_NAMES) if (n !== 'open') clearStage(state, n);
@@ -212,17 +215,127 @@ async function stageOpen(state, opts) {
     log(`open: reusing existing tab ${tab.tabId} (${tab.url})`);
     data = { tabId: tab.tabId, url: tab.url, reused: true };
   } else {
+    // Try to recover the previous conversation if we have its URL.
+    // Skip recovery if --fresh is set (start a brand new conversation).
+    let navUrl = 'https://chatgpt.com/';
+    let recovered = false;
+    if (!opts.fresh && state.conversationUrl && /\/c\//.test(state.conversationUrl)) {
+      log(`recovering conversation from URL: ${state.conversationUrl}`);
+      navUrl = state.conversationUrl;
+    }
     const r = unwrap(
-      await cmd('navigate', { url: 'https://chatgpt.com/', newTab: true, group_title: `GPT Pro Search - ${state.session}` }, state.session),
+      await cmd('navigate', { url: navUrl, newTab: true, group_title: `GPT Pro Search - ${state.session}` }, state.session),
       'navigate'
     );
-    data = { tabId: r.tabId, url: r.url || 'https://chatgpt.com/', reused: false };
+    data = { tabId: r.tabId, url: r.url || navUrl, reused: false, recovered: false };
     log(`open: created tab ${data.tabId} (${data.url})`);
+    await sleep(3000); // let the SPA hydrate
+
+    // Verify the conversation actually loaded. If the URL was for a deleted
+    // conversation, ChatGPT redirects to chatgpt.com and the page is empty.
+    if (!opts.fresh && state.conversationUrl && /\/c\//.test(navUrl)) {
+      const loaded = await waitForMessages(state.session, 8);
+      if (loaded && loaded.msgCount > 0) {
+        log(`recovery: ${loaded.msgCount} message(s) loaded from ${loaded.url}`);
+        data.recovered = true;
+        data.url = loaded.url;
+      } else {
+        log(`recovery: URL didn't resolve to a conversation (count=${loaded && loaded.msgCount}, url=${loaded && loaded.url})`);
+        log(`recovery: falling back to sidebar search by title "${state.conversationTitle}"`);
+        // First re-navigate to chatgpt.com to make sure the sidebar is visible
+        await cmd('navigate', { url: 'https://chatgpt.com/', newTab: false }, state.session);
+        await sleep(2500);
+        const searchResult = await searchSidebarForConversation(state.session, state.conversationTitle);
+        if (searchResult && searchResult.found) {
+          log(`recovery: found "${searchResult.text}" in sidebar, clicking...`);
+          const clicked = await evaluate(
+            state.session,
+            `(() => { const links = [...document.querySelectorAll('a[href*="/c/"]')]; const link = links.find(a => (a.innerText || '').trim() === ${JSON.stringify(searchResult.text)}); if (link) { link.click(); return true; } return false; })()`
+          );
+          if (clicked) {
+            const after = await waitForMessages(state.session, 12);
+            if (after && after.msgCount > 0 && after.url.indexOf('/c/') >= 0) {
+              log(`recovery: sidebar click worked, ${after.msgCount} message(s) at ${after.url}`);
+              data.recovered = true;
+              data.url = after.url;
+            } else {
+              log(`recovery: sidebar click did not load a conversation; starting fresh`);
+            }
+          }
+        } else {
+          log(`recovery: no matching conversation in sidebar; starting fresh`);
+        }
+      }
+    } else if (!opts.fresh && state.conversationTitle) {
+      // No URL, but we have a title. Open chatgpt.com and search the sidebar.
+      log(`no prior URL, trying sidebar search for "${state.conversationTitle}"`);
+      const searchResult = await searchSidebarForConversation(state.session, state.conversationTitle);
+      if (searchResult && searchResult.found) {
+        log(`recovery: found "${searchResult.text}" in sidebar, clicking...`);
+        const clicked = await evaluate(
+          state.session,
+          `(() => { const links = [...document.querySelectorAll('a[href*="/c/"]')]; const link = links.find(a => (a.innerText || '').trim() === ${JSON.stringify(searchResult.text)}); if (link) { link.click(); return true; } return false; })()`
+        );
+        if (clicked) {
+          const after = await waitForMessages(state.session, 12);
+          if (after && after.msgCount > 0 && after.url.indexOf('/c/') >= 0) {
+            log(`recovery: ${after.msgCount} message(s) at ${after.url}`);
+            data.recovered = true;
+            data.url = after.url;
+          }
+        }
+      }
+    }
   }
-  await sleep(3000); // let the SPA hydrate
   markStage(state, 'open', data);
   saveState(state);
   return { skipped: false, data };
+}
+
+async function searchSidebarForConversation(session, title) {
+  if (!title) return null;
+  return evaluate(
+    session,
+    `(() => { const links = [...document.querySelectorAll('a[href*="/c/"]')]; const target = ${JSON.stringify(title)}; let match = links.find(a => (a.innerText || '').trim() === target); if (match) return { found: true, text: (match.innerText || '').trim(), href: match.getAttribute('href') }; match = links.find(a => { const t = (a.innerText || '').trim(); return t && (t === target || t.startsWith(target) || target.startsWith(t)); }); if (match) return { found: true, text: (match.innerText || '').trim(), href: match.getAttribute('href'), partial: true }; return { found: false, candidates: links.slice(0, 10).map(a => (a.innerText || '').trim().slice(0, 50)) }; })()`
+  );
+}
+
+async function waitForMessages(session, maxSeconds) {
+  // Poll for messages to appear in the DOM. Returns {msgCount, url} or {msgCount:0, url}.
+  const deadline = Date.now() + maxSeconds * 1000;
+  let last = null;
+  while (Date.now() < deadline) {
+    const v = await evaluate(
+      session,
+      `(() => { const m = document.querySelectorAll('[data-message-author-role]'); return JSON.stringify({ msgCount: m.length, url: location.href }); })()`
+    );
+    if (v && v.msgCount > 0) return v;
+    last = v;
+    await sleep(1000);
+  }
+  return last || { msgCount: 0, url: '' };
+}
+
+async function captureConversationContext(state) {
+  try {
+    const info = await evaluate(
+      state.session,
+      `(() => ({ url: location.href, title: document.title }))()`
+    );
+    if (!info) return;
+    if (info.url && /\/c\//.test(info.url)) {
+      state.conversationUrl = info.url;
+      log(`captured conversation URL: ${info.url}`);
+    }
+    const cleanTitle = (info.title || '').replace(/^ChatGPT\s*[-—–]\s*/i, '').trim();
+    if (cleanTitle && cleanTitle !== 'ChatGPT' && cleanTitle.length < 200) {
+      state.conversationTitle = cleanTitle;
+      log(`captured conversation title: ${cleanTitle}`);
+    }
+    saveState(state);
+  } catch (e) {
+    log(`conversation context capture failed: ${e.message}`);
+  }
 }
 
 async function stageLoginCheck(state) {
@@ -381,6 +494,11 @@ async function stageExtract(state, opts) {
   markStage(state, 'extract', data);
   state.output = out;
   saveState(state);
+  // Capture conversation URL and title for future recovery (sidebar navigation).
+  // No-op if already captured (e.g. on a re-extract).
+  if (!state.conversationUrl || !/\/c\//.test(state.conversationUrl)) {
+    await captureConversationContext(state);
+  }
   return { skipped: false, data };
 }
 
@@ -604,6 +722,8 @@ Global flags (can appear before or after the subcommand):
   -C, --continue       Send a follow-up turn in the same ChatGPT conversation
                         (reuses the tab, keeps session open, re-runs send/wait/extract,
                         saves to gpt-pro-response-<ts>-turn-<N>.md)
+      --fresh          Skip auto-recovery from the conversation history sidebar
+                        (start a brand new conversation, even if state has a prior URL)
       --cleanup-state  Delete the state file when finished
       --dry-run        Like run but stop after ensure-model
       --status         Health check only, no session
@@ -656,6 +776,7 @@ function parseArgs(argv) {
     resume: false,
     keepSession: false,
     continueMode: false,
+    fresh: false,
     cleanupState: false,
     dryRun: false,
     statusOnly: false,
@@ -675,6 +796,7 @@ function parseArgs(argv) {
     else if (a === '--resume') opts.resume = true;
     else if (a === '--keep-session') opts.keepSession = true;
     else if (a === '--continue' || a === '-C') opts.continueMode = true;
+    else if (a === '--fresh') opts.fresh = true;
     else if (a === '--cleanup-state') opts.cleanupState = true;
     else if (a === '-f' || a === '--file') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); }
     else if (a === '-s' || a === '--session') { opts.session = argv[++i] || opts.session; }
