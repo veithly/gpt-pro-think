@@ -23,6 +23,13 @@ node ~/.claude/skills/gpt-pro-think/search.js -f ./prompt.md -o ./answer.md --js
 # Resume a previous run that was interrupted (skips already-done stages)
 node ~/.claude/skills/gpt-pro-think/search.js --resume
 
+# Multi-turn conversation: each --continue pushes another turn into the same
+# ChatGPT tab so the model keeps the context. Use --continue on EVERY turn,
+# including the first one, to keep the tab open.
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue "Explain X."
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue "Now give me an example."
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue "How would you test that?"
+
 # Health check / dry-run / all options
 node ~/.claude/skills/gpt-pro-think/search.js --status
 node ~/.claude/skills/gpt-pro-think/search.js --dry-run --model extended
@@ -46,6 +53,18 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 | `run` (default) | All of the above in order | — | — |
 
 `--resume` reads the per-session state file and skips stages already marked `done`; stages with an unmet precondition are re-run. See [references/script-architecture.md](references/script-architecture.md) for the state schema.
+
+### Multi-turn with `--continue`
+
+For conversations where later prompts depend on earlier responses, pass `--continue` (alias `-C`) on **every** turn, including the first. This:
+
+- Reuses the same ChatGPT tab so context is preserved
+- Uses `document.execCommand('insertText')` instead of `fill` to avoid clobbering an unsent draft
+- Forces `send` / `wait` / `extract` to re-run even if state shows them as done
+- Implies `--keep-session` so the tab stays open between turns
+- Saves each turn to `gpt-pro-response-<createdAt>-turn-<N>.md` plus a `gpt-pro-response-<createdAt>.md` "latest" file
+
+If you forget `--continue` on turn 1, the session gets closed after that turn and the conversation is lost. There is no way to recover the ChatGPT history after the tab is closed, so make `--continue` the default for any flow that's known to need follow-ups.
 
 Examples:
 ```bash

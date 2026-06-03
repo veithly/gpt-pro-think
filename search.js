@@ -271,27 +271,47 @@ async function stageSend(state, opts) {
   const prompt = state.prompt;
   if (!prompt) throw new Error('send: no prompt in state — pass a prompt on the CLI or use --resume with prior state');
   const prior = state.stages.send;
-  if (prior && prior.done && prior.data && prior.data.prompt === prompt) {
+  // In --continue mode, always re-send even if the prompt matches the prior turn
+  // (the user is explicitly asking to push another turn into the conversation).
+  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.prompt === prompt) {
     return { skipped: true, data: prior.data };
   }
   log(`clicking input...`);
   unwrap(await cmd('click', { selector: '[contenteditable="true"]' }, state.session), 'click input');
   await sleep(300);
-  log(`filling ${prompt.length} chars...`);
-  const fillRes = unwrap(await cmd('fill', { selector: '[contenteditable="true"]', value: prompt }, state.session), 'fill');
-  if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
+  if (opts.continueMode) {
+    // In continue mode, the input should be empty (previous turn was sent), but
+    // use insertText (not fill) so we never accidentally clobber an unsent draft.
+    log(`appending ${prompt.length} chars (continue mode)...`);
+    const inserted = await evaluate(
+      state.session,
+      `(() => { const ce = document.querySelector('[contenteditable="true"]'); if (!ce) return JSON.stringify({err:'no input'}); ce.focus(); const sel = window.getSelection(); const range = document.createRange(); range.selectNodeContents(ce); range.collapse(false); sel.removeAllRanges(); sel.addRange(range); const ok = document.execCommand('insertText', false, ${JSON.stringify(prompt)}); return JSON.stringify({ok, len: ce.innerText.length}); })()`
+    );
+    if (!inserted || !inserted.ok) throw new Error('send: failed to insert text into contenteditable');
+  } else {
+    log(`filling ${prompt.length} chars...`);
+    const fillRes = unwrap(await cmd('fill', { selector: '[contenteditable="true"]', value: prompt }, state.session), 'fill');
+    if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
+  }
   await sleep(300);
   log('clicking send...');
   unwrap(await cmd('click', { selector: '[data-testid="send-button"]' }, state.session), 'click send');
-  const data = { chars: prompt.length, fillMode: (fillRes && fillRes.mode) || 'value', prompt };
+  const data = {
+    chars: prompt.length,
+    mode: opts.continueMode ? 'continue-insert' : 'replace',
+    prompt,
+    turn: (state.turns || 0) + 1,
+  };
   markStage(state, 'send', data);
   state.prompt = prompt;
+  state.turns = data.turn;
   saveState(state);
   return { skipped: false, data };
 }
 
 async function stageWait(state, opts) {
-  if (state.stages.wait && state.stages.wait.done) {
+  // In --continue mode, always re-wait for the new response
+  if (!opts.continueMode && state.stages.wait && state.stages.wait.done) {
     return { skipped: true, data: state.stages.wait.data };
   }
   const maxWait = opts.wait || 900;
@@ -325,7 +345,8 @@ async function stageWait(state, opts) {
 }
 
 async function stageExtract(state, opts) {
-  if (state.stages.extract && state.stages.extract.done) {
+  // In --continue mode, always re-extract to get the latest response
+  if (!opts.continueMode && state.stages.extract && state.stages.extract.done) {
     return { skipped: true, data: state.stages.extract.data };
   }
   const extracted = await extractLastAssistant(state.session);
@@ -335,10 +356,28 @@ async function stageExtract(state, opts) {
     e.stageData = { error: extracted.error };
     throw e;
   }
-  const out = state.output || `gpt-pro-response-${Date.now()}.md`;
+  // File naming:
+  //   explicit --output:  used as-is (overwrites on each turn — caller's choice)
+  //   continue mode:      gpt-pro-response-<createdAt>-turn-<N>.md, one per turn
+  //                       PLUS a "latest" file with the current turn's content
+  //   normal mode:        gpt-pro-response-<Date.now()>.md (overwrites; one-off)
+  let out, latest;
+  if (opts.continueMode) {
+    const turn = state.turns || 1;
+    out = `gpt-pro-response-${state.createdAt || Date.now()}-turn-${turn}.md`;
+    latest = `gpt-pro-response-${state.createdAt || Date.now()}.md`;
+  } else if (state.output) {
+    out = state.output;
+  } else {
+    out = `gpt-pro-response-${Date.now()}.md`;
+  }
   fs.writeFileSync(out, extracted.text, 'utf8');
   log(`saved -> ${out}`);
-  const data = { length: extracted.text.length, path: out };
+  if (latest) {
+    fs.writeFileSync(latest, extracted.text, 'utf8');
+    log(`latest -> ${latest}`);
+  }
+  const data = { length: extracted.text.length, path: out, turn: state.turns || 1 };
   markStage(state, 'extract', data);
   state.output = out;
   saveState(state);
@@ -562,6 +601,9 @@ Global flags (can appear before or after the subcommand):
   -i, --interval SEC   Poll interval (default: 30)
       --resume         Skip stages already marked done in state file
       --keep-session   Do not close the browser tab when finished
+  -C, --continue       Send a follow-up turn in the same ChatGPT conversation
+                        (reuses the tab, keeps session open, re-runs send/wait/extract,
+                        saves to gpt-pro-response-<ts>-turn-<N>.md)
       --cleanup-state  Delete the state file when finished
       --dry-run        Like run but stop after ensure-model
       --status         Health check only, no session
@@ -579,7 +621,9 @@ Exit codes:
 State file: <script dir>/state/<session>.json
   - Auto-created on first run.
   - Each successful stage is marked done; --resume skips done stages.
-  - For 'send', the stage re-runs if the new prompt differs from the stored one.
+  - For 'send', the stage re-runs if the new prompt differs from the stored one
+    (or always re-runs under --continue).
+  - state.turns tracks the number of completed turns in the conversation.
 
 Examples:
   search.js "What is 2+2? Reply with just the number."
@@ -592,6 +636,11 @@ Examples:
   search.js send "now actually send it"
   search.js --resume                # pick up where a previous run left off
   search.js --resume --wait 1800    # resume with longer timeout
+
+  # Multi-turn conversation (keeps context between prompts)
+  search.js -s my-thread "Explain quantum entanglement in one paragraph."
+  search.js -s my-thread --continue "Now give me a concrete example."
+  search.js -s my-thread --continue "How would you test this experimentally?"
 `);
 }
 
@@ -606,6 +655,7 @@ function parseArgs(argv) {
     interval: 30,
     resume: false,
     keepSession: false,
+    continueMode: false,
     cleanupState: false,
     dryRun: false,
     statusOnly: false,
@@ -624,6 +674,7 @@ function parseArgs(argv) {
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--resume') opts.resume = true;
     else if (a === '--keep-session') opts.keepSession = true;
+    else if (a === '--continue' || a === '-C') opts.continueMode = true;
     else if (a === '--cleanup-state') opts.cleanupState = true;
     else if (a === '-f' || a === '--file') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); }
     else if (a === '-s' || a === '--session') { opts.session = argv[++i] || opts.session; }
@@ -653,6 +704,7 @@ function parseArgs(argv) {
         const ch = letters[j];
         if (ch === 'v') opts.verbose = true;
         else if (ch === 'h') opts.help = true;
+        else if (ch === 'C') opts.continueMode = true;
         else if (ch === 'f') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); consumed = true; break; }
         else if (ch === 's') { opts.session = argv[++i] || opts.session; consumed = true; break; }
         else if (ch === 'o') { opts.output = argv[++i] || ''; consumed = true; break; }
@@ -821,7 +873,9 @@ async function main() {
 
   // --- Success ---
 
-  // Final cleanup
+  // Final cleanup — --continue implies --keep-session so the tab stays open
+  // for follow-up turns.
+  if (opts.continueMode) opts.keepSession = true;
   if (opts.subcommand === 'run' && !opts.dryRun) {
     try { await stageCleanup(state, opts); } catch (e) { log(`cleanup warning: ${e.message}`); }
   } else if (opts.subcommand !== 'cleanup' && !opts.keepSession && opts.subcommand !== 'status') {
