@@ -52,8 +52,11 @@ pitch/gpt-pro/
 |---|---|
 | `fill` returns "No node with given id" | Click the input first, then retry `fill` |
 | Model not switching | Take a snapshot, find the composer pill, dispatch the pointer-event sequence (see [dom-selectors.md](dom-selectors.md)), then click the desired menuitemradio |
-| Response timeout (>15 min) | Screenshot the tab — may have hit rate limit, captcha, or login wall |
+| Tool not switching | Open **Add files and more**, choose `Deep research` / `Web search` manually, then run `search.js ensure-tool deep-research --resume` |
+| Response timeout (>20 min) | Run `search.js -s <session> latest --wait 1200`; for Deep research use `--wait 5400`; screenshot the tab if it still times out — may have hit rate limit, captcha, or login wall |
 | Empty response extraction | Try `[data-message-author-role=assistant]` first, then `.markdown` fallback, then full body text |
+| File upload failed | Confirm paths are regular files; default selector is `input#upload-files[type="file"]`; retry with `--upload-selector` if ChatGPT DOM changed; `Not allowed` usually means the Kimi WebBridge extension needs **Allow access to file URLs** / **允许访问文件网址** enabled |
+| Generated image not saved | Run `search.js -s <session> latest --image --image-dir <dir>`; if candidates exist but saving fails, inspect the manifest and image DOM |
 | Rate limit ("Please wait") | Wait 60s, retry. Stagger parallel sends by 30s |
 | ChatGPT not logged in | Ask user to log in manually, then re-run `search.js` |
 | Click `Uncaught` SyntaxError | Selector contains single quotes — switch to double quotes or no quotes (see [dom-selectors.md](dom-selectors.md)) |
@@ -66,8 +69,10 @@ pitch/gpt-pro/
 | Health check | 30s |
 | Prepare 3 prompts | 5-10 min |
 | Open 3 tabs + verify Extended | 2-3 min |
+| Select Deep research / Web search | 30s-1 min |
 | Send prompts | 1-2 min |
-| Wait for parallel responses | 10-15 min |
+| Wait for parallel responses | 10-20 min |
+| Wait for Deep research | 20-60+ min |
 | Extract + save | 2-3 min |
 | Synthesize + final decision (if ≥3 prompts) | 15-20 min |
 | **Total (3 prompts, no synthesis)** | **~20-30 min** |

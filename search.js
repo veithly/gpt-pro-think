@@ -2,7 +2,8 @@
 // search.js - Drive ChatGPT Pro (or Pro Extended) via kimi-webbridge.
 //
 // Default entry: `search.js "Your prompt"` runs the full pipeline.
-// Sub-commands: open | login-check | ensure-model | send | wait | extract
+// Sub-commands: open | login-check | ensure-model | ensure-tool | upload
+//               | send | wait | extract | image | extract-images | latest
 //               | status | cleanup | run
 // Per-session state file: <script dir>/state/<session>.json
 // `--resume` skips stages already marked done.
@@ -23,11 +24,114 @@ const STATUS_BIN = path.join(
 );
 const STATE_DIR = path.join(__dirname, 'state');
 const STATE_VERSION = 1;
-const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'send', 'wait', 'extract'];
+const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractImages'];
 const CHATGPT_HOST_RE = /^https?:\/\/(www\.)?chatgpt\.com\//;
+const DEFAULT_WAIT_SECONDS = 1200;
+const DEFAULT_DEEP_RESEARCH_WAIT_SECONDS = 3600;
+const DEFAULT_INTERVAL_SECONDS = 15;
+const DEFAULT_MIN_RESPONSE_CHARS = 240;
+const DEFAULT_STABLE_SECONDS = 60;
+const DEFAULT_IMAGE_DIR = 'gpt-pro-images';
+const DEFAULT_IMAGE_COUNT = 1;
+const DEFAULT_MAX_IMAGES = 8;
+const DEFAULT_IMAGE_MODEL = 'instant';
+const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
+const DEFAULT_UPLOAD_WAIT_SECONDS = 60;
+const DEFAULT_TOOL = 'auto';
+
+const TOOL_TARGETS = {
+  'deep-research': {
+    label: 'Deep research',
+    labels: ['Deep research', 'Deep Research', 'Deep search', 'Deep Search', '深度研究', '深度搜索'],
+  },
+  'web-search': {
+    label: 'Web search',
+    labels: ['Web search', 'Web Search', 'Search the web', 'Browse', '联网搜索', '网页搜索', '网络搜索', '搜索网页'],
+    activeLabels: ['Search', 'Web search', 'Web Search', '联网搜索', '网页搜索', '网络搜索', '搜索网页'],
+  },
+  'create-image': {
+    label: 'Create image',
+    labels: ['Create image', 'Create Image', 'Image', '创建图像', '创建图片', '生成图片', '图像生成'],
+  },
+};
+
+const IMAGE_COLLECTOR_JS = `
+  const collectMeaningfulImages = (root) => {
+    if (!root) return [];
+    const seen = new Set();
+    return [...root.querySelectorAll('img')].map((img, index) => {
+      const rect = img.getBoundingClientRect();
+      const style = window.getComputedStyle(img);
+      const src = img.currentSrc || img.src || img.getAttribute('src') || '';
+      const alt = img.getAttribute('alt') || '';
+      const className = typeof img.className === 'string' ? img.className : '';
+      const width = img.naturalWidth || Math.round(rect.width) || 0;
+      const height = img.naturalHeight || Math.round(rect.height) || 0;
+      const descriptor = [alt, className, src].join(' ');
+      const chatgptGenerated = /Generated image|imagegen|backend-api\\/estuary\\/content/i.test(descriptor);
+      const ready = !!img.complete || (chatgptGenerated && /^https?:\\/\\/chatgpt\\.com\\/backend-api\\/estuary\\/content/i.test(src));
+      return {
+        index,
+        src,
+        alt,
+        className: className.slice(0, 160),
+        width,
+        height,
+        rectWidth: Math.round(rect.width) || 0,
+        rectHeight: Math.round(rect.height) || 0,
+        complete: !!img.complete,
+        ready,
+        visible: rect.width > 32 && rect.height > 32 && style.display !== 'none' && style.visibility !== 'hidden'
+      };
+    }).filter((img) => {
+      if (!img.src || seen.has(img.src)) return false;
+      seen.add(img.src);
+      const w = img.width || img.rectWidth || 0;
+      const h = img.height || img.rectHeight || 0;
+      if (!img.visible) return false;
+      if (w < 128 || h < 128) return false;
+      if (w * h < 65536) return false;
+      const filterDescriptor = [img.alt, img.className, img.src].join(' ');
+      if (/avatar|profile|user|icon|emoji|logo/i.test(filterDescriptor) && Math.max(w, h) < 512) return false;
+      return true;
+    });
+  };
+`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.error('[search]', ...a);
+
+function normalizeModelName(model) {
+  const value = String(model || 'auto').trim().toLowerCase();
+  if (value === 'extended-pro') return 'extended';
+  if (value === 'think') return 'thinking';
+  return value || 'auto';
+}
+
+function normalizeToolName(tool) {
+  const value = String(tool || DEFAULT_TOOL).trim().toLowerCase().replace(/_/g, '-');
+  if (!value || value === 'default') return DEFAULT_TOOL;
+  if (value === 'off' || value === 'clear' || value === 'disable' || value === 'disabled' || value === 'no-tool') return 'none';
+  if (value === 'deep' || value === 'research' || value === 'deepresearch' || value === 'deep-research' || value === 'deep-search') return 'deep-research';
+  if (value === 'web' || value === 'search' || value === 'browse' || value === 'websearch' || value === 'web-search') return 'web-search';
+  if (value === 'image' || value === 'images' || value === 'create-image' || value === 'image-generation') return 'create-image';
+  if (value === 'auto' || value === 'none') return value;
+  return value;
+}
+
+function toolLabel(tool) {
+  const target = TOOL_TARGETS[normalizeToolName(tool)];
+  return target ? target.label : String(tool || DEFAULT_TOOL);
+}
+
+function normalizeUploadFiles(files) {
+  const list = Array.isArray(files) ? files : [];
+  return [...new Set(list.filter(Boolean).map((file) => path.resolve(String(file))))];
+}
+
+function uploadSignature(files) {
+  return JSON.stringify(normalizeUploadFiles(files));
+}
 
 // --- Daemon RPC --------------------------------------------------------------
 
@@ -152,9 +256,15 @@ function newState(session, opts) {
     prompt: opts.prompt || '',
     promptSource: opts.promptSource || '',
     output: opts.output || '',
+    uploads: normalizeUploadFiles(opts.uploads || []),
+    uploadSelector: opts.uploadSelector || DEFAULT_UPLOAD_SELECTOR,
+    imageDir: opts.imageDir || '',
+    imagePrefix: opts.imagePrefix || '',
     model: opts.model || 'auto',
+    tool: normalizeToolName(opts.tool || DEFAULT_TOOL),
     conversationUrl: '',
     conversationTitle: '',
+    images: [],
     turns: 0,
     stages: {},
   };
@@ -197,6 +307,7 @@ async function findChatgptTab(session) {
 // --- Stages ------------------------------------------------------------------
 
 async function stageOpen(state, opts) {
+  let lostPriorTab = false;
   if (state.stages.open && state.stages.open.done) {
     // Pre-flight: is the tab still there?
     const existing = await findChatgptTab(state.session);
@@ -205,9 +316,8 @@ async function stageOpen(state, opts) {
       return { skipped: true, data: state.stages.open.data };
     }
     log(`open: state says done but tab is gone, will attempt recovery`);
+    lostPriorTab = true;
     clearStage(state, 'open');
-    // also clear downstream stages since the tab context changed
-    for (const n of STAGE_NAMES) if (n !== 'open') clearStage(state, n);
   }
   const tab = await findChatgptTab(state.session);
   let data;
@@ -287,6 +397,13 @@ async function stageOpen(state, opts) {
       }
     }
   }
+  if (lostPriorTab && !data.recovered && !data.reused) {
+    log(`open: prior tab was not recovered; clearing downstream stages`);
+    for (const n of STAGE_NAMES) if (n !== 'open') clearStage(state, n);
+  }
+  if (data.url && /\/c\//.test(data.url)) {
+    state.conversationUrl = data.url;
+  }
   markStage(state, 'open', data);
   saveState(state);
   return { skipped: false, data };
@@ -314,6 +431,61 @@ async function waitForMessages(session, maxSeconds) {
     await sleep(1000);
   }
   return last || { msgCount: 0, url: '' };
+}
+
+async function getConversationProgress(session) {
+  const v = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const attrText = (el) => [el.getAttribute('aria-label'), el.getAttribute('data-testid'), textOf(el)].filter(Boolean).join(' ');
+      ${IMAGE_COLLECTOR_JS}
+      const assistants = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+      const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+      const messages = [...document.querySelectorAll('[data-message-author-role]')];
+      const imageRoots = [...document.querySelectorAll('[class*="group/imagegen-image"]')];
+      const virtualAssistantCount = assistants.length || (imageRoots.length ? Math.max(users.length, imageRoots.length) : 0);
+      const buttons = [...document.querySelectorAll('button,[role="button"]')];
+      const bodyText = textOf(document.body);
+      const last = assistants[assistants.length - 1] || imageRoots[imageRoots.length - 1] || null;
+      const lastText = textOf(last);
+      const lastImages = collectMeaningfulImages(last);
+      const imageSignature = lastImages.map((img) => {
+        const src = String(img.src || '');
+        return [img.width, img.height, img.complete ? 1 : 0, src.slice(0, 80), src.slice(-80)].join(':');
+      }).join('|');
+      const stopCount = buttons.filter((b) => /stop generating|stop responding|停止生成|停止回答/i.test(attrText(b))).length;
+      const copyCount = buttons.filter((b) => /copy|复制/i.test(attrText(b))).length;
+      const sendButton = document.querySelector('[data-testid="send-button"]');
+      const input = document.querySelector('[contenteditable="true"]');
+      const busy =
+        stopCount > 0 ||
+        !!document.querySelector('[data-testid*="stop"], [aria-label*="Stop generating"], [aria-label*="停止生成"]') ||
+        buttons.some((b) => /stop generating|stop responding|停止生成|停止回答/i.test(attrText(b)));
+      return JSON.stringify({
+        assistantCount: virtualAssistantCount,
+        assistantRoleCount: assistants.length,
+        imageRootCount: imageRoots.length,
+        userCount: users.length,
+        messageCount: messages.length,
+        lastAssistantLen: lastText.length,
+        lastAssistantText: lastText,
+        lastAssistantImageCount: lastImages.length,
+        lastAssistantImages: lastImages,
+        lastAssistantImageSignature: imageSignature,
+        stopCount,
+        copyCount,
+        busy,
+        hasInput: !!input,
+        sendDisabled: sendButton ? !!sendButton.disabled : null,
+        looksLikeLogin: /Log in|Sign in|Continue with|登录|登入/.test(bodyText),
+        looksRateLimited: /too many requests|please wait a moment|slow down|rate limit|请稍候|请求过多/i.test(bodyText),
+        url: location.href,
+        title: document.title
+      });
+    })()`
+  );
+  return v || {};
 }
 
 async function captureConversationContext(state) {
@@ -380,15 +552,489 @@ async function stageEnsureModel(state) {
   return { skipped: false, data };
 }
 
+async function stageEnsureTool(state, opts) {
+  const target = normalizeToolName(state.tool || DEFAULT_TOOL);
+  if (target === DEFAULT_TOOL) {
+    return { skipped: true, data: { target, state: await detectToolState(state.session) } };
+  }
+  const prior = state.stages.ensureTool;
+  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.target === target) {
+    const current = await detectToolState(state.session);
+    const selected = current.selectedTool || '';
+    if ((target === 'none' && !selected) || selected === target) {
+      return { skipped: true, data: { ...prior.data, state: current } };
+    }
+    log(`ensure-tool: state says done but current tool is ${selected || 'none'}, re-checking`);
+    clearStage(state, 'ensureTool');
+  }
+  if (target !== 'none' && !TOOL_TARGETS[target]) {
+    const e = new Error(`unknown tool target: ${target}`);
+    e.code = 'tool_switch_failed';
+    e.stageData = { target, valid: ['auto', 'none', ...Object.keys(TOOL_TARGETS)] };
+    throw e;
+  }
+
+  const before = await detectToolState(state.session);
+  let changed = false;
+  let picked = null;
+
+  if (target === 'none') {
+    if (before.selectedTool) {
+      picked = await clickActiveToolButton(state.session, before.selectedTool);
+      if (!picked || !picked.clicked) picked = await clickCheckedToolMenuItem(state.session);
+      changed = !!(picked && picked.clicked);
+    }
+  } else if (before.selectedTool !== target) {
+    picked = await clickToolMenuItem(state.session, target);
+    changed = !!(picked && picked.clicked);
+  }
+
+  await sleep(900);
+  const after = await detectToolState(state.session);
+  const ok = target === 'none' ? !after.selectedTool : after.selectedTool === target;
+  if (!ok) {
+    const e = new Error(`could not ensure tool=${target} (current=${after.selectedTool || 'none'}). Please select "${toolLabel(target)}" manually from Add files and more, then re-run with --resume.`);
+    e.code = 'tool_switch_failed';
+    e.stageData = { target, before, after, picked };
+    throw e;
+  }
+
+  if (changed) {
+    clearStage(state, 'send');
+    clearStage(state, 'wait');
+    clearStage(state, 'extract');
+    clearStage(state, 'extractImages');
+  }
+  const data = {
+    target,
+    selected: after.selectedTool || '',
+    label: after.selectedLabel || '',
+    changed,
+    picked,
+  };
+  markStage(state, 'ensureTool', data);
+  saveState(state);
+  return { skipped: false, data };
+}
+
+async function detectToolState(session) {
+  const targets = {};
+  for (const [key, cfg] of Object.entries(TOOL_TARGETS)) {
+    targets[key] = { labels: cfg.labels || [], activeLabels: cfg.activeLabels || cfg.labels || [] };
+  }
+  const v = await evaluate(
+    session,
+    `(() => {
+      const targets = ${JSON.stringify(targets)};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const matchesAny = (text, labels) => {
+        const t = norm(text);
+        if (!t) return false;
+        return labels.some((label) => {
+          const l = norm(label);
+          return t === l || t.startsWith(l + ',') || t.includes(l);
+        });
+      };
+      const targetFor = (text, active) => {
+        for (const [key, cfg] of Object.entries(targets)) {
+          const labels = active ? cfg.activeLabels : cfg.labels;
+          if (matchesAny(text, labels)) return key;
+        }
+        return '';
+      };
+      const describe = (el) => {
+        const text = textOf(el);
+        const aria = el.getAttribute('aria-label') || '';
+        const title = el.getAttribute('title') || '';
+        const role = el.getAttribute('role') || '';
+        const hay = [text, aria, title].filter(Boolean).join(' ');
+        return {
+          text,
+          aria,
+          title,
+          role,
+          checked: el.getAttribute('aria-checked') || '',
+          state: el.getAttribute('data-state') || '',
+          testid: el.getAttribute('data-testid') || '',
+          tool: targetFor(hay, /click to remove|remove|移除|取消|清除/i.test(hay)),
+        };
+      };
+      const menus = [...document.querySelectorAll('[role="menu"]')];
+      const toolsMenu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
+      const radios = toolsMenu
+        ? [...toolsMenu.querySelectorAll('[role="menuitemradio"]')].map(describe).filter((item) => item.tool)
+        : [];
+      const checkedRadio = radios.find((item) => item.checked === 'true' || item.state === 'checked') || null;
+      const removable = [...document.querySelectorAll('button,[role="button"]')]
+        .map(describe)
+        .filter((item) => item.tool && /click to remove|remove|移除|取消|清除/i.test([item.aria, item.title].join(' ')));
+      const selected = removable[0] || checkedRadio || null;
+      return JSON.stringify({
+        selectedTool: selected ? selected.tool : '',
+        selectedLabel: selected ? (selected.text || selected.aria || selected.title || '') : '',
+        selectedSource: selected ? (removable[0] ? 'chip' : 'menu') : '',
+        activeTools: removable,
+        menuOpen: !!toolsMenu,
+        radios,
+      });
+    })()`
+  );
+  return v || { selectedTool: '', activeTools: [], menuOpen: false, radios: [] };
+}
+
+async function readToolsMenu(session) {
+  const targets = {};
+  for (const [key, cfg] of Object.entries(TOOL_TARGETS)) targets[key] = cfg.labels;
+  const v = await evaluate(
+    session,
+    `(() => {
+      const targets = ${JSON.stringify(targets)};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const targetFor = (text) => {
+        const t = norm(text);
+        for (const [key, labels] of Object.entries(targets)) {
+          if (labels.some((label) => {
+            const l = norm(label);
+            return t === l || t.includes(l);
+          })) return key;
+        }
+        return '';
+      };
+      const menus = [...document.querySelectorAll('[role="menu"]')];
+      const menu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
+      const items = menu ? [...menu.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')].map((el) => ({
+        text: textOf(el),
+        role: el.getAttribute('role') || '',
+        checked: el.getAttribute('aria-checked') || '',
+        state: el.getAttribute('data-state') || '',
+        tool: targetFor(textOf(el)),
+      })) : [];
+      return JSON.stringify({ open: !!menu, text: menu ? textOf(menu) : '', items });
+    })()`
+  );
+  return v || { open: false, items: [] };
+}
+
+async function openToolsMenu(session) {
+  let menu = await readToolsMenu(session);
+  if (menu.open) return { ...menu, opened: false };
+  const opened = await evaluate(
+    session,
+    `(() => {
+      const btn =
+        document.querySelector('[data-testid="composer-plus-btn"]') ||
+        document.querySelector('button[aria-label*="Add files"]') ||
+        document.querySelector('button[aria-label*="添加"]');
+      if (!btn) return JSON.stringify({ opened: false, reason: 'button_not_found' });
+      const r = btn.getBoundingClientRect();
+      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        btn.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+      }
+      return JSON.stringify({ opened: true });
+    })()`
+  );
+  await sleep(800);
+  menu = await readToolsMenu(session);
+  return { ...menu, opened: !!(opened && opened.opened), openAttempt: opened };
+}
+
+async function clickToolMenuItem(session, target) {
+  const normalized = normalizeToolName(target);
+  const cfg = TOOL_TARGETS[normalized];
+  if (!cfg) return { clicked: false, reason: 'unknown_target', target: normalized };
+  const menu = await openToolsMenu(session);
+  if (!menu.open) return { clicked: false, reason: 'menu_not_open', target: normalized, menu };
+  const picked = await evaluate(
+    session,
+    `(() => {
+      const labels = ${JSON.stringify(cfg.labels)};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const matches = (text) => {
+        const t = norm(text);
+        return labels.some((label) => {
+          const l = norm(label);
+          return t === l || t.includes(l);
+        });
+      };
+      const menus = [...document.querySelectorAll('[role="menu"]')];
+      const menu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
+      if (!menu) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
+      const items = [...menu.querySelectorAll('[role="menuitemradio"]')];
+      const item = items.find((el) => matches(textOf(el)));
+      if (!item) return JSON.stringify({ clicked: false, reason: 'item_not_found', items: items.map((el) => textOf(el)) });
+      const r = item.getBoundingClientRect();
+      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        item.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+      }
+      return JSON.stringify({ clicked: true, text: textOf(item), checked: item.getAttribute('aria-checked') || '', state: item.getAttribute('data-state') || '' });
+    })()`
+  );
+  return { target: normalized, menu, ...(picked || {}) };
+}
+
+async function clickActiveToolButton(session, target) {
+  const normalized = normalizeToolName(target);
+  const cfg = TOOL_TARGETS[normalized];
+  if (!cfg) return { clicked: false, reason: 'unknown_target', target: normalized };
+  const labels = cfg.activeLabels || cfg.labels || [];
+  const picked = await evaluate(
+    session,
+    `(() => {
+      const labels = ${JSON.stringify(labels)};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const matches = (text) => {
+        const t = norm(text);
+        return labels.some((label) => {
+          const l = norm(label);
+          return t === l || t.startsWith(l + ',') || t.includes(l);
+        });
+      };
+      const buttons = [...document.querySelectorAll('button,[role="button"]')];
+      const button = buttons.find((el) => {
+        const hay = [textOf(el), el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' ');
+        return matches(hay) && /click to remove|remove|移除|取消|清除/i.test(hay);
+      });
+      if (!button) return JSON.stringify({ clicked: false, reason: 'active_button_not_found' });
+      const r = button.getBoundingClientRect();
+      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        button.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+      }
+      return JSON.stringify({ clicked: true, text: textOf(button), aria: button.getAttribute('aria-label') || '' });
+    })()`
+  );
+  return { target: normalized, ...(picked || {}) };
+}
+
+async function clickCheckedToolMenuItem(session) {
+  const menu = await openToolsMenu(session);
+  if (!menu.open) return { clicked: false, reason: 'menu_not_open', menu };
+  const picked = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const menus = [...document.querySelectorAll('[role="menu"]')];
+      const menu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
+      if (!menu) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
+      const item = [...menu.querySelectorAll('[role="menuitemradio"]')].find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
+      if (!item) return JSON.stringify({ clicked: false, reason: 'checked_item_not_found' });
+      const r = item.getBoundingClientRect();
+      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        item.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+      }
+      return JSON.stringify({ clicked: true, text: textOf(item), checked: item.getAttribute('aria-checked') || '', state: item.getAttribute('data-state') || '' });
+    })()`
+  );
+  return { menu, ...(picked || {}) };
+}
+
+function uploadFilesForState(state) {
+  return normalizeUploadFiles(state.uploads || []);
+}
+
+function validateUploadFiles(files) {
+  const missing = [];
+  const invalid = [];
+  for (const file of files) {
+    if (!fs.existsSync(file)) {
+      missing.push(file);
+      continue;
+    }
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) invalid.push(file);
+  }
+  if (missing.length || invalid.length) {
+    const e = new Error(`upload file check failed${missing.length ? `; missing: ${missing.join(', ')}` : ''}${invalid.length ? `; not files: ${invalid.join(', ')}` : ''}`);
+    e.code = 'upload_file_invalid';
+    e.stageData = { missing, invalid };
+    throw e;
+  }
+}
+
+async function waitForUploadInput(session, selector, maxSeconds = 8) {
+  const deadline = Date.now() + maxSeconds * 1000;
+  let last = null;
+  while (Date.now() < deadline) {
+    const found = await evaluate(
+      session,
+      `(() => {
+        const selector = ${JSON.stringify(selector)};
+        let input = document.querySelector(selector);
+        let selectorUsed = selector;
+        if (!input && selector !== ${JSON.stringify(DEFAULT_UPLOAD_SELECTOR)}) {
+          input = document.querySelector(${JSON.stringify(DEFAULT_UPLOAD_SELECTOR)});
+          selectorUsed = ${JSON.stringify(DEFAULT_UPLOAD_SELECTOR)};
+        }
+        if (!input) {
+          input = document.querySelector('input[type="file"][multiple], input[type="file"]');
+          selectorUsed = 'input[type="file"][multiple], input[type="file"]';
+        }
+        return JSON.stringify({
+          found: !!input,
+          id: input ? input.id : '',
+          selectorUsed,
+          accept: input ? input.accept : '',
+          multiple: input ? !!input.multiple : false
+        });
+      })()`
+    );
+    if (found && found.found) return found;
+    last = found;
+    const clicked = await evaluate(
+      session,
+      `(() => { const btn = document.querySelector('[data-testid="composer-plus-btn"], button[aria-label*="Add files"], button[aria-label*="添加"]'); if (btn) { btn.click(); return true; } return false; })()`
+    ).catch(() => false);
+    if (clicked) await sleep(500);
+    await sleep(500);
+  }
+  return last || { found: false };
+}
+
+async function waitForUploadedFileNames(session, files, maxSeconds) {
+  const names = files.map((file) => path.basename(file));
+  const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
+  let last = null;
+  while (Date.now() < deadline) {
+    const result = await evaluate(
+      session,
+      `(() => {
+        const names = ${JSON.stringify(names)};
+        const bodyText = (document.body.innerText || document.body.textContent || '');
+        const visible = names.filter((name) => bodyText.includes(name));
+        const fileInputs = [...document.querySelectorAll('input[type="file"]')].map((input) => ({
+          id: input.id || '',
+          count: input.files ? input.files.length : 0,
+          names: input.files ? [...input.files].map((file) => file.name) : []
+        }));
+        const elementText = [...document.querySelectorAll('[aria-label], [title], img[alt]')]
+          .map((el) => [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('alt')].filter(Boolean).join(' '))
+          .join('\\n');
+        const searchableText = bodyText + '\\n' + elementText;
+        const attributeVisible = names.filter((name) => searchableText.includes(name));
+        const inputVisible = names.filter((name) => fileInputs.some((input) => input.names.includes(name)));
+        return JSON.stringify({ visible, attributeVisible, inputVisible, fileInputs });
+      })()`
+    );
+    last = result;
+    const seen = new Set([...(result && result.visible || []), ...(result && result.attributeVisible || []), ...(result && result.inputVisible || [])]);
+    if (names.every((name) => seen.has(name))) return { ok: true, names, ...result };
+    await sleep(1000);
+  }
+  return { ok: false, names, ...(last || {}) };
+}
+
+async function waitForSendButtonReady(session, maxSeconds) {
+  const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
+  let last = null;
+  while (Date.now() < deadline) {
+    const result = await evaluate(
+      session,
+      `(() => {
+        const button = document.querySelector('[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label*="Send"], button[aria-label*="发送"]');
+        const composer = document.querySelector('#prompt-textarea, [contenteditable="true"]');
+        const attachments = [...document.querySelectorAll('[aria-label*="Remove file"], [aria-label*="Open image"], [aria-label*="移除"], [aria-label*="打开图片"], [class*="file-tile"]')]
+          .map((el) => ({
+            tag: el.tagName,
+            aria: el.getAttribute('aria-label') || '',
+            text: (el.innerText || '').slice(0, 160)
+          }));
+        return JSON.stringify({
+          found: !!button,
+          disabled: button ? !!button.disabled : null,
+          aria: button ? (button.getAttribute('aria-label') || '') : '',
+          text: button ? (button.innerText || '') : '',
+          composerText: composer ? ((composer.innerText || composer.textContent || '').slice(0, 240)) : '',
+          attachments
+        });
+      })()`
+    );
+    last = result;
+    if (result && result.found && result.disabled === false) return { ok: true, ...result };
+    await sleep(1000);
+  }
+  return { ok: false, ...(last || {}) };
+}
+
+async function stageUpload(state, opts) {
+  const files = uploadFilesForState(state);
+  if (!files.length) {
+    return { skipped: true, data: { files: [] } };
+  }
+  const signature = uploadSignature(files);
+  const prompt = state.prompt || '';
+  const prior = state.stages.upload;
+  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.signature === signature && prior.data.prompt === prompt) {
+    return { skipped: true, data: prior.data };
+  }
+  validateUploadFiles(files);
+  const requestedSelector = state.uploadSelector || opts.uploadSelector || DEFAULT_UPLOAD_SELECTOR;
+  const input = await waitForUploadInput(state.session, requestedSelector, 8);
+  if (!input || !input.found) {
+    const e = new Error(`upload input not found for selector ${requestedSelector}`);
+    e.code = 'upload_input_not_found';
+    e.stageData = { selector: requestedSelector, files };
+    throw e;
+  }
+  const selector = input.selectorUsed || requestedSelector;
+  log(`uploading ${files.length} file(s)...`);
+  let uploadResult;
+  try {
+    uploadResult = unwrap(
+      await cmd('upload', { selector, files }, state.session, { retries: 1 }),
+      'upload'
+    );
+  } catch (e) {
+    if (/Not allowed/i.test(e.message)) {
+      const err = new Error('upload was blocked by the browser/WebBridge extension (Not allowed)');
+      err.code = 'upload_not_allowed';
+      err.stageData = {
+        selector,
+        files,
+        hint: 'Enable "Allow access to file URLs" / "允许访问文件网址" for the Kimi WebBridge extension, then retry with --resume.',
+      };
+      throw err;
+    }
+    throw e;
+  }
+  const waitSeconds = Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS;
+  const attachmentState = await waitForUploadedFileNames(state.session, files, waitSeconds).catch((e) => ({ ok: false, error: e.message }));
+  if (!attachmentState.ok) {
+    log(`upload warning: could not confirm attachment chip(s) within ${waitSeconds}s`);
+  }
+  const data = {
+    files,
+    names: files.map((file) => path.basename(file)),
+    signature,
+    prompt,
+    selector,
+    input,
+    uploadResult,
+    attachmentState,
+  };
+  clearStage(state, 'send');
+  clearStage(state, 'wait');
+  clearStage(state, 'extract');
+  clearStage(state, 'extractImages');
+  markStage(state, 'upload', data);
+  saveState(state);
+  return { skipped: false, data };
+}
+
 async function stageSend(state, opts) {
   const prompt = state.prompt;
   if (!prompt) throw new Error('send: no prompt in state — pass a prompt on the CLI or use --resume with prior state');
   const prior = state.stages.send;
   // In --continue mode, always re-send even if the prompt matches the prior turn
   // (the user is explicitly asking to push another turn into the conversation).
-  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.prompt === prompt) {
+  const uploadFiles = uploadFilesForState(state);
+  const uploadSig = uploadSignature(uploadFiles);
+  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.prompt === prompt && prior.data.uploadSignature === uploadSig) {
     return { skipped: true, data: prior.data };
   }
+  const before = await getConversationProgress(state.session).catch(() => ({}));
   log(`clicking input...`);
   unwrap(await cmd('click', { selector: '[contenteditable="true"]' }, state.session), 'click input');
   await sleep(300);
@@ -407,6 +1053,14 @@ async function stageSend(state, opts) {
     if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
   }
   await sleep(300);
+  const readyWait = uploadFiles.length ? Math.max(10, Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS) : 10;
+  const sendReady = await waitForSendButtonReady(state.session, readyWait);
+  if (!sendReady.ok) {
+    const e = new Error(`send button did not become ready within ${readyWait}s`);
+    e.code = 'send_button_not_ready';
+    e.stageData = sendReady;
+    throw e;
+  }
   log('clicking send...');
   unwrap(await cmd('click', { selector: '[data-testid="send-button"]' }, state.session), 'click send');
   const data = {
@@ -414,7 +1068,16 @@ async function stageSend(state, opts) {
     mode: opts.continueMode ? 'continue-insert' : 'replace',
     prompt,
     turn: (state.turns || 0) + 1,
+    sentAt: Date.now(),
+    assistantBefore: Number.isFinite(before.assistantCount) ? before.assistantCount : null,
+    userBefore: Number.isFinite(before.userCount) ? before.userCount : null,
+    messageBefore: Number.isFinite(before.messageCount) ? before.messageCount : null,
+    uploadSignature: uploadSig,
+    uploads: uploadFiles,
   };
+  clearStage(state, 'wait');
+  clearStage(state, 'extract');
+  clearStage(state, 'extractImages');
   markStage(state, 'send', data);
   state.prompt = prompt;
   state.turns = data.turn;
@@ -424,15 +1087,79 @@ async function stageSend(state, opts) {
 
 async function stageWait(state, opts) {
   // In --continue mode, always re-wait for the new response
-  if (!opts.continueMode && state.stages.wait && state.stages.wait.done) {
-    return { skipped: true, data: state.stages.wait.data };
+  const waitKind = opts.imageMode ? 'image' : 'text';
+  const priorWait = state.stages.wait;
+  const priorKind = priorWait && priorWait.data && priorWait.data.kind ? priorWait.data.kind : 'text';
+  if (!opts.forceWait && !opts.continueMode && priorWait && priorWait.done && priorKind === waitKind) {
+    return { skipped: true, data: priorWait.data };
   }
-  const maxWait = opts.wait || 900;
-  const interval = opts.interval || 30;
-  log(`waiting up to ${maxWait}s (poll ${interval}s)...`);
-  const result = await waitForCompletion(state.session, maxWait, interval);
+  const maxWait = Number.isFinite(opts.wait) ? opts.wait : DEFAULT_WAIT_SECONDS;
+  const interval = Number.isFinite(opts.interval) ? opts.interval : DEFAULT_INTERVAL_SECONDS;
+  if (opts.imageMode) {
+    const imageCriteria = imageWaitCriteriaFromState(state, opts);
+    log(`waiting up to ${maxWait}s for image(s) (poll ${interval}s, stable ${imageCriteria.stableSec}s, min ${imageCriteria.requiredImages} image)...`);
+    const result = await waitForImageCompletion(state.session, {
+      maxWaitSec: maxWait,
+      intervalSec: interval,
+      ...imageCriteria,
+    });
+    log(`wait result: ${result.status} (${result.elapsed}s)`);
+    const data = {
+      kind: 'image',
+      status: result.status,
+      elapsed: result.elapsed,
+      imageCount: result.imageCount || 0,
+      requiredImages: imageCriteria.requiredImages,
+      assistantCount: result.assistantCount || 0,
+      stableFor: result.stableFor || 0,
+      stableSec: imageCriteria.stableSec,
+      assistantBefore: imageCriteria.assistantBefore,
+      images: result.images || [],
+      last: result.last,
+    };
+    if (result.status === 'login_required') {
+      const e = new Error('login wall appeared during image generation - log in then re-run');
+      e.code = 'login_required';
+      e.stageData = data;
+      throw e;
+    }
+    if (result.status === 'rate_limited') {
+      const e = new Error('rate limited by chatgpt - wait 60s then re-run with --resume');
+      e.code = 'rate_limited';
+      e.stageData = data;
+      throw e;
+    }
+    if (result.status === 'timeout') {
+      saveState(state);
+      const e = new Error(`image wait timed out after ${maxWait}s - re-run with --resume or "-s ${state.session} latest --image --wait ${maxWait}"`);
+      e.code = 'wait_timeout';
+      e.stageData = data;
+      throw e;
+    }
+    markStage(state, 'wait', data);
+    saveState(state);
+    return { skipped: false, data };
+  }
+  const criteria = waitCriteriaFromState(state, opts);
+  log(`waiting up to ${maxWait}s (poll ${interval}s, stable ${criteria.stableSec}s, min ${criteria.minChars} chars)...`);
+  const result = await waitForCompletion(state.session, {
+    maxWaitSec: maxWait,
+    intervalSec: interval,
+    ...criteria,
+  });
   log(`wait result: ${result.status} (${result.elapsed}s)`);
-  const data = { status: result.status, elapsed: result.elapsed };
+  const data = {
+    kind: 'text',
+    status: result.status,
+    elapsed: result.elapsed,
+    length: result.length || 0,
+    assistantCount: result.assistantCount || 0,
+    stableFor: result.stableFor || 0,
+    minChars: criteria.minChars,
+    stableSec: criteria.stableSec,
+    assistantBefore: criteria.assistantBefore,
+    last: result.last,
+  };
   if (result.status === 'login_required') {
     const e = new Error('login wall appeared during generation - log in then re-run');
     e.code = 'login_required';
@@ -445,28 +1172,34 @@ async function stageWait(state, opts) {
     e.stageData = data;
     throw e;
   }
-  markStage(state, 'wait', data);
-  saveState(state);
   if (result.status === 'timeout') {
     // Timeout is exit 3, not 4. Throw a special error.
-    const e = new Error(`wait timed out after ${maxWait}s - re-run with --resume and a longer --wait, or run extract to grab what's on screen`);
+    saveState(state);
+    const e = new Error(`wait timed out after ${maxWait}s - latest reply is not complete yet; re-run with --resume or "-s ${state.session} latest --wait ${maxWait}"`);
     e.code = 'wait_timeout';
     e.stageData = data;
     throw e;
   }
+  markStage(state, 'wait', data);
+  saveState(state);
   return { skipped: false, data };
 }
 
 async function stageExtract(state, opts) {
   // In --continue mode, always re-extract to get the latest response
-  if (!opts.continueMode && state.stages.extract && state.stages.extract.done) {
+  if (!opts.forceExtract && !opts.continueMode && state.stages.extract && state.stages.extract.done) {
     return { skipped: true, data: state.stages.extract.data };
   }
-  const extracted = await extractLastAssistant(state.session);
+  const criteria = waitCriteriaFromState(state, opts);
+  const extracted = await extractLastAssistant(state.session, criteria.requireNewAssistant ? criteria : {});
   if (!extracted.text) {
     const e = new Error('no assistant message found - re-run with --resume, or run send again if generation never started');
     e.code = 'no_response';
-    e.stageData = { error: extracted.error };
+    e.stageData = {
+      error: extracted.error,
+      assistantCount: extracted.assistantCount,
+      assistantBefore: criteria.assistantBefore,
+    };
     throw e;
   }
   // File naming:
@@ -475,7 +1208,9 @@ async function stageExtract(state, opts) {
   //                       PLUS a "latest" file with the current turn's content
   //   normal mode:        gpt-pro-response-<Date.now()>.md (overwrites; one-off)
   let out, latest;
-  if (opts.continueMode) {
+  if (opts.latestMode) {
+    out = state.output || `gpt-pro-response-${state.createdAt || Date.now()}-latest.md`;
+  } else if (opts.continueMode) {
     const turn = state.turns || 1;
     out = `gpt-pro-response-${state.createdAt || Date.now()}-turn-${turn}.md`;
     latest = `gpt-pro-response-${state.createdAt || Date.now()}.md`;
@@ -490,12 +1225,67 @@ async function stageExtract(state, opts) {
     fs.writeFileSync(latest, extracted.text, 'utf8');
     log(`latest -> ${latest}`);
   }
-  const data = { length: extracted.text.length, path: out, turn: state.turns || 1 };
+  const data = {
+    length: extracted.text.length,
+    path: out,
+    turn: state.turns || 1,
+    assistantCount: extracted.assistantCount,
+    assistantIndex: extracted.index,
+  };
   markStage(state, 'extract', data);
   state.output = out;
   saveState(state);
   // Capture conversation URL and title for future recovery (sidebar navigation).
   // No-op if already captured (e.g. on a re-extract).
+  if (!state.conversationUrl || !/\/c\//.test(state.conversationUrl)) {
+    await captureConversationContext(state);
+  }
+  return { skipped: false, data };
+}
+
+async function stageExtractImages(state, opts) {
+  if (!opts.forceExtract && !opts.continueMode && state.stages.extractImages && state.stages.extractImages.done) {
+    return { skipped: true, data: state.stages.extractImages.data };
+  }
+  const criteria = imageWaitCriteriaFromState(state, opts);
+  const maxImages = Math.max(criteria.requiredImages, Number.isFinite(opts.maxImages) ? opts.maxImages : DEFAULT_MAX_IMAGES);
+  const extracted = await extractLastAssistantImages(state.session, criteria.requireNewAssistant ? criteria : {}, maxImages);
+  if (!extracted.images.length) {
+    const e = new Error('no generated images found in the latest assistant message - re-run with --resume after generation completes');
+    e.code = 'no_images';
+    e.stageData = {
+      error: extracted.error,
+      assistantCount: extracted.assistantCount,
+      assistantBefore: criteria.assistantBefore,
+    };
+    throw e;
+  }
+  const saved = await saveExtractedImages(state, opts, extracted);
+  if (!saved.images.length) {
+    const e = new Error('generated image(s) were found, but none could be saved');
+    e.code = 'image_save_failed';
+    e.stageData = {
+      manifest: saved.manifestPath,
+      failed: saved.failed,
+      candidateCount: extracted.images.length,
+    };
+    throw e;
+  }
+  const data = {
+    imageCount: saved.images.length,
+    failedCount: saved.failed.length,
+    dir: saved.dir,
+    manifestPath: saved.manifestPath,
+    images: saved.images,
+    failed: saved.failed,
+    turn: state.turns || 1,
+    assistantCount: extracted.assistantCount,
+    assistantIndex: extracted.index,
+  };
+  markStage(state, 'extractImages', data);
+  state.output = saved.manifestPath;
+  state.images = saved.images;
+  saveState(state);
   if (!state.conversationUrl || !/\/c\//.test(state.conversationUrl)) {
     await captureConversationContext(state);
   }
@@ -516,6 +1306,27 @@ async function stageCleanup(state, opts) {
     if (fs.existsSync(p)) fs.unlinkSync(p);
   }
   return { skipped: false, data: { closed: !opts.keepSession, stateRemoved: !!opts.cleanupState } };
+}
+
+async function runLatest(state, opts) {
+  const existing = await findChatgptTab(state.session);
+  if (!existing && !state.conversationUrl && !state.conversationTitle) {
+    const e = new Error(`latest: no prior tab or saved conversation for session "${state.session}"`);
+    e.code = 'no_session_context';
+    e.stageData = { session: state.session };
+    throw e;
+  }
+  const latestOpts = { ...opts, keepSession: true, forceWait: true, forceExtract: true, latestMode: true };
+  const results = {};
+  results.open = await stageOpen(state, latestOpts);
+  results.loginCheck = await stageLoginCheck(state, latestOpts);
+  results.wait = await stageWait(state, latestOpts);
+  if (opts.imageMode) {
+    results.extractImages = await stageExtractImages(state, latestOpts);
+  } else {
+    results.extract = await stageExtract(state, latestOpts);
+  }
+  return results;
 }
 
 // --- Model detection & switching --------------------------------------------
@@ -555,6 +1366,16 @@ async function detectModel(session) {
   return { model: mode, effort: sub, pills };
 }
 
+async function detectModelReady(session, maxSeconds = 10) {
+  const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
+  let state = await detectModel(session);
+  while (state.model === 'unknown' && Date.now() < deadline) {
+    await sleep(750);
+    state = await detectModel(session);
+  }
+  return state;
+}
+
 async function probePopover(session) {
   const opened = await evaluate(
     session,
@@ -569,8 +1390,8 @@ async function probePopover(session) {
 }
 
 async function ensureModel(session, target) {
-  if (target === 'auto') return { ok: true, state: await detectModel(session), changed: false };
-  const state = await detectModel(session);
+  if (target === 'auto') return { ok: true, state: await detectModelReady(session, 4), changed: false };
+  const state = await detectModelReady(session, 12);
   if (target === 'extended' && state.model === 'extended') return { ok: true, state, changed: false };
   if (target === 'pro' && (state.model === 'pro' || state.model === 'thinking')) return { ok: true, state, changed: false };
   const labelRe = target === 'extended' || target === 'pro' ? 'Pro' : target === 'thinking' ? 'Thinking' : target === 'instant' ? 'Instant' : null;
@@ -594,59 +1415,479 @@ async function ensureModel(session, target) {
 
 // --- Wait & extract ----------------------------------------------------------
 
-async function waitForCompletion(session, maxWaitSec, intervalSec) {
+function textSignature(text) {
+  const t = String(text || '');
+  return `${t.length}:${t.slice(0, 160)}:${t.slice(-500)}`;
+}
+
+function looksLikeThinkingPlaceholder(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return true;
+  if (/^(thinking|reasoning|working|searching|analyzing|generating|one moment|please wait|思考中|正在思考|正在分析|正在生成|请稍等)[\s.。…-]*$/i.test(t)) {
+    return true;
+  }
+  if (t.length <= 240 && /(thinking|reasoning|working on it|still working|one moment|please wait|思考中|正在思考|正在分析|正在生成|请稍等)/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function isSubstantiveAssistantText(text, minChars) {
+  const t = String(text || '').trim();
+  if (looksLikeThinkingPlaceholder(t)) return false;
+  if (minChars > 0 && t.length < minChars) return false;
+  return true;
+}
+
+function summarizeProgress(page, criteria) {
+  const text = (page && page.lastAssistantText) || '';
+  return {
+    assistantCount: (page && page.assistantCount) || 0,
+    lastAssistantLen: text.length,
+    busy: !!(page && page.busy),
+    copyCount: (page && page.copyCount) || 0,
+    hasNewAssistant: criteria.requireNewAssistant
+      ? ((page && page.assistantCount) || 0) > criteria.assistantBefore
+      : ((page && page.assistantCount) || 0) > 0,
+    url: (page && page.url) || '',
+  };
+}
+
+function summarizeImageProgress(page, criteria) {
+  const images = (page && page.lastAssistantImages) || [];
+  return {
+    assistantCount: (page && page.assistantCount) || 0,
+    imageCount: images.length,
+    requiredImages: criteria.requiredImages,
+    busy: !!(page && page.busy),
+    copyCount: (page && page.copyCount) || 0,
+    hasNewAssistant: criteria.requireNewAssistant
+      ? ((page && page.assistantCount) || 0) > criteria.assistantBefore
+      : ((page && page.assistantCount) || 0) > 0,
+    images: images.map((img) => ({
+      width: img.width || 0,
+      height: img.height || 0,
+      complete: !!img.complete,
+      srcHint: String(img.src || '').slice(0, 120),
+    })),
+    url: (page && page.url) || '',
+  };
+}
+
+function waitCriteriaFromState(state, opts) {
+  const sendData = state.stages && state.stages.send && state.stages.send.data;
+  const assistantBefore = sendData && Number.isFinite(sendData.assistantBefore) ? sendData.assistantBefore : null;
+  return {
+    assistantBefore,
+    requireNewAssistant: assistantBefore !== null,
+    minChars: Math.max(0, Number.isFinite(opts.minChars) ? opts.minChars : DEFAULT_MIN_RESPONSE_CHARS),
+    stableSec: Math.max(0, Number.isFinite(opts.stableSec) ? opts.stableSec : DEFAULT_STABLE_SECONDS),
+  };
+}
+
+function imageWaitCriteriaFromState(state, opts) {
+  const sendData = state.stages && state.stages.send && state.stages.send.data;
+  const assistantBefore = sendData && Number.isFinite(sendData.assistantBefore) ? sendData.assistantBefore : null;
+  return {
+    assistantBefore,
+    requireNewAssistant: assistantBefore !== null,
+    requiredImages: Math.max(1, Number.isFinite(opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT),
+    stableSec: Math.max(0, Number.isFinite(opts.stableSec) ? opts.stableSec : DEFAULT_STABLE_SECONDS),
+  };
+}
+
+async function waitForCompletion(session, config) {
+  const maxWaitSec = Math.max(0, config.maxWaitSec);
+  const intervalSec = Math.max(1, config.intervalSec);
+  const criteria = {
+    assistantBefore: Number.isFinite(config.assistantBefore) ? config.assistantBefore : null,
+    requireNewAssistant: !!config.requireNewAssistant,
+    minChars: Math.max(0, config.minChars),
+    stableSec: Math.max(0, config.stableSec),
+  };
   const start = Date.now();
   let lastReport = 0;
   let prevSig = '';
-  let stableRounds = 0;
-  while ((Date.now() - start) / 1000 < maxWaitSec) {
-    await sleep(intervalSec * 1000);
-    const tree = JSON.stringify((await snapshot(session)).tree || '');
-    const stopCount = (tree.match(/Stop generating/gi) || []).length;
-    const copyCount = (tree.match(/"Copy"/g) || []).length;
+  let stableSince = Date.now();
+  let lastPage = null;
+  while (true) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
+    const page = await getConversationProgress(session);
+    lastPage = page;
+    const hasNewAssistant = criteria.requireNewAssistant
+      ? (page.assistantCount || 0) > criteria.assistantBefore
+      : (page.assistantCount || 0) > 0;
+    const text = page.lastAssistantText || '';
+    const substantive = hasNewAssistant && isSubstantiveAssistantText(text, criteria.minChars);
+    const generating = !!page.busy || (page.stopCount || 0) > 0;
+    const sig = `${page.assistantCount || 0}:${textSignature(text)}`;
+    if (sig !== prevSig) {
+      prevSig = sig;
+      stableSince = Date.now();
+    }
+    const stableFor = Math.floor((Date.now() - stableSince) / 1000);
+
     if (elapsed - lastReport >= 30) {
-      log(`[${elapsed}s] stop=${stopCount} copy=${copyCount}`);
+      const need = !hasNewAssistant
+        ? 'new-assistant'
+        : !substantive
+          ? `substantive-text>=${criteria.minChars}`
+          : generating
+            ? 'generation-stop'
+            : `stable ${stableFor}/${criteria.stableSec}s`;
+      log(`[${elapsed}s] assistant=${page.assistantCount || 0} len=${text.length} busy=${generating ? 1 : 0} copy=${page.copyCount || 0} need=${need}`);
       lastReport = elapsed;
     }
-    if (/(Log in|Sign up)/i.test(tree) && stopCount === 0 && copyCount === 0) {
+
+    if (page.looksLikeLogin && !page.hasInput) {
       return { status: 'login_required', elapsed };
     }
-    if (/too many requests|please wait a moment|slow down/i.test(tree)) {
+    if (page.looksRateLimited) {
       return { status: 'rate_limited', elapsed };
     }
-    if (stopCount === 0 && copyCount >= 1) {
-      await sleep(intervalSec * 1000);
-      return { status: 'complete', elapsed };
+
+    if (substantive && !generating && stableFor >= criteria.stableSec) {
+      return {
+        status: 'complete',
+        elapsed,
+        length: text.length,
+        assistantCount: page.assistantCount || 0,
+        stableFor,
+        minChars: criteria.minChars,
+        url: page.url || '',
+      };
     }
-    const sig = tree.length + ':' + tree.slice(-200);
-    if (sig === prevSig) {
-      stableRounds++;
-      if (stableRounds >= 4 && stopCount === 0) return { status: 'complete', elapsed };
-    } else {
-      stableRounds = 0;
-      prevSig = sig;
-    }
+
+    if (elapsed >= maxWaitSec) break;
+    await sleep(Math.min(intervalSec, Math.max(1, maxWaitSec - elapsed)) * 1000);
   }
-  return { status: 'timeout', elapsed: maxWaitSec };
+  return { status: 'timeout', elapsed: maxWaitSec, last: summarizeProgress(lastPage, criteria) };
 }
 
-async function extractLastAssistant(session) {
-  const code = `(() => { const msgs = document.querySelectorAll('[data-message-author-role="assistant"]'); if (!msgs.length) { const alt = document.querySelectorAll('.markdown, .prose'); if (alt.length) { const t = alt[alt.length-1].innerText; return JSON.stringify({ len: t.length, text: t }); } return JSON.stringify({ error: 'no_messages' }); } const last = msgs[msgs.length-1]; return JSON.stringify({ len: last.innerText.length, text: last.innerText }); })()`;
+async function waitForImageCompletion(session, config) {
+  const maxWaitSec = Math.max(0, config.maxWaitSec);
+  const intervalSec = Math.max(1, config.intervalSec);
+  const criteria = {
+    assistantBefore: Number.isFinite(config.assistantBefore) ? config.assistantBefore : null,
+    requireNewAssistant: !!config.requireNewAssistant,
+    requiredImages: Math.max(1, Number.isFinite(config.requiredImages) ? config.requiredImages : DEFAULT_IMAGE_COUNT),
+    stableSec: Math.max(0, config.stableSec),
+  };
+  const start = Date.now();
+  let lastReport = 0;
+  let prevSig = '';
+  let stableSince = Date.now();
+  let lastPage = null;
+  while (true) {
+    const elapsed = Math.floor((Date.now() - start) / 1000);
+    const page = await getConversationProgress(session);
+    lastPage = page;
+    const hasNewAssistant = criteria.requireNewAssistant
+      ? (page.assistantCount || 0) > criteria.assistantBefore
+      : (page.assistantCount || 0) > 0;
+    const images = page.lastAssistantImages || [];
+    const imageCount = images.length;
+      const imagesReady = hasNewAssistant &&
+      imageCount >= criteria.requiredImages &&
+      images.slice(0, criteria.requiredImages).every((img) => img.ready !== false);
+    const generating = !!page.busy || (page.stopCount || 0) > 0;
+    const sig = `${page.assistantCount || 0}:${page.lastAssistantImageSignature || ''}`;
+    if (sig !== prevSig) {
+      prevSig = sig;
+      stableSince = Date.now();
+    }
+    const stableFor = Math.floor((Date.now() - stableSince) / 1000);
+
+    if (elapsed - lastReport >= 30) {
+      const need = !hasNewAssistant
+        ? 'new-assistant'
+        : imageCount < criteria.requiredImages
+          ? `images>=${criteria.requiredImages}`
+          : !imagesReady
+            ? 'images-loaded'
+            : generating
+              ? 'generation-stop'
+              : `stable ${stableFor}/${criteria.stableSec}s`;
+      log(`[${elapsed}s] assistant=${page.assistantCount || 0} images=${imageCount} busy=${generating ? 1 : 0} copy=${page.copyCount || 0} need=${need}`);
+      lastReport = elapsed;
+    }
+
+    if (page.looksLikeLogin && !page.hasInput) {
+      return { status: 'login_required', elapsed };
+    }
+    if (page.looksRateLimited) {
+      return { status: 'rate_limited', elapsed };
+    }
+
+    if (imagesReady && !generating && stableFor >= criteria.stableSec) {
+      return {
+        status: 'complete',
+        elapsed,
+        imageCount,
+        images,
+        assistantCount: page.assistantCount || 0,
+        stableFor,
+        url: page.url || '',
+      };
+    }
+
+    if (elapsed >= maxWaitSec) break;
+    await sleep(Math.min(intervalSec, Math.max(1, maxWaitSec - elapsed)) * 1000);
+  }
+  return { status: 'timeout', elapsed: maxWaitSec, last: summarizeImageProgress(lastPage, criteria) };
+}
+
+async function extractLastAssistant(session, criteria = {}) {
+  const minAssistantIndex = Number.isFinite(criteria.assistantBefore) ? criteria.assistantBefore : null;
+  const code = `(() => {
+    const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    if (!msgs.length) {
+      const alt = [...document.querySelectorAll('.markdown, .prose')];
+      if (alt.length) {
+        const t = alt[alt.length - 1].innerText || '';
+        return JSON.stringify({ len: t.length, text: t, assistantCount: 0, fallback: true });
+      }
+      return JSON.stringify({ error: 'no_messages', assistantCount: 0 });
+    }
+    const minIndex = ${minAssistantIndex === null ? 'null' : JSON.stringify(minAssistantIndex)};
+    if (minIndex !== null && msgs.length <= minIndex) {
+      return JSON.stringify({ error: 'no_new_assistant', assistantCount: msgs.length, minIndex });
+    }
+    const last = msgs[msgs.length - 1];
+    const t = last.innerText || '';
+    return JSON.stringify({ len: t.length, text: t, assistantCount: msgs.length, index: msgs.length - 1 });
+  })()`;
   const v = await evaluate(session, code);
   if (!v) return { text: '', error: 'no_value' };
   if (typeof v === 'string') return { text: v };
-  return { text: v.text || '', len: v.len, error: v.error };
+  return { text: v.text || '', len: v.len, error: v.error, assistantCount: v.assistantCount, index: v.index };
+}
+
+async function extractLastAssistantImages(session, criteria = {}, maxImages = DEFAULT_MAX_IMAGES) {
+  const minAssistantIndex = Number.isFinite(criteria.assistantBefore) ? criteria.assistantBefore : null;
+  const cappedMax = Math.max(1, Math.min(32, Number.isFinite(maxImages) ? maxImages : DEFAULT_MAX_IMAGES));
+  const code = `(async () => {
+    ${IMAGE_COLLECTOR_JS}
+    const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+    const imageRoots = [...document.querySelectorAll('[class*="group/imagegen-image"]')];
+    const effectiveCount = msgs.length || (imageRoots.length ? Math.max(users.length, imageRoots.length) : 0);
+    if (!msgs.length && !imageRoots.length) return JSON.stringify({ error: 'no_messages', assistantCount: 0, images: [] });
+    const minIndex = ${minAssistantIndex === null ? 'null' : JSON.stringify(minAssistantIndex)};
+    if (minIndex !== null && effectiveCount <= minIndex) {
+      return JSON.stringify({ error: 'no_new_assistant', assistantCount: effectiveCount, minIndex, images: [] });
+    }
+    const last = msgs[msgs.length - 1] || imageRoots[imageRoots.length - 1];
+    const nodes = [...last.querySelectorAll('img')];
+    const candidates = collectMeaningfulImages(last).slice(0, ${JSON.stringify(cappedMax)});
+    const bytesToBase64 = (bytes) => {
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    };
+    const readImage = async (meta) => {
+      const img = nodes[meta.index];
+      const src = meta.src || (img && (img.currentSrc || img.src || img.getAttribute('src'))) || '';
+      let dataUrl = '';
+      let mimeType = '';
+      let bytes = 0;
+      let error = '';
+      try {
+        if (/^data:/i.test(src)) {
+          dataUrl = src;
+          const match = src.match(/^data:([^;,]+)/i);
+          mimeType = match ? match[1] : '';
+          bytes = Math.floor((src.length * 3) / 4);
+        } else if (src) {
+          const response = await fetch(src, { credentials: 'include', cache: 'force-cache' });
+          if (!response.ok) throw new Error('fetch ' + response.status);
+          const blob = await response.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+          const byteArray = new Uint8Array(arrayBuffer);
+          mimeType = blob.type || response.headers.get('content-type') || '';
+          bytes = byteArray.byteLength;
+          dataUrl = 'data:' + (mimeType || 'application/octet-stream') + ';base64,' + bytesToBase64(byteArray);
+        }
+      } catch (e) {
+        error = e && e.message ? e.message : String(e);
+      }
+      return { ...meta, src, dataUrl, mimeType, bytes, error };
+    };
+    const images = [];
+    for (const candidate of candidates) {
+      images.push(await readImage(candidate));
+    }
+    return JSON.stringify({
+      assistantCount: effectiveCount,
+      assistantRoleCount: msgs.length,
+      imageRootCount: imageRoots.length,
+      index: effectiveCount - 1,
+      url: location.href,
+      images
+    });
+  })()`;
+  const v = await evaluate(session, code);
+  if (!v) return { images: [], error: 'no_value' };
+  if (typeof v === 'string') return { images: [], error: v };
+  return {
+    images: Array.isArray(v.images) ? v.images : [],
+    error: v.error,
+    assistantCount: v.assistantCount,
+    assistantRoleCount: v.assistantRoleCount,
+    imageRootCount: v.imageRootCount,
+    index: v.index,
+    url: v.url,
+  };
+}
+
+function sanitizeFileComponent(value, fallback) {
+  const clean = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120);
+  return clean || fallback;
+}
+
+function mimeToExt(mimeType, fallback = 'png') {
+  const mime = String(mimeType || '').split(';')[0].trim().toLowerCase();
+  if (mime === 'image/jpeg' || mime === 'image/jpg') return 'jpg';
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/webp') return 'webp';
+  if (mime === 'image/gif') return 'gif';
+  if (mime === 'image/avif') return 'avif';
+  if (mime === 'image/svg+xml') return 'svg';
+  return fallback;
+}
+
+function compactSource(src) {
+  const value = String(src || '');
+  if (/^data:/i.test(value)) {
+    const header = value.slice(0, Math.min(value.indexOf(',') + 1 || 80, 120));
+    return `${header}...(${value.length} chars)`;
+  }
+  if (value.length > 500) return `${value.slice(0, 220)}...${value.slice(-220)}`;
+  return value;
+}
+
+function parseDataUrl(dataUrl) {
+  const raw = String(dataUrl || '');
+  const b64 = raw.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/is);
+  if (b64) {
+    return {
+      buffer: Buffer.from(b64[2], 'base64'),
+      mimeType: b64[1] || '',
+    };
+  }
+  const plain = raw.match(/^data:([^;,]+)?(?:;[^,]*)?,(.*)$/is);
+  if (plain) {
+    return {
+      buffer: Buffer.from(decodeURIComponent(plain[2]), 'utf8'),
+      mimeType: plain[1] || '',
+    };
+  }
+  return null;
+}
+
+function uniquePath(dir, fileName) {
+  const parsed = path.parse(fileName);
+  let candidate = path.join(dir, fileName);
+  let n = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dir, `${parsed.name}-${n}${parsed.ext}`);
+    n += 1;
+  }
+  return candidate;
+}
+
+async function downloadImageFromUrl(url) {
+  if (typeof fetch !== 'function') throw new Error('Node fetch is unavailable');
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`download ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const mimeType = response.headers.get('content-type') || '';
+  return { buffer, mimeType };
+}
+
+async function saveExtractedImages(state, opts, extracted) {
+  const dir = path.resolve(opts.imageDir || state.imageDir || DEFAULT_IMAGE_DIR);
+  const prefix = sanitizeFileComponent(
+    opts.imagePrefix || state.imagePrefix || `gpt-image-${state.createdAt || Date.now()}`,
+    `gpt-image-${Date.now()}`
+  );
+  fs.mkdirSync(dir, { recursive: true });
+  const saved = [];
+  const failed = [];
+  const images = Array.isArray(extracted.images) ? extracted.images : [];
+
+  for (let i = 0; i < images.length; i++) {
+    const image = images[i];
+    try {
+      let parsed = image.dataUrl ? parseDataUrl(image.dataUrl) : null;
+      let mimeType = (parsed && parsed.mimeType) || image.mimeType || '';
+      if (!parsed && /^https?:\/\//i.test(image.src || '')) {
+        const downloaded = await downloadImageFromUrl(image.src);
+        parsed = { buffer: downloaded.buffer, mimeType: downloaded.mimeType };
+        mimeType = downloaded.mimeType || mimeType;
+      }
+      if (!parsed || !parsed.buffer || !parsed.buffer.length) {
+        throw new Error(image.error || 'image bytes unavailable');
+      }
+      if (mimeType && !/^image\//i.test(mimeType)) {
+        throw new Error(`non-image content-type: ${mimeType}`);
+      }
+      const ext = mimeToExt(mimeType || image.mimeType);
+      const filePath = uniquePath(dir, `${prefix}-${String(saved.length + 1).padStart(2, '0')}.${ext}`);
+      fs.writeFileSync(filePath, parsed.buffer);
+      saved.push({
+        path: filePath,
+        bytes: parsed.buffer.length,
+        mimeType: mimeType || image.mimeType || '',
+        width: image.width || 0,
+        height: image.height || 0,
+        src: compactSource(image.src),
+      });
+      log(`saved image -> ${filePath}`);
+    } catch (e) {
+      failed.push({
+        index: i,
+        src: compactSource(image.src),
+        width: image.width || 0,
+        height: image.height || 0,
+        error: e.message,
+      });
+    }
+  }
+
+  const manifest = {
+    generatedAt: new Date().toISOString(),
+    session: state.session,
+    conversationUrl: extracted.url || state.conversationUrl || '',
+    prompt: state.prompt || '',
+    imageDir: dir,
+    images: saved,
+    failed,
+  };
+  const manifestPath = uniquePath(dir, `${prefix}-manifest.json`);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+  log(`image manifest -> ${manifestPath}`);
+  return { dir, manifestPath, images: saved, failed };
 }
 
 // --- Sub-command pipeline ---------------------------------------------------
 
-const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'send', 'wait', 'extract'];
+const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract'];
+const IMAGE_PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extractImages'];
 
-async function runPipeline(state, opts) {
+async function runPipeline(state, opts, pipeline = PIPELINE) {
   const results = {};
-  // dry-run stops after ensureModel
-  const stages = opts.dryRun ? PIPELINE.slice(0, PIPELINE.indexOf('ensureModel') + 1) : PIPELINE;
+  // dry-run stops after model selection unless a tool target was requested,
+  // in which case it also verifies the ChatGPT tool selector.
+  const dryRunStop = opts.toolExplicit ? 'ensureTool' : 'ensureModel';
+  const stages = opts.dryRun ? pipeline.slice(0, pipeline.indexOf(dryRunStop) + 1) : pipeline;
   for (const stage of stages) {
     const fn = STAGE_FNS[stage];
     try {
@@ -675,9 +1916,12 @@ const STAGE_FNS = {
   open: stageOpen,
   loginCheck: stageLoginCheck,
   ensureModel: stageEnsureModel,
+  ensureTool: stageEnsureTool,
+  upload: stageUpload,
   send: stageSend,
   wait: stageWait,
   extract: stageExtract,
+  extractImages: stageExtractImages,
 };
 
 // Map kebab-case subcommand names to stage function keys.
@@ -685,14 +1929,17 @@ const SUBCOMMAND_TO_STAGE = {
   open: 'open',
   'login-check': 'loginCheck',
   'ensure-model': 'ensureModel',
+  'ensure-tool': 'ensureTool',
+  upload: 'upload',
   send: 'send',
   wait: 'wait',
   extract: 'extract',
+  'extract-images': 'extractImages',
 };
 
 // --- CLI --------------------------------------------------------------------
 
-const SUBCOMMANDS = ['run', 'open', 'login-check', 'ensure-model', 'send', 'wait', 'extract', 'status', 'cleanup'];
+const SUBCOMMANDS = ['run', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'latest', 'status', 'cleanup'];
 
 function printHelp() {
   process.stdout.write(`search.js - drive ChatGPT Pro via kimi-webbridge (stateful, resumable)
@@ -702,21 +1949,45 @@ Usage:
 
 Sub-commands:
   run [prompt...]      All stages in order (default if no subcommand given)
+  image [prompt...]    Generate image(s) in ChatGPT and save them locally
   open                 Open a ChatGPT tab (or reuse an existing one)
   login-check          Detect whether ChatGPT is logged in
-  ensure-model [tgt]   Verify / switch model. tgt: auto|pro|extended (default: state value)
+  ensure-model [tgt]   Verify / switch model. tgt: auto|pro|extended|thinking|think|instant
+  ensure-tool [tgt]    Verify / switch ChatGPT tool. tgt: auto|none|deep-research|web-search|create-image
+  upload               Upload --upload file(s) into the composer
   send [prompt...]     Fill the input and click send
   wait                 Poll until response completes
   extract              Pull the last assistant message to --output
+  extract-images       Save generated image(s) from the latest assistant message
+  latest               Recover this --session, wait for the latest complete reply,
+                       save it, and print it to stdout
   status               Print session state and exit
   cleanup              Close the session tab
 
 Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
-  -m, --model NAME     Target model: auto|pro|extended|extended-pro (default: auto)
-  -w, --wait SECONDS   Max wait for response (default: 900)
-  -i, --interval SEC   Poll interval (default: 30)
+  -m, --model NAME     Target model: auto|pro|extended|extended-pro|thinking|think|instant
+                       (default: auto; image defaults to ${DEFAULT_IMAGE_MODEL})
+      --tool NAME      Target ChatGPT tool: auto|none|deep-research|deep-search|web-search|create-image
+      --deep-research  Select ChatGPT's Deep research tool before sending
+      --deep-search    Alias for --deep-research
+      --web-search     Select ChatGPT's Web search tool before sending
+  -w, --wait SECONDS   Max wait for response (default: ${DEFAULT_WAIT_SECONDS})
+                       Deep research default: ${DEFAULT_DEEP_RESEARCH_WAIT_SECONDS}
+  -i, --interval SEC   Poll interval (default: ${DEFAULT_INTERVAL_SECONDS})
+      --min-chars N    Min assistant chars before "complete" (default: ${DEFAULT_MIN_RESPONSE_CHARS}; use 0 for terse answers)
+      --stable SEC     Assistant text must be unchanged this long (default: ${DEFAULT_STABLE_SECONDS})
+      --upload PATH    Upload a local file before sending (repeatable)
+      --upload-selector CSS
+                       File input selector (default: ${DEFAULT_UPLOAD_SELECTOR})
+      --upload-wait SEC
+                       Seconds to wait for attachment chips (default: ${DEFAULT_UPLOAD_WAIT_SECONDS})
+      --image          Image mode for run/latest/wait (alias for the image flow)
+      --image-dir DIR  Directory for saved generated images (default: ./${DEFAULT_IMAGE_DIR})
+      --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
+      --image-count N  Minimum generated images to wait for (default: ${DEFAULT_IMAGE_COUNT})
+      --max-images N   Max image candidates to extract/save (default: ${DEFAULT_MAX_IMAGES})
       --resume         Skip stages already marked done in state file
       --keep-session   Do not close the browser tab when finished
   -C, --continue       Send a follow-up turn in the same ChatGPT conversation
@@ -726,6 +1997,7 @@ Global flags (can appear before or after the subcommand):
                         (start a brand new conversation, even if state has a prior URL)
       --cleanup-state  Delete the state file when finished
       --dry-run        Like run but stop after ensure-model
+                       (or ensure-tool when a tool flag is passed)
       --status         Health check only, no session
       --json           Output result as JSON
   -v, --verbose        Verbose logging
@@ -741,21 +2013,35 @@ Exit codes:
 State file: <script dir>/state/<session>.json
   - Auto-created on first run.
   - Each successful stage is marked done; --resume skips done stages.
+  - Optional uploads run before send and are not reused by a fresh non-resume prompt.
   - For 'send', the stage re-runs if the new prompt differs from the stored one
     (or always re-runs under --continue).
-  - state.turns tracks the number of completed turns in the conversation.
+  - state.turns tracks the number of sent turns in the conversation.
+  - state.tool records an explicit ChatGPT tool target when requested.
 
 Examples:
-  search.js "What is 2+2? Reply with just the number."
+  search.js "What is 2+2? Reply with just the number." --min-chars 0
   search.js --model extended "Reason about X in deep mode."
+  search.js --deep-research "Research current competitors and cite sources."
+  search.js --deep-search --wait 5400 "Do a deep market scan."
+  search.js --web-search "Find the latest release notes."
   search.js -f ./prompt.md -o ./answer.md --json
   search.js --status
   search.js --dry-run --model extended
   search.js open
   search.js ensure-model extended
+  search.js ensure-tool deep-research
+  search.js --upload ./brief.pdf "Summarize this file."
+  search.js --upload ./a.pdf --upload ./b.csv "Compare these files."
   search.js send "now actually send it"
   search.js --resume                # pick up where a previous run left off
   search.js --resume --wait 1800    # resume with longer timeout
+  search.js -s my-thread latest     # wait for and print latest complete reply
+  search.js -s my-thread latest --wait 0 --stable 0 --json  # check current readiness only
+  search.js image "Create a square watercolor icon of a tiny robot reading."
+  search.js image --model think "Create a detailed isometric app icon."
+  search.js --image --model instant "Create a product hero image." --image-dir ./assets/generated
+  search.js -s my-thread latest --image --image-dir ./assets/generated
 
   # Multi-turn conversation (keeps context between prompts)
   search.js -s my-thread "Explain quantum entanglement in one paragraph."
@@ -770,9 +2056,23 @@ function parseArgs(argv) {
     subcommandArgs: [],
     session: `gpt-pro-${Date.now()}`,
     output: '',
+    uploads: [],
+    uploadSelector: DEFAULT_UPLOAD_SELECTOR,
+    uploadWait: DEFAULT_UPLOAD_WAIT_SECONDS,
     model: 'auto',
-    wait: 900,
-    interval: 30,
+    modelExplicit: false,
+    tool: DEFAULT_TOOL,
+    toolExplicit: false,
+    wait: DEFAULT_WAIT_SECONDS,
+    waitExplicit: false,
+    interval: DEFAULT_INTERVAL_SECONDS,
+    minChars: DEFAULT_MIN_RESPONSE_CHARS,
+    stableSec: DEFAULT_STABLE_SECONDS,
+    imageMode: false,
+    imageDir: '',
+    imagePrefix: '',
+    imageCount: DEFAULT_IMAGE_COUNT,
+    maxImages: DEFAULT_MAX_IMAGES,
     resume: false,
     keepSession: false,
     continueMode: false,
@@ -795,15 +2095,28 @@ function parseArgs(argv) {
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--resume') opts.resume = true;
     else if (a === '--keep-session') opts.keepSession = true;
+    else if (a === '--upload') { opts.uploads.push(argv[++i] || ''); }
+    else if (a === '--upload-selector') { opts.uploadSelector = argv[++i] || DEFAULT_UPLOAD_SELECTOR; }
+    else if (a === '--upload-wait') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.uploadWait = n; }
+    else if (a === '--tool') { opts.tool = normalizeToolName(argv[++i] || DEFAULT_TOOL); opts.toolExplicit = true; }
+    else if (a === '--deep-research' || a === '--deep-search') { opts.tool = 'deep-research'; opts.toolExplicit = true; }
+    else if (a === '--web-search') { opts.tool = 'web-search'; opts.toolExplicit = true; }
+    else if (a === '--image') opts.imageMode = true;
     else if (a === '--continue' || a === '-C') opts.continueMode = true;
     else if (a === '--fresh') opts.fresh = true;
     else if (a === '--cleanup-state') opts.cleanupState = true;
     else if (a === '-f' || a === '--file') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); }
     else if (a === '-s' || a === '--session') { opts.session = argv[++i] || opts.session; }
     else if (a === '-o' || a === '--output') { opts.output = argv[++i] || ''; }
-    else if (a === '-m' || a === '--model') { opts.model = argv[++i] || 'auto'; }
-    else if (a === '-w' || a === '--wait') { opts.wait = parseInt(argv[++i], 10) || opts.wait; }
-    else if (a === '-i' || a === '--interval') { opts.interval = parseInt(argv[++i], 10) || opts.interval; }
+    else if (a === '-m' || a === '--model') { opts.model = argv[++i] || 'auto'; opts.modelExplicit = true; }
+    else if (a === '-w' || a === '--wait') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
+    else if (a === '-i' || a === '--interval') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.interval = n; }
+    else if (a === '--min-chars') { opts.minChars = parseInt(argv[++i], 10); if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
+    else if (a === '--stable' || a === '--stable-seconds') { opts.stableSec = parseInt(argv[++i], 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
+    else if (a === '--image-dir') { opts.imageDir = argv[++i] || ''; }
+    else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
+    else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
+    else if (a === '--max-images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.maxImages = n; }
     else if (a === '-') { opts.stdin = true; opts.subcommandArgs.push('-'); }
     else if (a === '--') { i++; while (i < argv.length) { positional.push(argv[i]); i++; } break; }
     else if (a.startsWith('--')) {
@@ -813,9 +2126,22 @@ function parseArgs(argv) {
         if (k === 'file') { opts.promptFile = v; opts.subcommandArgs.push('--file=' + v); }
         else if (k === 'session') opts.session = v;
         else if (k === 'output') opts.output = v;
-        else if (k === 'model') opts.model = v;
-        else if (k === 'wait') opts.wait = parseInt(v, 10) || opts.wait;
-        else if (k === 'interval') opts.interval = parseInt(v, 10) || opts.interval;
+        else if (k === 'upload') opts.uploads.push(v);
+        else if (k === 'upload-selector') opts.uploadSelector = v || DEFAULT_UPLOAD_SELECTOR;
+        else if (k === 'upload-wait') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.uploadWait = n; }
+        else if (k === 'tool') { opts.tool = normalizeToolName(v || DEFAULT_TOOL); opts.toolExplicit = true; }
+        else if (k === 'deep-research' || k === 'deep-search') { opts.tool = /^(0|false|no)$/i.test(v) ? DEFAULT_TOOL : 'deep-research'; opts.toolExplicit = !/^(0|false|no)$/i.test(v); }
+        else if (k === 'web-search') { opts.tool = /^(0|false|no)$/i.test(v) ? DEFAULT_TOOL : 'web-search'; opts.toolExplicit = !/^(0|false|no)$/i.test(v); }
+        else if (k === 'model') { opts.model = v; opts.modelExplicit = true; }
+        else if (k === 'wait') { const n = parseInt(v, 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
+        else if (k === 'interval') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.interval = n; }
+        else if (k === 'min-chars') { opts.minChars = parseInt(v, 10); if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
+        else if (k === 'stable' || k === 'stable-seconds') { opts.stableSec = parseInt(v, 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
+        else if (k === 'image') opts.imageMode = !/^(0|false|no)$/i.test(v);
+        else if (k === 'image-dir') opts.imageDir = v;
+        else if (k === 'image-prefix') opts.imagePrefix = v;
+        else if (k === 'image-count' || k === 'images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageCount = n; }
+        else if (k === 'max-images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.maxImages = n; }
         else die(2, `unknown option: --${k}`);
       } else die(2, `unknown option: ${a}`);
     }
@@ -830,9 +2156,9 @@ function parseArgs(argv) {
         else if (ch === 'f') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); consumed = true; break; }
         else if (ch === 's') { opts.session = argv[++i] || opts.session; consumed = true; break; }
         else if (ch === 'o') { opts.output = argv[++i] || ''; consumed = true; break; }
-        else if (ch === 'm') { opts.model = argv[++i] || 'auto'; consumed = true; break; }
-        else if (ch === 'w') { opts.wait = parseInt(argv[++i], 10) || opts.wait; consumed = true; break; }
-        else if (ch === 'i') { opts.interval = parseInt(argv[++i], 10) || opts.interval; consumed = true; break; }
+        else if (ch === 'm') { opts.model = argv[++i] || 'auto'; opts.modelExplicit = true; consumed = true; break; }
+        else if (ch === 'w') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } consumed = true; break; }
+        else if (ch === 'i') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.interval = n; consumed = true; break; }
         else die(2, `unknown short flag: -${ch}`);
       }
     }
@@ -880,6 +2206,11 @@ async function readPrompt(opts, state) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.subcommand === 'image' || opts.subcommand === 'extract-images') opts.imageMode = true;
+  if (opts.imageMode && opts.subcommand === 'run') opts.subcommand = 'image';
+  if (opts.subcommand === 'image' && !opts.modelExplicit) opts.model = DEFAULT_IMAGE_MODEL;
+  opts.tool = normalizeToolName(opts.tool);
+  if (opts.tool === 'deep-research' && !opts.waitExplicit) opts.wait = DEFAULT_DEEP_RESEARCH_WAIT_SECONDS;
   if (opts.help) { printHelp(); return; }
   if (opts.verbose) log('opts:', JSON.stringify({ ...opts, subcommandArgs: '[redacted]' }));
 
@@ -903,13 +2234,55 @@ async function main() {
   let state = loadState(opts.session);
   if (state) log(`loaded existing state for ${state.session} (stages: ${Object.keys(state.stages).join(',') || 'none'})`);
   if (!state) {
-    state = newState(opts.session, { output: opts.output, model: opts.model === 'extended-pro' ? 'extended' : opts.model });
+    state = newState(opts.session, {
+      output: opts.output,
+      uploads: opts.uploads,
+      uploadSelector: opts.uploadSelector,
+      imageDir: opts.imageDir,
+      imagePrefix: opts.imagePrefix,
+      model: normalizeModelName(opts.model),
+      tool: opts.tool,
+    });
   }
+  if (!state.tool) state.tool = DEFAULT_TOOL;
   if (opts.output) state.output = opts.output;
-  if (opts.model && opts.model !== 'auto') state.model = opts.model === 'extended-pro' ? 'extended' : opts.model;
+  if (!opts.resume && ['send', 'run', 'image'].includes(opts.subcommand) && !opts.uploads.length && state.uploads && state.uploads.length) {
+    state.uploads = [];
+    clearStage(state, 'upload');
+  }
+  if (opts.uploads.length) {
+    const nextUploads = normalizeUploadFiles(opts.uploads);
+    if (uploadSignature(state.uploads || []) !== uploadSignature(nextUploads)) {
+      clearStage(state, 'upload');
+      clearStage(state, 'send');
+      clearStage(state, 'wait');
+      clearStage(state, 'extract');
+      clearStage(state, 'extractImages');
+    }
+    state.uploads = nextUploads;
+  }
+  if (opts.uploadSelector && opts.uploadSelector !== DEFAULT_UPLOAD_SELECTOR) state.uploadSelector = opts.uploadSelector;
+  if (opts.imageDir) state.imageDir = opts.imageDir;
+  if (opts.imagePrefix) state.imagePrefix = opts.imagePrefix;
+  if (opts.model && opts.model !== 'auto') state.model = normalizeModelName(opts.model);
+  if (!opts.resume && ['send', 'run', 'image'].includes(opts.subcommand) && !opts.toolExplicit && state.tool && state.tool !== DEFAULT_TOOL) {
+    state.tool = DEFAULT_TOOL;
+    clearStage(state, 'ensureTool');
+  }
+  if (opts.toolExplicit) {
+    const nextTool = normalizeToolName(opts.tool);
+    if (normalizeToolName(state.tool) !== nextTool) {
+      clearStage(state, 'ensureTool');
+      clearStage(state, 'send');
+      clearStage(state, 'wait');
+      clearStage(state, 'extract');
+      clearStage(state, 'extractImages');
+    }
+    state.tool = nextTool;
+  }
   // Only save back if we actually have something to record (don't pollute state
   // for read-only sub-commands like status).
-  if (opts.subcommand !== 'status') saveState(state);
+  if (opts.subcommand !== 'status' && opts.subcommand !== 'latest') saveState(state);
 
   // --- Sub-commands ---
 
@@ -926,7 +2299,7 @@ async function main() {
 
   // For send/run, resolve the prompt (dry-run skips this)
   let promptInfo = { text: '', source: '' };
-  if (['send', 'run'].includes(opts.subcommand) && !opts.dryRun) {
+  if (['send', 'run', 'image'].includes(opts.subcommand) && !opts.dryRun) {
     promptInfo = await readPrompt(opts, state);
     if (!promptInfo.text) {
       die(2, `no prompt provided. Pass it as a positional arg, -f file, or - (stdin), or use --resume with prior state.`);
@@ -938,8 +2311,23 @@ async function main() {
 
   // For ensure-model subcommand, override the target if first arg given
   if (opts.subcommand === 'ensure-model' && opts.subcommandArgs.length) {
-    state.model = String(opts.subcommandArgs[0]).toLowerCase();
-    if (state.model === 'extended-pro') state.model = 'extended';
+    state.model = normalizeModelName(opts.subcommandArgs[0]);
+    saveState(state);
+  }
+
+  // For ensure-tool subcommand, override the target if first arg given
+  if (opts.subcommand === 'ensure-tool' && opts.subcommandArgs.length) {
+    const nextTool = normalizeToolName(opts.subcommandArgs[0]);
+    if (normalizeToolName(state.tool) !== nextTool) {
+      clearStage(state, 'ensureTool');
+      clearStage(state, 'send');
+      clearStage(state, 'wait');
+      clearStage(state, 'extract');
+      clearStage(state, 'extractImages');
+    }
+    state.tool = nextTool;
+    opts.tool = nextTool;
+    opts.toolExplicit = true;
     saveState(state);
   }
 
@@ -948,14 +2336,23 @@ async function main() {
   // Short-circuit before doing any work: if --resume and extract is done and
   // the output file exists, just return the cached response. This avoids
   // re-opening tabs and re-sending prompts when the user just wants the answer.
-  if (opts.resume && opts.subcommand === 'run' && state.stages.extract && state.stages.extract.done) {
-    const cachedOut = state.stages.extract.data && state.stages.extract.data.path;
+  if (opts.resume && ['run', 'image'].includes(opts.subcommand)) {
+    const doneStage = opts.imageMode ? state.stages.extractImages : state.stages.extract;
+    const cachedOut = doneStage && doneStage.data && (opts.imageMode ? doneStage.data.manifestPath : doneStage.data.path);
     if (cachedOut && fs.existsSync(cachedOut)) {
       log(`resume: all stages already done, returning cached output`);
-      if (!opts.json) {
+      if (opts.imageMode) {
+        const payload = {
+          ok: true,
+          cached: true,
+          output: cachedOut,
+          images: (doneStage.data && doneStage.data.images) || [],
+        };
+        console.log(JSON.stringify(payload, null, 2));
+      } else if (!opts.json) {
         process.stdout.write(fs.readFileSync(cachedOut, 'utf8'));
       } else {
-        console.log(JSON.stringify({ ok: true, cached: true, output: cachedOut, length: state.stages.extract.data.length }, null, 2));
+        console.log(JSON.stringify({ ok: true, cached: true, output: cachedOut, length: doneStage.data.length }, null, 2));
       }
       process.exit(0);
     }
@@ -966,6 +2363,10 @@ async function main() {
   try {
     if (opts.subcommand === 'run') {
       result = await runPipeline(state, opts);
+    } else if (opts.subcommand === 'image') {
+      result = await runPipeline(state, { ...opts, imageMode: true }, IMAGE_PIPELINE);
+    } else if (opts.subcommand === 'latest') {
+      result = await runLatest(state, opts);
     } else if (SUBCOMMAND_TO_STAGE[opts.subcommand]) {
       const stageName = SUBCOMMAND_TO_STAGE[opts.subcommand];
       const fn = STAGE_FNS[stageName];
@@ -974,7 +2375,7 @@ async function main() {
       die(2, `unknown subcommand: ${opts.subcommand}`);
     }
   } catch (e) {
-    const code = e.code === 'wait_timeout' ? 3 : 4;
+    const code = e.code === 'wait_timeout' ? 3 : e.code === 'no_session_context' ? 2 : 4;
     const out = {
       ok: false,
       code: e.code || 'unknown',
@@ -998,7 +2399,7 @@ async function main() {
   // Final cleanup — --continue implies --keep-session so the tab stays open
   // for follow-up turns.
   if (opts.continueMode) opts.keepSession = true;
-  if (opts.subcommand === 'run' && !opts.dryRun) {
+  if (['run', 'image'].includes(opts.subcommand) && !opts.dryRun) {
     try { await stageCleanup(state, opts); } catch (e) { log(`cleanup warning: ${e.message}`); }
   } else if (opts.subcommand !== 'cleanup' && !opts.keepSession && opts.subcommand !== 'status') {
     // For individual sub-commands, don't auto-cleanup unless it's the final stage
@@ -1006,6 +2407,7 @@ async function main() {
 
   const waitData = (result.wait && result.wait.data) || (state.stages.wait && state.stages.wait.data) || {};
   const extractData = (result.extract && result.extract.data) || (state.stages.extract && state.stages.extract.data) || {};
+  const imageData = (result.extractImages && result.extractImages.data) || (state.stages.extractImages && state.stages.extractImages.data) || {};
 
   const out = {
     ok: true,
@@ -1013,20 +2415,34 @@ async function main() {
     elapsed: Math.floor((Date.now() - startTime) / 1000),
     stages: Object.keys(state.stages),
     model: state.model,
-    output: extractData.path || state.output || null,
+    tool: state.tool || DEFAULT_TOOL,
+    output: imageData.manifestPath || extractData.path || state.output || null,
     length: extractData.length || 0,
+    imageCount: imageData.imageCount || 0,
+    images: imageData.images || [],
     wait: waitData,
   };
   if (opts.json) {
-    if (extractData.path && fs.existsSync(extractData.path)) {
+    if (!opts.imageMode && extractData.path && fs.existsSync(extractData.path)) {
       out.response = fs.readFileSync(extractData.path, 'utf8');
     }
     console.log(JSON.stringify(out, null, 2));
   } else {
-    if (opts.subcommand === 'run' && !opts.dryRun && extractData.path) {
+    if (opts.imageMode && imageData.manifestPath) {
+      log(`image(s) saved to ${imageData.dir}`);
+      console.log(JSON.stringify({
+        ok: true,
+        output: imageData.manifestPath,
+        imageCount: imageData.imageCount || 0,
+        images: (imageData.images || []).map((img) => img.path),
+        failedCount: imageData.failedCount || 0,
+      }, null, 2));
+    } else if (opts.subcommand === 'run' && !opts.dryRun && extractData.path) {
       log(`response (${out.length} chars) saved to ${out.output}`);
-    }
-    if (extractData.path && fs.existsSync(extractData.path)) {
+      if (fs.existsSync(extractData.path)) {
+        process.stdout.write(fs.readFileSync(extractData.path, 'utf8'));
+      }
+    } else if (extractData.path && fs.existsSync(extractData.path)) {
       process.stdout.write(fs.readFileSync(extractData.path, 'utf8'));
     } else if (opts.subcommand !== 'status' && opts.subcommand !== 'cleanup') {
       // For non-extract sub-commands, print a brief summary

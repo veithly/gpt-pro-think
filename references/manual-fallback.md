@@ -50,11 +50,44 @@ Wait 3s for the page to load.
 
 ## Step 4 — Verify / switch to Pro Extended
 
-**Method A — script (preferred):** `node search.js --dry-run --model extended` (see SKILL.md).
+**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js --dry-run --deep-research` for ChatGPT Deep research, or `node search.js --dry-run --model instant` / `--model think` before image generation (see SKILL.md).
 
 **Method B — manual:** Take a `snapshot`, find the composer pill (text contains `Heavy` / `Extended Pro` / `Thinking` / `Instant`). To open its popover, dispatch the pointer-event sequence documented in [dom-selectors.md](dom-selectors.md). Click the menuitemradio with text matching the desired mode (`Pro • Extended` for Extended Pro).
 
-## Step 5 — Send the prompt
+## Step 5 — Select ChatGPT tool (optional)
+
+For ChatGPT Deep research / deep search, prefer the script:
+
+```bash
+node search.js --deep-research "Research current competitors and cite sources."
+node search.js ensure-tool deep-research
+node search.js ensure-tool none
+```
+
+Manual selection:
+1. Open the composer **Add files and more** button (`[data-testid="composer-plus-btn"]`) with the pointer-event sequence in [dom-selectors.md](dom-selectors.md).
+2. In the opened `[role="menu"]`, click the `[role="menuitemradio"]` with text `Deep research` or `Web search`.
+3. Verify the composer shows an active chip like `Deep research, click to remove`.
+
+If Deep research is enabled, plan for a longer wait. The script uses `--wait 3600` by default for `--deep-research`; manual fallback should use a similar budget.
+
+## Step 6 — Send the prompt
+
+If the prompt needs local files, prefer the script:
+
+```bash
+node search.js --upload ./brief.pdf --upload ./data.csv "Summarize and compare these files."
+```
+
+Manual upload through WebBridge:
+
+```bash
+curl -s -X POST http://127.0.0.1:10086/command \
+  -H 'Content-Type: application/json' \
+  -d "{\"action\":\"upload\",\"args\":{\"selector\":\"input#upload-files[type=\\\"file\\\"]\",\"files\":[\"$PWD/brief.pdf\"]},\"session\":\"$SESSION\"}"
+```
+
+Then wait until the attachment chip/file name appears in the composer before sending the text prompt. The current general file input is `input#upload-files[type="file"]`; image-only inputs such as `input#upload-photos` should be used only when you intentionally want ChatGPT's photo/image upload path.
 
 ```bash
 # Read prompt file and JSON-encode for the value field
@@ -83,13 +116,15 @@ curl -s -X POST http://127.0.0.1:10086/command \
 
 **Stagger parallel sends by 30s** to avoid rate limiting.
 
-## Step 6 — Wait for responses
+## Step 7 — Wait for responses
 
-Pro Extended typically takes **8-12 min** per response. For 3 parallel tabs, total wait ≈ **10-15 min**.
+Pro Extended commonly takes **about 10 min** per response and can take **20 min** for long prompts. Deep research can take **20-60 min**. For 3 parallel Pro Extended tabs, total wait ≈ **10-20 min**; for Deep research, use fewer parallel sends and expect longer waits.
 
-Poll every 2-3 min. Completion indicators:
+Poll every 2-3 min. Treat completion as conservative:
 - `Stop generating` button count = 0
-- `Copy` button count ≥ 2 (1 in user prompt + 1 in assistant reply)
+- The latest assistant text is not a short "thinking" / placeholder string
+- The latest assistant text is substantive (default script threshold: 240 chars)
+- The latest assistant text is stable for about 60s
 - Input is active again
 
 ```bash
@@ -100,7 +135,7 @@ curl -s -X POST http://127.0.0.1:10086/command \
 
 Then parse with a small node script: look for `Stop generating` and `Copy` counts.
 
-## Step 7 — Extract responses
+## Step 8 — Extract responses
 
 ```bash
 curl -s -X POST http://127.0.0.1:10086/command \
@@ -112,14 +147,34 @@ Save to `pitch/gpt-pro/responses/prompt-N-response.md`.
 
 If extraction returns empty: try `.markdown` selector fallback, then fall back to a full-page screenshot + visual reading.
 
-## Step 8 — Synthesize (optional, when ≥3 prompts)
+### Extract generated images
+
+Preferred path:
+
+```bash
+node search.js image "Create a square watercolor icon." --image-dir ./assets/generated
+node search.js -s "$SESSION" latest --image --image-dir ./assets/generated
+node search.js -s "$SESSION" extract-images --resume --image-dir ./assets/generated
+```
+
+Manual inspection path:
+
+```bash
+curl -s -X POST http://127.0.0.1:10086/command \
+  -H 'Content-Type: application/json' \
+  -d "{\"action\":\"evaluate\",\"args\":{\"code\":\"(() => { const msgs=[...document.querySelectorAll('[data-message-author-role=assistant]')]; const last=msgs[msgs.length-1]; const imgs=last?[...last.querySelectorAll('img')].map(img=>({src:img.currentSrc||img.src,width:img.naturalWidth,height:img.naturalHeight,complete:img.complete,alt:img.alt})):[]; return JSON.stringify({count:imgs.length, imgs}); })()\"},\"session\":\"$SESSION\"}"
+```
+
+The automatic extractor saves only visible large image candidates from the latest assistant message. It first reads bytes with page-context `fetch(..., { credentials: 'include' })`, then falls back to a public Node download for `http(s)` sources.
+
+## Step 9 — Synthesize (optional, when ≥3 prompts)
 
 1. Combine key insights from all responses
 2. Add cross-reference and contradiction analysis
 3. Send meta-prompt in a new session `gpt-pro-decision`
 4. Wait ~10 min, collect final decision into `final-decision.md`
 
-## Step 9 — Cleanup
+## Step 10 — Cleanup
 
 ```bash
 for s in gpt-pro-1 gpt-pro-2 gpt-pro-3 gpt-pro-decision; do

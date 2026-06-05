@@ -6,7 +6,11 @@ Drive [ChatGPT Pro](https://chatgpt.com) (or **Pro Extended** with deep reasonin
 
 - **No API key needed.** Uses your real ChatGPT Pro subscription through a local browser daemon.
 - **Extended Pro deep reasoning.** A single `--model extended` flag puts the model in the deepest reasoning tier.
-- **Resumable.** A 6-stage state machine (`open` → `login-check` → `ensure-model` → `send` → `wait` → `extract`) writes progress to disk. If anything fails, re-run with `--resume` and pick up where you left off.
+- **Deep research / Web search.** `--deep-research` / `--deep-search` selects ChatGPT's Deep research tool; `--web-search` selects the lighter Web search tool.
+- **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
+- **Image generation capture.** `image` / `--image` waits for generated images in ChatGPT's web UI, saves them under `--image-dir`, and writes a manifest.
+- **Long-wait safe.** Default wait is 20 minutes, with stable-text and minimum-length checks so short "still thinking" text is not treated as a finished answer.
+- **Latest retrieval.** `latest` recovers a named session, waits for the newest complete reply, saves it, and prints it directly.
 - **Idempotent stages.** Each sub-command can be re-run safely; the tab is reused, the model is only switched if needed, and the prompt is only re-sent if it changed.
 - **Surgical intervention.** The script stops at well-defined failure points (login wall, captcha, model switch failed, rate limit) with a clear message and a runbook for what to do.
 
@@ -27,8 +31,18 @@ cd gpt-pro-think
 ## Quick start
 
 ```bash
-# Run a prompt
-./search.js "What is 17 * 23? Show your work." --model extended
+# Run a deep prompt
+./search.js "Analyze the tradeoffs of this architecture and recommend next steps." --model extended
+
+# Run ChatGPT Deep research / deep search
+./search.js --deep-research "Research current competitors and cite sources."
+./search.js --deep-search --wait 5400 "Do a deep market scan."
+
+# Run lighter web search
+./search.js --web-search "Find the latest release notes."
+
+# Intentionally terse answer: lower the completion length threshold
+./search.js "What is 17 * 23? Reply with just the number." --min-chars 0
 
 # Read prompt from file, JSON output
 ./search.js -f ./prompt.md -o ./answer.md --json
@@ -39,8 +53,20 @@ cd gpt-pro-think
 # Open tab and verify Extended Pro without sending
 ./search.js --dry-run --model extended
 
+# Open tab and verify Deep research selection without sending
+./search.js --dry-run --deep-research
+
 # After a failure: pick up where it left off
 ./search.js --resume
+
+# Recover a named session and print the newest complete answer
+./search.js -s my-thread latest
+
+# Generate image(s) in ChatGPT and save them into the project
+node ./search.js image "Create a square watercolor icon of a tiny robot reading." --image-dir ./assets/generated
+
+# Upload local file(s) before sending a prompt
+node ./search.js --upload ./brief.pdf "Summarize this file and list the action items."
 ```
 
 ## Sub-commands
@@ -52,12 +78,47 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 | `open` | Open a ChatGPT tab; reuse if one exists | ✓ |
 | `login-check` | Detect whether ChatGPT is logged in | ✓ |
 | `ensure-model [target]` | Verify / switch the model pill | ✓ |
+| `ensure-tool [target]` | Verify / switch the ChatGPT composer tool | ✓ |
+| `upload` | Upload `--upload` file(s) into the composer | ✓ |
 | `send [prompt]` | Fill the input and click send | ✓ (skips if prompt unchanged) |
 | `wait` | Poll until the response completes | ✓ |
 | `extract` | Save the last assistant message | ✓ |
+| `image [prompt]` | Run the full image-generation flow and save generated images | — |
+| `extract-images` | Save generated images from the latest assistant message | ✓ |
+| `latest` | Recover the session, wait for the latest complete reply, save + print it | ✓ |
 | `status` | Print the current session state | — |
 | `cleanup` | Close the session tab | — |
 | `run` (default) | All of the above | — |
+
+Completion defaults are tuned for Pro Extended: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. Use `--min-chars 0` only when you intentionally expect a terse answer.
+
+To use ChatGPT's composer tools, pass `--deep-research`, `--deep-search`, `--web-search`, or the generic `--tool <auto|none|deep-research|web-search|create-image>`. The `ensure-tool` stage runs after model selection and before upload/send.
+
+```bash
+node ./search.js --deep-research "Research the current API gateway market and cite sources."
+node ./search.js --web-search "Find the latest changelog and summarize it."
+node ./search.js ensure-tool deep-research
+node ./search.js ensure-tool none
+```
+
+To attach files, pass `--upload <path>` one or more times before the prompt. The upload stage runs after tool selection and before send, targets ChatGPT's hidden `input#upload-files`, and waits for attachment chips before sending. In Chrome/Edge, Kimi WebBridge also needs **Allow access to file URLs** / **允许访问文件网址** enabled for local file injection.
+
+```bash
+node ./search.js --upload ./brief.pdf "Summarize this file."
+node ./search.js --upload ./brief.pdf --upload ./data.csv "Compare these two files."
+node ./search.js -s file-thread --resume
+```
+
+For image generation, use `image` or `--image`. Full image runs default to `--model instant` because ChatGPT image generation must be sent from Thinking/Instant rather than Extended Pro; pass `--model think` / `--model thinking` for the Thinking option. The script waits for at least `--image-count` large generated image(s) in the newest assistant message, waits until generation controls disappear and the image set is stable for `--stable` seconds, then writes files into `--image-dir` (default `./gpt-pro-images`). It also writes a JSON manifest with paths, dimensions, byte sizes, and any failed candidates.
+
+```bash
+node ./search.js image "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
+node ./search.js image --model think "Create a detailed isometric app icon." --image-dir ./assets/generated
+node ./search.js --image --model instant "Create four sticker-style UI mascots." --image-count 4 --image-dir ./assets/generated
+node ./search.js -s design-thread latest --image --image-dir ./assets/generated
+node ./search.js -s design-thread extract-images --resume --image-dir ./assets/generated
+node ./scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24
+```
 
 ## Exit codes
 
@@ -66,7 +127,7 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 | `0` | Success | Use the saved file / stdout output |
 | `1` | Daemon or network error | Re-run after fixing the daemon |
 | `2` | Bad arguments | Read `--help` |
-| `3` | Timeout during `wait` | Re-run with `--resume` and a longer `--wait`, or run `extract` to grab what's on screen |
+| `3` | Timeout during `wait` | Re-run with `--resume` or `-s <session> latest --wait 1200`; timeout does not mark `wait` done |
 | `4` | **Human intervention required** | See [references/intervention-points.md](references/intervention-points.md) |
 
 ## How it works
@@ -91,6 +152,7 @@ Each stage is a thin wrapper around one or two `cmd()` calls to the daemon. The 
 - **[references/intervention-points.md](references/intervention-points.md)** — runbook for each `exit 4` failure
 - **[references/script-architecture.md](references/script-architecture.md)** — state schema, sub-command lifecycle, resume semantics
 - **[references/dom-selectors.md](references/dom-selectors.md)** — CSS / ARIA selectors + popover pointer-event gotchas
+- **[references/image-generation.md](references/image-generation.md)** — image generation + transparent cutout workflow
 - **[references/operations.md](references/operations.md)** — daemon envelope, session naming, failure recovery, time budget
 - **[references/manual-fallback.md](references/manual-fallback.md)** — raw curl flow for when sub-commands aren't enough
 
