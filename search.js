@@ -13,6 +13,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const { execFile } = require('child_process');
 
 const DAEMON_HOST = '127.0.0.1';
@@ -38,6 +39,20 @@ const DEFAULT_IMAGE_MODEL = 'instant';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 60;
 const DEFAULT_TOOL = 'auto';
+const DEEP_RESEARCH_APP_URI = 'connectors://connector_openai_deep_research';
+const DEEP_RESEARCH_IFRAME_TITLE = 'internal://deep-research';
+const DEEP_RESEARCH_TERMINAL_STATUSES = new Set([
+  'completed',
+  'failed',
+  'error',
+  'rate_limited',
+  'rate_limit_exceeded',
+  'moderation_blocked',
+  'user_stopped',
+  'stopped',
+  'cancelled',
+  'canceled',
+]);
 
 const TOOL_TARGETS = {
   'deep-research': {
@@ -1087,7 +1102,8 @@ async function stageSend(state, opts) {
 
 async function stageWait(state, opts) {
   // In --continue mode, always re-wait for the new response
-  const waitKind = opts.imageMode ? 'image' : 'text';
+  const deepResearch = isDeepResearchState(state) && !opts.imageMode;
+  const waitKind = opts.imageMode ? 'image' : deepResearch ? 'deep-research' : 'text';
   const priorWait = state.stages.wait;
   const priorKind = priorWait && priorWait.data && priorWait.data.kind ? priorWait.data.kind : 'text';
   if (!opts.forceWait && !opts.continueMode && priorWait && priorWait.done && priorKind === waitKind) {
@@ -1133,6 +1149,58 @@ async function stageWait(state, opts) {
       saveState(state);
       const e = new Error(`image wait timed out after ${maxWait}s - re-run with --resume or "-s ${state.session} latest --image --wait ${maxWait}"`);
       e.code = 'wait_timeout';
+      e.stageData = data;
+      throw e;
+    }
+    markStage(state, 'wait', data);
+    saveState(state);
+    return { skipped: false, data };
+  }
+  if (deepResearch) {
+    const deepCriteria = deepResearchWaitCriteriaFromState(state, opts);
+    log(`waiting up to ${maxWait}s for Deep research (poll ${interval}s)...`);
+    const result = await waitForDeepResearchCompletion(state.session, {
+      maxWaitSec: maxWait,
+      intervalSec: interval,
+      ...deepCriteria,
+    });
+    log(`wait result: ${result.status} (${result.elapsed}s)`);
+    const data = {
+      kind: 'deep-research',
+      status: result.status,
+      elapsed: result.elapsed,
+      length: result.length || 0,
+      stableFor: result.stableFor || 0,
+      minChars: deepCriteria.minChars,
+      assistantBefore: deepCriteria.assistantBefore,
+      plan: result.plan || null,
+      widgetStatus: result.widgetStatus || '',
+      sessionId: result.sessionId || '',
+      export: result.export || null,
+      last: result.last,
+    };
+    if (result.status === 'login_required') {
+      const e = new Error('login wall appeared during Deep research - log in then re-run');
+      e.code = 'login_required';
+      e.stageData = data;
+      throw e;
+    }
+    if (result.status === 'rate_limited' || result.status === 'rate_limit_exceeded') {
+      const e = new Error('rate limited by ChatGPT Deep research - wait, then re-run with --resume');
+      e.code = 'rate_limited';
+      e.stageData = data;
+      throw e;
+    }
+    if (result.status === 'timeout') {
+      saveState(state);
+      const e = new Error(`Deep research wait timed out after ${maxWait}s - re-run with --resume or "-s ${state.session} latest --deep-research --wait ${maxWait}"`);
+      e.code = 'wait_timeout';
+      e.stageData = data;
+      throw e;
+    }
+    if (result.status && result.status !== 'complete') {
+      const e = new Error(`Deep research ended with status=${result.status}`);
+      e.code = `deep_research_${result.status}`;
       e.stageData = data;
       throw e;
     }
@@ -1187,18 +1255,27 @@ async function stageWait(state, opts) {
 
 async function stageExtract(state, opts) {
   // In --continue mode, always re-extract to get the latest response
-  if (!opts.forceExtract && !opts.continueMode && state.stages.extract && state.stages.extract.done) {
+  const deepResearch = isDeepResearchState(state) && !opts.imageMode;
+  const extractKind = deepResearch ? 'deep-research' : 'text';
+  const priorExtract = state.stages.extract;
+  const priorKind = priorExtract && priorExtract.data && priorExtract.data.kind ? priorExtract.data.kind : 'text';
+  if (!opts.forceExtract && !opts.continueMode && priorExtract && priorExtract.done && priorKind === extractKind) {
     return { skipped: true, data: state.stages.extract.data };
   }
   const criteria = waitCriteriaFromState(state, opts);
-  const extracted = await extractLastAssistant(state.session, criteria.requireNewAssistant ? criteria : {});
+  const extracted = deepResearch
+    ? await extractDeepResearchReport(state.session)
+    : await extractLastAssistant(state.session, criteria.requireNewAssistant ? criteria : {});
   if (!extracted.text) {
-    const e = new Error('no assistant message found - re-run with --resume, or run send again if generation never started');
+    const e = new Error(deepResearch
+      ? 'no Deep research report found - re-run with --resume after the report completes'
+      : 'no assistant message found - re-run with --resume, or run send again if generation never started');
     e.code = 'no_response';
     e.stageData = {
       error: extracted.error,
       assistantCount: extracted.assistantCount,
       assistantBefore: criteria.assistantBefore,
+      deepResearch: extracted.deepResearch,
     };
     throw e;
   }
@@ -1226,11 +1303,13 @@ async function stageExtract(state, opts) {
     log(`latest -> ${latest}`);
   }
   const data = {
+    kind: extractKind,
     length: extracted.text.length,
     path: out,
     turn: state.turns || 1,
     assistantCount: extracted.assistantCount,
     assistantIndex: extracted.index,
+    deepResearch: extracted.deepResearch,
   };
   markStage(state, 'extract', data);
   state.output = out;
@@ -1437,6 +1516,707 @@ function isSubstantiveAssistantText(text, minChars) {
   if (looksLikeThinkingPlaceholder(t)) return false;
   if (minChars > 0 && t.length < minChars) return false;
   return true;
+}
+
+function isDeepResearchState(state) {
+  return normalizeToolName(state && state.tool) === 'deep-research';
+}
+
+function deepResearchWaitCriteriaFromState(state, opts) {
+  const sendData = state.stages && state.stages.send && state.stages.send.data;
+  const assistantBefore = sendData && Number.isFinite(sendData.assistantBefore) ? sendData.assistantBefore : null;
+  return {
+    assistantBefore,
+    requireNewAssistant: assistantBefore !== null,
+    // Deep research reports can intentionally be terse; keep the default from
+    // blocking completion unless the caller explicitly asks for a minimum.
+    minChars: opts.minCharsExplicit ? Math.max(0, Number.isFinite(opts.minChars) ? opts.minChars : DEFAULT_MIN_RESPONSE_CHARS) : 1,
+  };
+}
+
+function summarizePlan(plan) {
+  if (!plan || typeof plan !== 'object') return null;
+  const title = String(plan.title || plan.name || plan.heading || '').trim();
+  const rawSteps = Array.isArray(plan.steps)
+    ? plan.steps
+    : Array.isArray(plan.items)
+      ? plan.items
+      : Array.isArray(plan.plan)
+        ? plan.plan
+        : [];
+  const steps = rawSteps.map((step, index) => {
+    if (typeof step === 'string') return { id: `step-${index + 1}`, text: step, status: '' };
+    if (!step || typeof step !== 'object') return { id: `step-${index + 1}`, text: String(step || ''), status: '' };
+    return {
+      id: String(step.id || `step-${index + 1}`),
+      text: String(step.text || step.title || step.name || step.description || '').trim(),
+      status: String(step.status || ''),
+      reason: step.reason || null,
+    };
+  }).filter((step) => step.text);
+  if (!title && !steps.length) return null;
+  return { title, steps };
+}
+
+function deepResearchPlanSignature(plan) {
+  if (!plan) return '';
+  return JSON.stringify({
+    title: plan.title || '',
+    steps: (plan.steps || []).map((step) => [step.text || '', step.status || '']),
+  });
+}
+
+function isDeepResearchTerminalStatus(status) {
+  return DEEP_RESEARCH_TERMINAL_STATUSES.has(String(status || '').toLowerCase());
+}
+
+function collectDeepResearchMessages(body) {
+  const meta = body && (body._meta || body.meta) || {};
+  const structured = body && (body.structuredContent || body.structured_content) || {};
+  const candidates = [
+    meta.deep_research_widget_messages,
+    structured.deep_research_widget_messages,
+    structured.messages,
+    body && body.deep_research_widget_messages,
+    body && body.messages,
+  ];
+  const messages = [];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) messages.push(...candidate);
+  }
+  return messages;
+}
+
+function firstStringAtPaths(root, paths) {
+  for (const pathParts of paths) {
+    let value = root;
+    for (const part of pathParts) {
+      value = value && value[part];
+      if (value === undefined || value === null) break;
+    }
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function getDeepResearchMessageContent(message) {
+  const content = message && message.content || {};
+  if (Array.isArray(content.parts)) return content.parts.filter(Boolean).join('\n').trim();
+  if (typeof content.text === 'string') return content.text.trim();
+  if (typeof content.content === 'string' && content.content_type !== 'reasoning_recap') return content.content.trim();
+  return '';
+}
+
+function normalizeDeepResearchToolState(progress, result) {
+  const body = result && result.body || {};
+  const meta = body && (body._meta || body.meta) || {};
+  const structured = body && (body.structuredContent || body.structured_content) || {};
+  const messages = collectDeepResearchMessages(body);
+  let status = firstStringAtPaths(body, [
+    ['status'],
+    ['state'],
+    ['workflow_status'],
+    ['deep_research_status'],
+    ['_meta', 'status'],
+    ['meta', 'status'],
+    ['structuredContent', 'status'],
+    ['structured_content', 'status'],
+    ['structuredContent', 'state'],
+    ['structured_content', 'state'],
+  ]);
+  let plan = summarizePlan(
+    structured.plan ||
+    structured.venus_plan ||
+    meta.venus_plan ||
+    meta.plan ||
+    body.plan
+  );
+  let finalSignal = false;
+  let lastMessageStatus = '';
+  let lastText = '';
+  for (const message of messages) {
+    const metadata = message && message.metadata || {};
+    const sdk = metadata.chatgpt_sdk || {};
+    const trm = sdk.tool_response_metadata || {};
+    const widgetState = trm.venus_widget_state || metadata.venus_widget_state || {};
+    const messageStatus = String(widgetState.status || metadata.status || message.status || '').trim();
+    if (messageStatus) lastMessageStatus = messageStatus;
+    const messagePlan = summarizePlan(trm.venus_plan || widgetState.plan || metadata.venus_plan);
+    if (messagePlan) plan = messagePlan;
+    if (metadata.venus_message_type === 'final_widget_status_signal') finalSignal = true;
+    const text = getDeepResearchMessageContent(message);
+    if (text) lastText = text;
+  }
+  if (!status && lastMessageStatus) status = lastMessageStatus;
+  if (finalSignal && !status) status = 'completed';
+
+  const lowerStatus = String(status || '').toLowerCase();
+  const completed = finalSignal || lowerStatus === 'completed' || lowerStatus === 'complete' || lowerStatus === 'succeeded' || lowerStatus === 'success';
+  const terminal = completed || isDeepResearchTerminalStatus(lowerStatus);
+  return {
+    ok: true,
+    status,
+    completed,
+    terminal,
+    messageCount: messages.length,
+    hasMessages: messages.length > 0,
+    textLength: lastText.length,
+    lastText,
+    plan: plan || (progress && progress.plan) || null,
+    sessionId: (progress && progress.sessionId) || '',
+    widgetSessionId: (progress && progress.widgetSessionId) || '',
+    rawStatus: status,
+  };
+}
+
+async function getDeepResearchState(session, progress) {
+  if (!progress || !progress.sessionId) {
+    return { ok: false, error: 'missing_session_id', messageCount: 0, hasMessages: false };
+  }
+  try {
+    const result = await callDeepResearchTool(session, progress, 'get_state', { session_id: progress.sessionId });
+    return normalizeDeepResearchToolState(progress, result);
+  } catch (e) {
+    return {
+      ok: false,
+      error: e.message,
+      code: e.code || '',
+      messageCount: 0,
+      hasMessages: false,
+      sessionId: progress.sessionId || '',
+    };
+  }
+}
+
+function deepResearchHasAdvanceControl(progress) {
+  const controls = progress && Array.isArray(progress.controls) ? progress.controls : [];
+  const advanceRe = /(start|begin|run)\s+(deep\s+)?research|deep research.*(start|begin|run)|confirm(\s+(plan|research))?|continue(\s+(research|with research))?|approve|开始(研究|搜索)|确认(计划|研究|开始)?|继续(研究|搜索)?|提交计划/i;
+  return controls.some((label) =>
+    advanceRe.test(label) &&
+    !/stop|cancel|delete|discard|停止|取消|删除|放弃/i.test(label)
+  );
+}
+
+async function clickDeepResearchAdvanceControl(session) {
+  const clicked = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const attrText = (el) => [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('data-testid'), textOf(el)].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+      const isAdvance = (label) =>
+        /(start|begin|run)\\s+(deep\\s+)?research|deep research.*(start|begin|run)|confirm(\\s+(plan|research))?|continue(\\s+(research|with research))?|approve|开始(研究|搜索)|确认(计划|研究|开始)?|继续(研究|搜索)?|提交计划/i.test(label) &&
+        !/stop|cancel|delete|discard|停止|取消|删除|放弃/i.test(label);
+      const buttons = [...document.querySelectorAll('button,[role="button"]')];
+      const button = buttons.find((el) => {
+        const label = attrText(el);
+        if (!label || !isAdvance(label)) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.display !== 'none' && style.visibility !== 'hidden' && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+      });
+      if (!button) return JSON.stringify({ clicked: false, reason: 'button_not_found', candidates: buttons.map(attrText).filter(Boolean).slice(0, 40) });
+      const rect = button.getBoundingClientRect();
+      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        button.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: rect.x + Math.min(10, rect.width / 2), clientY: rect.y + Math.min(10, rect.height / 2), button: 0 }));
+      }
+      return JSON.stringify({ clicked: true, label: attrText(button) });
+    })()`
+  );
+  return clicked || { clicked: false, reason: 'no_result' };
+}
+
+async function getDeepResearchProgress(session) {
+  const v = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const attrText = (el) => [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('data-testid'), textOf(el)].filter(Boolean).join(' ');
+      const fiberOf = (el) => {
+        if (!el) return null;
+        const key = Object.keys(el).find((k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        return key ? el[key] : null;
+      };
+      const parseJson = (text) => {
+        if (!text || typeof text !== 'string') return null;
+        try { return JSON.parse(text); } catch { return null; }
+      };
+      const normalizePlan = (plan) => {
+        if (!plan || typeof plan !== 'object') return null;
+        const rawSteps = Array.isArray(plan.steps) ? plan.steps : Array.isArray(plan.items) ? plan.items : Array.isArray(plan.plan) ? plan.plan : [];
+        const steps = rawSteps.map((step, index) => {
+          if (typeof step === 'string') return { id: 'step-' + (index + 1), text: step, status: '' };
+          if (!step || typeof step !== 'object') return { id: 'step-' + (index + 1), text: String(step || ''), status: '' };
+          return {
+            id: String(step.id || 'step-' + (index + 1)),
+            text: String(step.text || step.title || step.name || step.description || '').trim(),
+            status: String(step.status || ''),
+            reason: step.reason || null
+          };
+        }).filter((step) => step.text);
+        const title = String(plan.title || plan.name || plan.heading || '').trim();
+        return title || steps.length ? { title, steps } : null;
+      };
+      const out = {
+        status: '',
+        statuses: [],
+        completed: false,
+        terminal: false,
+        plan: null,
+        sessionId: '',
+        asyncTaskConversationId: '',
+        widgetSessionId: '',
+        websocketUrl: '',
+        toolMessageId: '',
+        widgetId: '',
+        waitingUntil: '',
+        venusMessageType: '',
+        messageCount: 0,
+        assistantSectionCount: 0,
+        iframe: null,
+        controls: [],
+        looksLikeLogin: /Log in|Sign in|Continue with|登录|登入/.test(textOf(document.body)),
+        looksRateLimited: /too many requests|please wait a moment|slow down|rate limit|请稍候|请求过多/i.test(textOf(document.body)),
+        url: location.href,
+        title: document.title
+      };
+      const iframe = document.querySelector('iframe[title=${JSON.stringify(DEEP_RESEARCH_IFRAME_TITLE)}]');
+      if (iframe) {
+        const rect = iframe.getBoundingClientRect();
+        out.iframe = {
+          title: iframe.getAttribute('title') || '',
+          src: iframe.getAttribute('src') || '',
+          visible: rect.width > 20 && rect.height > 20,
+          width: Math.round(rect.width),
+          height: Math.round(rect.height)
+        };
+      }
+      out.controls = [...document.querySelectorAll('button,[role="button"]')]
+        .map((el) => attrText(el).replace(/\\s+/g, ' ').trim())
+        .filter((label) => /start|confirm|continue|stop|cancel|edit|copy|download|开始|确认|继续|停止|取消|编辑|复制|下载/i.test(label))
+        .slice(0, 40);
+      const sections = [...document.querySelectorAll('section[data-turn="assistant"]')];
+      out.assistantSectionCount = sections.length;
+      for (const section of sections) {
+        const fiber = fiberOf(section);
+        let messages = [];
+        try { messages = fiber && fiber.memoizedProps && fiber.memoizedProps.children.props.turn.messages || []; } catch {}
+        out.messageCount += messages.length;
+        for (const message of messages) {
+          const metadata = message && message.metadata || {};
+          const sdk = metadata.chatgpt_sdk || {};
+          const trm = sdk.tool_response_metadata || {};
+          const widgetState = trm.venus_widget_state || metadata.venus_widget_state || {};
+          const plan = normalizePlan(trm.venus_plan || widgetState.plan || metadata.venus_plan);
+          const status = String(widgetState.status || '').trim();
+          if (status) out.statuses.push(status);
+          if (plan) out.plan = plan;
+          if (metadata.venus_message_type) out.venusMessageType = metadata.venus_message_type;
+          if (trm['openai/widgetSessionId']) out.widgetSessionId = trm['openai/widgetSessionId'];
+          if (trm.widgetSessionId) out.widgetSessionId = trm.widgetSessionId;
+          if (trm.async_task_conversation_id) {
+            out.asyncTaskConversationId = trm.async_task_conversation_id;
+            out.sessionId = trm.async_task_conversation_id;
+          }
+          if (trm.websocket_url) out.websocketUrl = trm.websocket_url;
+          if (widgetState.waiting_for_user_response_on_plan_until) out.waitingUntil = widgetState.waiting_for_user_response_on_plan_until;
+          if (message && message.author && message.author.name === 'api_tool.call_tool') {
+            out.toolMessageId = message.id || out.toolMessageId;
+            out.widgetId = message.id || out.widgetId;
+          }
+          const content = message && message.content || {};
+          const toolPayload = parseJson(content.text || (Array.isArray(content.parts) ? content.parts.join('') : ''));
+          if (toolPayload && toolPayload.session_id && !out.sessionId) out.sessionId = toolPayload.session_id;
+        }
+      }
+      out.status = out.statuses.length ? out.statuses[out.statuses.length - 1] : '';
+      if (out.venusMessageType === 'final_widget_status_signal' && !out.status) out.status = 'completed';
+      out.completed = out.status === 'completed' || out.venusMessageType === 'final_widget_status_signal';
+      out.terminal = out.completed || ${JSON.stringify([...DEEP_RESEARCH_TERMINAL_STATUSES])}.includes(String(out.status || '').toLowerCase());
+      if (!out.widgetId && out.toolMessageId) out.widgetId = out.toolMessageId;
+      return JSON.stringify(out);
+    })()`
+  );
+  if (!v || typeof v !== 'object') return {};
+  if (v.plan) v.plan = summarizePlan(v.plan);
+  return v;
+}
+
+async function callDeepResearchTool(session, progress, toolName, toolInput) {
+  const meta = progress || {};
+  const sessionId = meta.sessionId || meta.asyncTaskConversationId || (toolInput && toolInput.session_id) || '';
+  const messageId = meta.toolMessageId || meta.widgetId || '';
+  const widgetId = meta.widgetId || meta.toolMessageId || messageId;
+  if (!sessionId) {
+    const e = new Error(`Deep research ${toolName}: missing session_id`);
+    e.code = 'deep_research_session_missing';
+    throw e;
+  }
+  const v = await evaluate(
+    session,
+    `(async () => {
+      const auth = await fetch('/api/auth/session', { credentials: 'include' })
+        .then((r) => r.json())
+        .then((j) => j && j.accessToken);
+      if (!auth) return JSON.stringify({ ok: false, status: 401, error: 'missing_access_token' });
+      const payload = {
+        app_uri: ${JSON.stringify(DEEP_RESEARCH_APP_URI)},
+        tool_name: ${JSON.stringify(toolName)},
+        tool_input: ${JSON.stringify({ ...(toolInput || {}), session_id: sessionId })},
+        call_context: {
+          message_id: ${JSON.stringify(messageId)},
+          widget_context: {
+            app_uri: ${JSON.stringify(DEEP_RESEARCH_APP_URI)},
+            widget_id: ${JSON.stringify(widgetId)},
+            widget_session_id: ${JSON.stringify(meta.widgetSessionId || '')},
+            source: 'iframe'
+          }
+        }
+      };
+      const res = await fetch('/backend-api/ecosystem/call_mcp', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + auth },
+        body: JSON.stringify(payload)
+      });
+      const text = await res.text();
+      let body = null;
+      try { body = JSON.parse(text); } catch {}
+      return JSON.stringify({
+        ok: res.ok,
+        status: res.status,
+        contentType: res.headers.get('content-type') || '',
+        body,
+        text: body ? '' : text.slice(0, 4000)
+      });
+    })()`
+  );
+  if (!v || typeof v !== 'object') return { ok: false, status: 0, error: 'no_value' };
+  if (!v.ok) {
+    const e = new Error(`Deep research ${toolName} failed (${v.status || 'unknown'}): ${v.error || v.text || 'request failed'}`);
+    e.code = v.status === 401 ? 'deep_research_auth_failed' : 'deep_research_tool_failed';
+    e.stageData = { status: v.status, contentType: v.contentType, text: v.text };
+    throw e;
+  }
+  return v;
+}
+
+async function startDeepResearchNow(session, progress) {
+  if (!progress || (progress.status !== 'waiting_for_user_response_on_plan' && !deepResearchHasAdvanceControl(progress))) {
+    return { attempted: false, reason: 'not_waiting_for_plan' };
+  }
+  let mcpResult = null;
+  try {
+    if (progress.sessionId) {
+      const result = await callDeepResearchTool(session, progress, 'skip_sleep', { session_id: progress.sessionId });
+      const isError = !!(result.body && result.body.isError);
+      mcpResult = {
+        attempted: true,
+        ok: !isError,
+        method: 'skip_sleep',
+        status: result.status,
+        isError,
+      };
+      if (!isError) return mcpResult;
+    }
+  } catch (e) {
+    mcpResult = {
+      attempted: true,
+      ok: false,
+      method: 'skip_sleep',
+      error: e.message,
+      code: e.code,
+    };
+  }
+  const uiResult = await clickDeepResearchAdvanceControl(session);
+  if (uiResult.clicked) {
+    return {
+      attempted: true,
+      ok: true,
+      method: 'ui_button',
+      label: uiResult.label || '',
+      fallbackFrom: mcpResult && mcpResult.error || '',
+    };
+  }
+  return {
+    attempted: true,
+    ok: false,
+    method: progress.sessionId ? 'skip_sleep+ui_button' : 'ui_button',
+    error: (mcpResult && mcpResult.error) || uiResult.reason || 'missing_session_id',
+    ui: uiResult,
+  };
+}
+
+function findZipEntry(buffer, wantedName) {
+  let eocd = -1;
+  const min = Math.max(0, buffer.length - 65558);
+  for (let i = buffer.length - 22; i >= min; i--) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error('docx export is not a valid zip: missing EOCD');
+  const totalEntries = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  for (let i = 0; i < totalEntries; i++) {
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) throw new Error(`docx export is not a valid zip: bad central directory at ${offset}`);
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLen = buffer.readUInt16LE(offset + 28);
+    const extraLen = buffer.readUInt16LE(offset + 30);
+    const commentLen = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.slice(offset + 46, offset + 46 + nameLen).toString('utf8');
+    if (name === wantedName) {
+      if (buffer.readUInt32LE(localOffset) !== 0x04034b50) throw new Error(`docx export is not a valid zip: bad local header for ${wantedName}`);
+      const localNameLen = buffer.readUInt16LE(localOffset + 26);
+      const localExtraLen = buffer.readUInt16LE(localOffset + 28);
+      const start = localOffset + 30 + localNameLen + localExtraLen;
+      const compressed = buffer.slice(start, start + compressedSize);
+      if (method === 0) return compressed;
+      if (method === 8) return zlib.inflateRawSync(compressed);
+      throw new Error(`docx export uses unsupported zip compression method ${method}`);
+    }
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
+}
+
+function decodeXmlEntities(text) {
+  return String(text || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function extractDocxText(buffer) {
+  const documentXml = findZipEntry(buffer, 'word/document.xml');
+  if (!documentXml) throw new Error('docx export did not contain word/document.xml');
+  const xml = documentXml.toString('utf8');
+  const chunks = [];
+  const tokenRe = /(<w:tab\b[^>]*\/>|<w:br\b[^>]*\/>|<\/w:p>|<w:t\b[^>]*>([\s\S]*?)<\/w:t>)/g;
+  let match;
+  while ((match = tokenRe.exec(xml))) {
+    const token = match[1];
+    if (token.startsWith('<w:t')) chunks.push(decodeXmlEntities(match[2] || ''));
+    else if (token.startsWith('<w:tab')) chunks.push('\t');
+    else chunks.push('\n');
+  }
+  return chunks.join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function extractTextFromDeepResearchMessages(body) {
+  const messages = collectDeepResearchMessages(body);
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] || {};
+    const content = message.content || {};
+    let text = '';
+    if (Array.isArray(content.parts)) text = content.parts.filter(Boolean).join('\n');
+    else if (typeof content.text === 'string') text = content.text;
+    else if (typeof content.content === 'string' && content.content_type !== 'reasoning_recap') text = content.content;
+    if (text && text.trim()) return text.trim();
+  }
+  return '';
+}
+
+async function extractDeepResearchReport(session, progress = null) {
+  const current = progress && progress.sessionId ? progress : await getDeepResearchProgress(session);
+  if (!current || !current.sessionId) {
+    return { text: '', error: 'deep_research_session_missing', deepResearch: current || null };
+  }
+  let exported;
+  try {
+    exported = await callDeepResearchTool(session, current, 'export', {
+      session_id: current.sessionId,
+      export_type: 'docx',
+    });
+  } catch (e) {
+    return {
+      text: '',
+      error: e.message,
+      deepResearch: {
+        status: current.status || '',
+        sessionId: current.sessionId || '',
+        plan: current.plan || null,
+      },
+    };
+  }
+  const body = exported.body || {};
+  const encoded = body && ((body._meta && body._meta.encoded_data) || (body.meta && body.meta.encoded_data));
+  if (encoded) {
+    try {
+      const buffer = Buffer.from(encoded, 'base64');
+      const text = extractDocxText(buffer);
+      return {
+        text,
+        len: text.length,
+        deepResearch: {
+          status: current.status || '',
+          sessionId: current.sessionId || '',
+          plan: current.plan || null,
+          export: {
+            type: 'docx',
+            bytes: buffer.length,
+            contentDisposition: (body._meta && body._meta.content_disposition) || (body.meta && body.meta.content_disposition) || '',
+          },
+        },
+      };
+    } catch (e) {
+      return { text: '', error: `docx_export_parse_failed: ${e.message}`, deepResearch: { status: current.status || '', sessionId: current.sessionId || '' } };
+    }
+  }
+  const fallbackText = extractTextFromDeepResearchMessages(body);
+  return {
+    text: fallbackText,
+    len: fallbackText.length,
+    error: fallbackText ? undefined : 'deep_research_report_unavailable',
+    deepResearch: {
+      status: current.status || '',
+      sessionId: current.sessionId || '',
+      plan: current.plan || null,
+    },
+  };
+}
+
+async function waitForDeepResearchCompletion(session, config) {
+  const maxWaitSec = Math.max(0, config.maxWaitSec);
+  const intervalSec = Math.max(1, config.intervalSec);
+  const minChars = Math.max(0, Number.isFinite(config.minChars) ? config.minChars : 1);
+  const start = Date.now();
+  let lastReport = 0;
+  let lastPlanSig = '';
+  let startAttempt = null;
+  let lastStartAttemptAt = -Infinity;
+  let lastExportAttemptAt = -Infinity;
+  let lastProgress = null;
+  let lastToolState = null;
+  let lastExtract = null;
+
+  while (true) {
+    const elapsed = Math.floor((Date.now() - start) / 1000);
+    const progress = await getDeepResearchProgress(session);
+    lastProgress = progress;
+    const toolState = progress.sessionId ? await getDeepResearchState(session, progress) : null;
+    if (toolState && toolState.ok) {
+      lastToolState = toolState;
+      if (!progress.plan && toolState.plan) progress.plan = toolState.plan;
+      if (toolState.hasMessages && (!startAttempt || startAttempt.ok === false)) {
+        startAttempt = { attempted: false, ok: true, method: 'get_state', reason: 'messages_present' };
+      }
+    }
+
+    const plan = (toolState && toolState.plan) || progress.plan;
+    const planSig = deepResearchPlanSignature(plan);
+    if (planSig && planSig !== lastPlanSig) {
+      lastPlanSig = planSig;
+      log(`Deep research plan: ${plan.title || '(untitled)'}`);
+      for (const step of plan.steps || []) log(`  - ${step.text}`);
+    }
+
+    if (progress.looksLikeLogin && !progress.sessionId) return { status: 'login_required', elapsed, last: summarizeDeepResearchProgress(progress, toolState, lastExtract) };
+    if (progress.looksRateLimited) return { status: 'rate_limited', elapsed, last: summarizeDeepResearchProgress(progress, toolState, lastExtract) };
+
+    const hasToolMessages = !!(toolState && toolState.ok && toolState.hasMessages);
+    const waitingForPlan = progress.status === 'waiting_for_user_response_on_plan' && !hasToolMessages;
+    const shouldAdvance = (waitingForPlan || deepResearchHasAdvanceControl(progress)) && elapsed - lastStartAttemptAt >= 15 && !hasToolMessages;
+    if (shouldAdvance) {
+      log('Deep research is waiting for plan confirmation; starting research via skip_sleep...');
+      startAttempt = await startDeepResearchNow(session, progress);
+      lastStartAttemptAt = elapsed;
+      if (startAttempt.ok) log(`Deep research plan confirmed (${startAttempt.method || 'unknown'})`);
+      else log(`Deep research plan confirmation did not complete automatically: ${startAttempt.error || startAttempt.reason || 'unknown'}`);
+      await sleep(1200);
+    }
+
+    const effectiveStatus = (
+      (toolState && toolState.completed) ? 'completed' :
+      (toolState && toolState.status) ||
+      (hasToolMessages && progress.status === 'waiting_for_user_response_on_plan' ? 'researching' : '') ||
+      progress.status ||
+      ''
+    );
+    const completed = !!(progress.completed || progress.status === 'completed' || (toolState && toolState.completed));
+    const shouldTryExport =
+      !!progress.sessionId &&
+      (completed ||
+        (hasToolMessages && (!lastExtract || elapsed - lastExportAttemptAt >= 30)) ||
+        (toolState && toolState.terminal && !lastExtract));
+
+    if (shouldTryExport) {
+      lastExportAttemptAt = elapsed;
+      lastExtract = await extractDeepResearchReport(session, progress);
+      const text = lastExtract.text || '';
+      if (text.trim() && text.trim().length >= minChars) {
+        return {
+          status: 'complete',
+          elapsed,
+          length: text.length,
+          stableFor: 0,
+          minChars,
+          widgetStatus: effectiveStatus || 'completed',
+          sessionId: progress.sessionId || '',
+          plan: plan || null,
+          export: lastExtract.deepResearch && lastExtract.deepResearch.export || null,
+          last: summarizeDeepResearchProgress(progress, toolState, lastExtract),
+        };
+      }
+    }
+
+    const lowerStatus = String(effectiveStatus || '').toLowerCase();
+    if (lowerStatus && isDeepResearchTerminalStatus(lowerStatus) && lowerStatus !== 'completed') {
+      return {
+        status: lowerStatus,
+        elapsed,
+        widgetStatus: effectiveStatus || '',
+        sessionId: progress.sessionId || '',
+        plan: plan || null,
+        last: summarizeDeepResearchProgress(progress, toolState, lastExtract),
+      };
+    }
+
+    if (elapsed - lastReport >= 30) {
+      const need = waitingForPlan
+        ? 'plan-confirmation'
+        : completed
+          ? `exported-report>=${minChars}`
+          : hasToolMessages
+            ? `running/export-probe>=${minChars}`
+            : 'completed-report';
+      const getState = toolState && toolState.ok
+        ? `get_state=${toolState.status || 'unknown'} msg=${toolState.messageCount || 0}`
+        : toolState && toolState.error
+          ? `get_state_error=${toolState.error.slice(0, 120)}`
+          : 'get_state=unavailable';
+      log(`[${elapsed}s] deep-research status=${effectiveStatus || progress.status || 'unknown'} top=${progress.status || 'unknown'} ${getState} session=${progress.sessionId || 'none'} iframe=${progress.iframe && progress.iframe.visible ? 1 : 0} exported=${lastExtract && lastExtract.text ? lastExtract.text.length : 0} need=${need}`);
+      lastReport = elapsed;
+    }
+
+    if (elapsed >= maxWaitSec) break;
+    await sleep(Math.min(intervalSec, Math.max(1, maxWaitSec - elapsed)) * 1000);
+  }
+
+  return { status: 'timeout', elapsed: maxWaitSec, last: summarizeDeepResearchProgress(lastProgress, lastToolState, lastExtract) };
+}
+
+function summarizeDeepResearchProgress(progress, toolState, extract) {
+  return {
+    status: (progress && progress.status) || '',
+    toolStatus: (toolState && toolState.status) || '',
+    toolMessageCount: (toolState && toolState.messageCount) || 0,
+    toolStateError: (toolState && toolState.error) || '',
+    completed: !!(progress && progress.completed),
+    terminal: !!(progress && progress.terminal),
+    sessionId: (progress && progress.sessionId) || '',
+    widgetSessionId: (progress && progress.widgetSessionId) || '',
+    hasPlan: !!(progress && progress.plan),
+    plan: (progress && progress.plan) || null,
+    iframe: (progress && progress.iframe) || null,
+    exportError: extract && extract.error || '',
+    exportedLength: extract && extract.text ? extract.text.length : 0,
+    url: (progress && progress.url) || '',
+  };
 }
 
 function summarizeProgress(page, criteria) {
@@ -2067,6 +2847,7 @@ function parseArgs(argv) {
     waitExplicit: false,
     interval: DEFAULT_INTERVAL_SECONDS,
     minChars: DEFAULT_MIN_RESPONSE_CHARS,
+    minCharsExplicit: false,
     stableSec: DEFAULT_STABLE_SECONDS,
     imageMode: false,
     imageDir: '',
@@ -2111,7 +2892,7 @@ function parseArgs(argv) {
     else if (a === '-m' || a === '--model') { opts.model = argv[++i] || 'auto'; opts.modelExplicit = true; }
     else if (a === '-w' || a === '--wait') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
     else if (a === '-i' || a === '--interval') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.interval = n; }
-    else if (a === '--min-chars') { opts.minChars = parseInt(argv[++i], 10); if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
+    else if (a === '--min-chars') { opts.minChars = parseInt(argv[++i], 10); opts.minCharsExplicit = true; if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
     else if (a === '--stable' || a === '--stable-seconds') { opts.stableSec = parseInt(argv[++i], 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
     else if (a === '--image-dir') { opts.imageDir = argv[++i] || ''; }
     else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
@@ -2135,7 +2916,7 @@ function parseArgs(argv) {
         else if (k === 'model') { opts.model = v; opts.modelExplicit = true; }
         else if (k === 'wait') { const n = parseInt(v, 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
         else if (k === 'interval') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.interval = n; }
-        else if (k === 'min-chars') { opts.minChars = parseInt(v, 10); if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
+        else if (k === 'min-chars') { opts.minChars = parseInt(v, 10); opts.minCharsExplicit = true; if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
         else if (k === 'stable' || k === 'stable-seconds') { opts.stableSec = parseInt(v, 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
         else if (k === 'image') opts.imageMode = !/^(0|false|no)$/i.test(v);
         else if (k === 'image-dir') opts.imageDir = v;

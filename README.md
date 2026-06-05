@@ -92,6 +92,8 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 
 Completion defaults are tuned for Pro Extended: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. Use `--min-chars 0` only when you intentionally expect a terse answer.
 
+Deep research uses a separate completion path: the script prints the generated plan, confirms it through the connector or a narrow Start/Confirm/Continue research button fallback, polls the connector's `get_state` because the visible ChatGPT status can lag behind, and extracts the final report through DOCX export.
+
 To use ChatGPT's composer tools, pass `--deep-research`, `--deep-search`, `--web-search`, or the generic `--tool <auto|none|deep-research|web-search|create-image>`. The `ensure-tool` stage runs after model selection and before upload/send.
 
 ```bash

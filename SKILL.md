@@ -95,6 +95,8 @@ If `wait` times out, it exits `3` and does **not** mark the `wait` stage done. R
 
 When using this skill from an agent, budget at least 20 minutes per Pro Extended prompt and up to 60 minutes for Deep research. If the command is still running with no stdout, keep polling the process; do not stop early unless the user explicitly cancels or the script exits.
 
+For Deep research, `wait` uses the connector state rather than only the visible ChatGPT message text. It prints the generated research plan, confirms it through the Deep research connector or a narrow Start/Confirm/Continue research button fallback, polls `get_state` because the top-level UI can remain stale, and probes DOCX export until the full report is available.
+
 ### Deep research and Web search
 
 Use `--deep-research` when the user explicitly wants ChatGPT's Deep research tool, current-source investigation, or a searched report with citations. `--deep-search` is an alias because users often describe the same ChatGPT UI feature that way.
