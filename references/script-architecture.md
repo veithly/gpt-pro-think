@@ -36,6 +36,17 @@ Schema (v1):
   "model": "auto | pro | extended | thinking | instant",
   "tool": "auto | none | deep-research | web-search | create-image",
   "images": [],
+  "active": {
+    "stage": "wait",
+    "status": "waiting",
+    "kind": "deep-research",
+    "startedAt": 1700000060000,
+    "updatedAt": 1700000180000,
+    "elapsed": 120,
+    "waitLimitSec": null,
+    "unlimited": true,
+    "need": "running/export-probe>=1"
+  },
   "stages": {
     "open":        {"done": true,  "at": ..., "data": {"tabId": 123, "url": "https://chatgpt.com/"}},
     "loginCheck":  {"done": true,  "at": ..., "data": {"state": "logged_in"}},
@@ -64,6 +75,12 @@ Full image runs default to `model: "instant"` unless `--model` is passed. `--mod
 
 Deep research runs default to `--wait 3600` unless `--wait` is passed, because ChatGPT's Deep research tool can run much longer than Pro Extended text replies.
 
+Passing `--until-complete` (aliases: `--wait-forever`, `--hang`) disables the wait timeout for text, image, and Deep research waits. During an active wait, the script rewrites `active` in the state file with progress fields such as `elapsed`, `need`, status-specific counts, and `last`. On completion, `active` is removed and the `wait` stage is marked done.
+
+`research`, `deep-research`, and `deep-search` are command aliases for the agent-safe Deep research flow. They normalize to `run` with `tool=deep-research` and `--until-complete`, so callers do not need to know about plan confirmation, stale top-frame widget state, or DOCX export extraction.
+
+`doctor` is a no-prompt readiness check. It verifies WebBridge health, opens or reuses a ChatGPT tab, checks login, opens the composer tools menu, and confirms `Deep research` / `Web search` are visible before an agent starts a long run.
+
 ## Sub-command lifecycle
 
 Each sub-command is a function that:
@@ -80,6 +97,8 @@ Stages that take a prompt (`send`, `run`, `image`) also accept `-f` and `-` (std
 - `cleanup` is always safe to re-run.
 - The state file is rewritten on every successful stage completion. If the process crashes mid-stage, the file shows the last completed stage and the next one will retry.
 - `wait` timeouts exit `3` and are not marked done. The next `--resume` or `latest` command re-polls instead of extracting a partial answer by accident.
+- `--until-complete` is the preferred agent mode: it keeps the CLI process alive across long runs and only exits after `wait` completes, a terminal error occurs, or human intervention is required.
+- `research "..."` is the preferred Deep research mode for agents. It implies the Deep research tool and unlimited wait, then prints the extracted report.
 - `latest` is not part of the main pipeline. It opens/recovers the named session, force-runs `wait` and `extract`, then prints the newest complete answer. With `--image`, it force-runs image wait + `extractImages` and prints a saved-path summary.
 - `ensure-tool` can be run directly to pre-select or clear a tool without sending a prompt: `search.js ensure-tool deep-research` or `search.js ensure-tool none`.
 

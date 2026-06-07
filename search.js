@@ -262,6 +262,24 @@ function saveState(state) {
   fs.writeFileSync(statePath(state.session), JSON.stringify(state, null, 2));
 }
 
+function setActiveStage(state, name, data = {}) {
+  const prior = state.active && state.active.stage === name ? state.active : {};
+  state.active = {
+    stage: name,
+    startedAt: prior.startedAt || Date.now(),
+    updatedAt: Date.now(),
+    ...data,
+  };
+  saveState(state);
+}
+
+function clearActiveStage(state, name) {
+  if (!state.active) return;
+  if (name && state.active.stage !== name) return;
+  delete state.active;
+  saveState(state);
+}
+
 function newState(session, opts) {
   return {
     version: STATE_VERSION,
@@ -281,6 +299,7 @@ function newState(session, opts) {
     conversationTitle: '',
     images: [],
     turns: 0,
+    active: null,
     stages: {},
   };
 }
@@ -1107,17 +1126,29 @@ async function stageWait(state, opts) {
   const priorWait = state.stages.wait;
   const priorKind = priorWait && priorWait.data && priorWait.data.kind ? priorWait.data.kind : 'text';
   if (!opts.forceWait && !opts.continueMode && priorWait && priorWait.done && priorKind === waitKind) {
+    clearActiveStage(state, 'wait');
     return { skipped: true, data: priorWait.data };
   }
-  const maxWait = Number.isFinite(opts.wait) ? opts.wait : DEFAULT_WAIT_SECONDS;
+  const maxWait = opts.waitForever ? Number.POSITIVE_INFINITY : Number.isFinite(opts.wait) ? opts.wait : DEFAULT_WAIT_SECONDS;
   const interval = Number.isFinite(opts.interval) ? opts.interval : DEFAULT_INTERVAL_SECONDS;
+  const recordWaitProgress = (progress = {}) => {
+    setActiveStage(state, 'wait', {
+      status: progress.status || 'waiting',
+      kind: waitKind,
+      ...waitLimitState(maxWait),
+      elapsed: Number.isFinite(progress.elapsed) ? progress.elapsed : 0,
+      ...progress,
+    });
+  };
+  recordWaitProgress({ status: 'waiting', elapsed: 0 });
   if (opts.imageMode) {
     const imageCriteria = imageWaitCriteriaFromState(state, opts);
-    log(`waiting up to ${maxWait}s for image(s) (poll ${interval}s, stable ${imageCriteria.stableSec}s, min ${imageCriteria.requiredImages} image)...`);
+    log(`waiting ${waitLimitLabel(maxWait)} for image(s) (poll ${interval}s, stable ${imageCriteria.stableSec}s, min ${imageCriteria.requiredImages} image)...`);
     const result = await waitForImageCompletion(state.session, {
       maxWaitSec: maxWait,
       intervalSec: interval,
       ...imageCriteria,
+      onProgress: recordWaitProgress,
     });
     log(`wait result: ${result.status} (${result.elapsed}s)`);
     const data = {
@@ -1134,35 +1165,39 @@ async function stageWait(state, opts) {
       last: result.last,
     };
     if (result.status === 'login_required') {
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
       const e = new Error('login wall appeared during image generation - log in then re-run');
       e.code = 'login_required';
       e.stageData = data;
       throw e;
     }
     if (result.status === 'rate_limited') {
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
       const e = new Error('rate limited by chatgpt - wait 60s then re-run with --resume');
       e.code = 'rate_limited';
       e.stageData = data;
       throw e;
     }
     if (result.status === 'timeout') {
-      saveState(state);
-      const e = new Error(`image wait timed out after ${maxWait}s - re-run with --resume or "-s ${state.session} latest --image --wait ${maxWait}"`);
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
+      const e = new Error(`image wait timed out after ${maxWait}s - re-run with --resume --until-complete or "-s ${state.session} latest --image --until-complete"`);
       e.code = 'wait_timeout';
       e.stageData = data;
       throw e;
     }
+    clearActiveStage(state, 'wait');
     markStage(state, 'wait', data);
     saveState(state);
     return { skipped: false, data };
   }
   if (deepResearch) {
     const deepCriteria = deepResearchWaitCriteriaFromState(state, opts);
-    log(`waiting up to ${maxWait}s for Deep research (poll ${interval}s)...`);
+    log(`waiting ${waitLimitLabel(maxWait)} for Deep research (poll ${interval}s)...`);
     const result = await waitForDeepResearchCompletion(state.session, {
       maxWaitSec: maxWait,
       intervalSec: interval,
       ...deepCriteria,
+      onProgress: recordWaitProgress,
     });
     log(`wait result: ${result.status} (${result.elapsed}s)`);
     const data = {
@@ -1180,40 +1215,45 @@ async function stageWait(state, opts) {
       last: result.last,
     };
     if (result.status === 'login_required') {
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
       const e = new Error('login wall appeared during Deep research - log in then re-run');
       e.code = 'login_required';
       e.stageData = data;
       throw e;
     }
     if (result.status === 'rate_limited' || result.status === 'rate_limit_exceeded') {
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
       const e = new Error('rate limited by ChatGPT Deep research - wait, then re-run with --resume');
       e.code = 'rate_limited';
       e.stageData = data;
       throw e;
     }
     if (result.status === 'timeout') {
-      saveState(state);
-      const e = new Error(`Deep research wait timed out after ${maxWait}s - re-run with --resume or "-s ${state.session} latest --deep-research --wait ${maxWait}"`);
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
+      const e = new Error(`Deep research wait timed out after ${maxWait}s - re-run with --resume --until-complete or "-s ${state.session} latest --deep-research --until-complete"`);
       e.code = 'wait_timeout';
       e.stageData = data;
       throw e;
     }
     if (result.status && result.status !== 'complete') {
+      recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
       const e = new Error(`Deep research ended with status=${result.status}`);
       e.code = `deep_research_${result.status}`;
       e.stageData = data;
       throw e;
     }
+    clearActiveStage(state, 'wait');
     markStage(state, 'wait', data);
     saveState(state);
     return { skipped: false, data };
   }
   const criteria = waitCriteriaFromState(state, opts);
-  log(`waiting up to ${maxWait}s (poll ${interval}s, stable ${criteria.stableSec}s, min ${criteria.minChars} chars)...`);
+  log(`waiting ${waitLimitLabel(maxWait)} (poll ${interval}s, stable ${criteria.stableSec}s, min ${criteria.minChars} chars)...`);
   const result = await waitForCompletion(state.session, {
     maxWaitSec: maxWait,
     intervalSec: interval,
     ...criteria,
+    onProgress: recordWaitProgress,
   });
   log(`wait result: ${result.status} (${result.elapsed}s)`);
   const data = {
@@ -1229,12 +1269,14 @@ async function stageWait(state, opts) {
     last: result.last,
   };
   if (result.status === 'login_required') {
+    recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
     const e = new Error('login wall appeared during generation - log in then re-run');
     e.code = 'login_required';
     e.stageData = data;
     throw e;
   }
   if (result.status === 'rate_limited') {
+    recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
     const e = new Error('rate limited by chatgpt - wait 60s then re-run with --resume');
     e.code = 'rate_limited';
     e.stageData = data;
@@ -1242,12 +1284,13 @@ async function stageWait(state, opts) {
   }
   if (result.status === 'timeout') {
     // Timeout is exit 3, not 4. Throw a special error.
-    saveState(state);
-    const e = new Error(`wait timed out after ${maxWait}s - latest reply is not complete yet; re-run with --resume or "-s ${state.session} latest --wait ${maxWait}"`);
+    recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
+    const e = new Error(`wait timed out after ${maxWait}s - latest reply is not complete yet; re-run with --resume --until-complete or "-s ${state.session} latest --until-complete"`);
     e.code = 'wait_timeout';
     e.stageData = data;
     throw e;
   }
+  clearActiveStage(state, 'wait');
   markStage(state, 'wait', data);
   saveState(state);
   return { skipped: false, data };
@@ -1408,6 +1451,90 @@ async function runLatest(state, opts) {
   return results;
 }
 
+async function runDoctor(state, opts, daemonStatus) {
+  const checks = [
+    {
+      name: 'webbridge',
+      ok: true,
+      daemonVersion: daemonStatus && daemonStatus.version || '',
+      extensionVersion: daemonStatus && daemonStatus.extension_version || '',
+    },
+  ];
+  const doctorOpts = { ...opts, keepSession: true };
+  let openResult = null;
+  let loginResult = null;
+  let toolMenu = null;
+  try {
+    openResult = await stageOpen(state, doctorOpts);
+    checks.push({
+      name: 'chatgpt_tab',
+      ok: true,
+      url: openResult && openResult.data && openResult.data.url || '',
+      reused: !!(openResult && openResult.data && openResult.data.reused),
+    });
+  } catch (e) {
+    checks.push({ name: 'chatgpt_tab', ok: false, error: e.message, code: e.code || '' });
+  }
+
+  if (checks.every((check) => check.ok)) {
+    try {
+      loginResult = await stageLoginCheck(state, doctorOpts);
+      checks.push({
+        name: 'chatgpt_login',
+        ok: loginResult && loginResult.data && loginResult.data.state !== 'login_required',
+        state: loginResult && loginResult.data && loginResult.data.state || 'unknown',
+      });
+    } catch (e) {
+      checks.push({ name: 'chatgpt_login', ok: false, error: e.message, code: e.code || '' });
+    }
+  }
+
+  if (checks.every((check) => check.ok)) {
+    try {
+      toolMenu = await openToolsMenu(state.session);
+      const items = Array.isArray(toolMenu.items) ? toolMenu.items : [];
+      const deepResearch = items.find((item) => item.tool === 'deep-research') || null;
+      const webSearch = items.find((item) => item.tool === 'web-search') || null;
+      checks.push({
+        name: 'composer_tools_menu',
+        ok: !!toolMenu.open,
+        opened: !!toolMenu.opened,
+        itemCount: items.length,
+      });
+      checks.push({
+        name: 'deep_research_tool',
+        ok: !!deepResearch,
+        label: deepResearch && deepResearch.text || '',
+      });
+      checks.push({
+        name: 'web_search_tool',
+        ok: !!webSearch,
+        label: webSearch && webSearch.text || '',
+      });
+    } catch (e) {
+      checks.push({ name: 'composer_tools_menu', ok: false, error: e.message, code: e.code || '' });
+    } finally {
+      await evaluate(state.session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); document.body.click(); return true; })()`).catch(() => false);
+    }
+  }
+
+  const ok = checks.every((check) => check.ok);
+  const data = {
+    ok,
+    checks,
+    recommendedResearchCommand: `node ${path.basename(__filename)} research --until-complete "Research your topic and cite sources."`,
+    state: state.session,
+    conversationUrl: state.conversationUrl || '',
+  };
+  if (!ok) {
+    const e = new Error('doctor found an environment problem');
+    e.code = 'doctor_failed';
+    e.stageData = data;
+    throw e;
+  }
+  return { doctor: { skipped: false, data } };
+}
+
 // --- Model detection & switching --------------------------------------------
 
 async function detectModel(session) {
@@ -1497,6 +1624,26 @@ async function ensureModel(session, target) {
 function textSignature(text) {
   const t = String(text || '');
   return `${t.length}:${t.slice(0, 160)}:${t.slice(-500)}`;
+}
+
+function waitLimitLabel(maxWait) {
+  return Number.isFinite(maxWait) ? `up to ${maxWait}s` : 'until complete';
+}
+
+function waitLimitState(maxWait) {
+  return {
+    waitLimitSec: Number.isFinite(maxWait) ? maxWait : null,
+    unlimited: !Number.isFinite(maxWait),
+  };
+}
+
+function emitWaitProgress(config, progress) {
+  if (typeof config.onProgress !== 'function') return;
+  try {
+    config.onProgress(progress);
+  } catch (e) {
+    log(`wait progress update failed: ${e.message}`);
+  }
 }
 
 function looksLikeThinkingPlaceholder(text) {
@@ -2176,19 +2323,30 @@ async function waitForDeepResearchCompletion(session, config) {
       };
     }
 
+    const need = waitingForPlan
+      ? 'plan-confirmation'
+      : completed
+        ? `exported-report>=${minChars}`
+        : hasToolMessages
+          ? `running/export-probe>=${minChars}`
+          : 'completed-report';
+    const getState = toolState && toolState.ok
+      ? `get_state=${toolState.status || 'unknown'} msg=${toolState.messageCount || 0}`
+      : toolState && toolState.error
+        ? `get_state_error=${toolState.error.slice(0, 120)}`
+        : 'get_state=unavailable';
+    emitWaitProgress(config, {
+      status: 'waiting',
+      elapsed,
+      widgetStatus: effectiveStatus || progress.status || '',
+      sessionId: progress.sessionId || '',
+      length: lastExtract && lastExtract.text ? lastExtract.text.length : 0,
+      need,
+      plan: plan || null,
+      last: summarizeDeepResearchProgress(progress, toolState, lastExtract),
+    });
+
     if (elapsed - lastReport >= 30) {
-      const need = waitingForPlan
-        ? 'plan-confirmation'
-        : completed
-          ? `exported-report>=${minChars}`
-          : hasToolMessages
-            ? `running/export-probe>=${minChars}`
-            : 'completed-report';
-      const getState = toolState && toolState.ok
-        ? `get_state=${toolState.status || 'unknown'} msg=${toolState.messageCount || 0}`
-        : toolState && toolState.error
-          ? `get_state_error=${toolState.error.slice(0, 120)}`
-          : 'get_state=unavailable';
       log(`[${elapsed}s] deep-research status=${effectiveStatus || progress.status || 'unknown'} top=${progress.status || 'unknown'} ${getState} session=${progress.sessionId || 'none'} iframe=${progress.iframe && progress.iframe.visible ? 1 : 0} exported=${lastExtract && lastExtract.text ? lastExtract.text.length : 0} need=${need}`);
       lastReport = elapsed;
     }
@@ -2307,14 +2465,25 @@ async function waitForCompletion(session, config) {
     }
     const stableFor = Math.floor((Date.now() - stableSince) / 1000);
 
+    const need = !hasNewAssistant
+      ? 'new-assistant'
+      : !substantive
+        ? `substantive-text>=${criteria.minChars}`
+        : generating
+          ? 'generation-stop'
+          : `stable ${stableFor}/${criteria.stableSec}s`;
+    emitWaitProgress(config, {
+      status: 'waiting',
+      elapsed,
+      assistantCount: page.assistantCount || 0,
+      length: text.length,
+      busy: generating,
+      stableFor,
+      need,
+      last: summarizeProgress(lastPage, criteria),
+    });
+
     if (elapsed - lastReport >= 30) {
-      const need = !hasNewAssistant
-        ? 'new-assistant'
-        : !substantive
-          ? `substantive-text>=${criteria.minChars}`
-          : generating
-            ? 'generation-stop'
-            : `stable ${stableFor}/${criteria.stableSec}s`;
       log(`[${elapsed}s] assistant=${page.assistantCount || 0} len=${text.length} busy=${generating ? 1 : 0} copy=${page.copyCount || 0} need=${need}`);
       lastReport = elapsed;
     }
@@ -2378,16 +2547,28 @@ async function waitForImageCompletion(session, config) {
     }
     const stableFor = Math.floor((Date.now() - stableSince) / 1000);
 
+    const need = !hasNewAssistant
+      ? 'new-assistant'
+      : imageCount < criteria.requiredImages
+        ? `images>=${criteria.requiredImages}`
+        : !imagesReady
+          ? 'images-loaded'
+          : generating
+            ? 'generation-stop'
+            : `stable ${stableFor}/${criteria.stableSec}s`;
+    emitWaitProgress(config, {
+      status: 'waiting',
+      elapsed,
+      assistantCount: page.assistantCount || 0,
+      imageCount,
+      requiredImages: criteria.requiredImages,
+      busy: generating,
+      stableFor,
+      need,
+      last: summarizeImageProgress(lastPage, criteria),
+    });
+
     if (elapsed - lastReport >= 30) {
-      const need = !hasNewAssistant
-        ? 'new-assistant'
-        : imageCount < criteria.requiredImages
-          ? `images>=${criteria.requiredImages}`
-          : !imagesReady
-            ? 'images-loaded'
-            : generating
-              ? 'generation-stop'
-              : `stable ${stableFor}/${criteria.stableSec}s`;
       log(`[${elapsed}s] assistant=${page.assistantCount || 0} images=${imageCount} busy=${generating ? 1 : 0} copy=${page.copyCount || 0} need=${need}`);
       lastReport = elapsed;
     }
@@ -2719,7 +2900,8 @@ const SUBCOMMAND_TO_STAGE = {
 
 // --- CLI --------------------------------------------------------------------
 
-const SUBCOMMANDS = ['run', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'latest', 'status', 'cleanup'];
+const RESEARCH_SUBCOMMANDS = new Set(['research', 'deep-research', 'deep-search']);
+const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'latest', 'doctor', 'status', 'cleanup'];
 
 function printHelp() {
   process.stdout.write(`search.js - drive ChatGPT Pro via kimi-webbridge (stateful, resumable)
@@ -2729,6 +2911,10 @@ Usage:
 
 Sub-commands:
   run [prompt...]      All stages in order (default if no subcommand given)
+  research [prompt...] Agent-safe Deep research: select tool, confirm plan,
+                       wait until full report export, save + print it
+  deep-research [...]  Alias for research
+  deep-search [...]    Alias for research
   image [prompt...]    Generate image(s) in ChatGPT and save them locally
   open                 Open a ChatGPT tab (or reuse an existing one)
   login-check          Detect whether ChatGPT is logged in
@@ -2741,6 +2927,7 @@ Sub-commands:
   extract-images       Save generated image(s) from the latest assistant message
   latest               Recover this --session, wait for the latest complete reply,
                        save it, and print it to stdout
+  doctor               Verify WebBridge, ChatGPT login, and research tool selectors
   status               Print session state and exit
   cleanup              Close the session tab
 
@@ -2755,6 +2942,9 @@ Global flags (can appear before or after the subcommand):
       --web-search     Select ChatGPT's Web search tool before sending
   -w, --wait SECONDS   Max wait for response (default: ${DEFAULT_WAIT_SECONDS})
                        Deep research default: ${DEFAULT_DEEP_RESEARCH_WAIT_SECONDS}
+      --until-complete Keep polling until the reply/report is complete; overrides
+                       --wait and leaves progress in the state file
+                       (aliases: --wait-forever, --hang)
   -i, --interval SEC   Poll interval (default: ${DEFAULT_INTERVAL_SECONDS})
       --min-chars N    Min assistant chars before "complete" (default: ${DEFAULT_MIN_RESPONSE_CHARS}; use 0 for terse answers)
       --stable SEC     Assistant text must be unchanged this long (default: ${DEFAULT_STABLE_SECONDS})
@@ -2800,33 +2990,34 @@ State file: <script dir>/state/<session>.json
   - state.tool records an explicit ChatGPT tool target when requested.
 
 Examples:
-  search.js "What is 2+2? Reply with just the number." --min-chars 0
-  search.js --model extended "Reason about X in deep mode."
-  search.js --deep-research "Research current competitors and cite sources."
-  search.js --deep-search --wait 5400 "Do a deep market scan."
-  search.js --web-search "Find the latest release notes."
+  search.js research "Research current competitors and cite sources."
+  search.js --until-complete "What is 2+2? Reply with just the number." --min-chars 0
+  search.js --model extended --until-complete "Reason about X in deep mode."
+  search.js --deep-research --until-complete "Research current competitors and cite sources."
+  search.js --deep-search --until-complete "Do a deep market scan."
+  search.js --web-search --until-complete "Find the latest release notes."
   search.js -f ./prompt.md -o ./answer.md --json
   search.js --status
   search.js --dry-run --model extended
   search.js open
   search.js ensure-model extended
   search.js ensure-tool deep-research
-  search.js --upload ./brief.pdf "Summarize this file."
-  search.js --upload ./a.pdf --upload ./b.csv "Compare these files."
+  search.js --upload ./brief.pdf --until-complete "Summarize this file."
+  search.js --upload ./a.pdf --upload ./b.csv --until-complete "Compare these files."
   search.js send "now actually send it"
-  search.js --resume                # pick up where a previous run left off
+  search.js --resume --until-complete # pick up where a previous run left off
   search.js --resume --wait 1800    # resume with longer timeout
-  search.js -s my-thread latest     # wait for and print latest complete reply
+  search.js -s my-thread latest --until-complete # wait for and print latest complete reply
   search.js -s my-thread latest --wait 0 --stable 0 --json  # check current readiness only
-  search.js image "Create a square watercolor icon of a tiny robot reading."
-  search.js image --model think "Create a detailed isometric app icon."
-  search.js --image --model instant "Create a product hero image." --image-dir ./assets/generated
-  search.js -s my-thread latest --image --image-dir ./assets/generated
+  search.js image --until-complete "Create a square watercolor icon of a tiny robot reading."
+  search.js image --model think --until-complete "Create a detailed isometric app icon."
+  search.js --image --model instant --until-complete "Create a product hero image." --image-dir ./assets/generated
+  search.js -s my-thread latest --image --until-complete --image-dir ./assets/generated
 
   # Multi-turn conversation (keeps context between prompts)
-  search.js -s my-thread "Explain quantum entanglement in one paragraph."
-  search.js -s my-thread --continue "Now give me a concrete example."
-  search.js -s my-thread --continue "How would you test this experimentally?"
+  search.js -s my-thread --until-complete "Explain quantum entanglement in one paragraph."
+  search.js -s my-thread --continue --until-complete "Now give me a concrete example."
+  search.js -s my-thread --continue --until-complete "How would you test this experimentally?"
 `);
 }
 
@@ -2845,6 +3036,7 @@ function parseArgs(argv) {
     toolExplicit: false,
     wait: DEFAULT_WAIT_SECONDS,
     waitExplicit: false,
+    waitForever: false,
     interval: DEFAULT_INTERVAL_SECONDS,
     minChars: DEFAULT_MIN_RESPONSE_CHARS,
     minCharsExplicit: false,
@@ -2882,6 +3074,7 @@ function parseArgs(argv) {
     else if (a === '--tool') { opts.tool = normalizeToolName(argv[++i] || DEFAULT_TOOL); opts.toolExplicit = true; }
     else if (a === '--deep-research' || a === '--deep-search') { opts.tool = 'deep-research'; opts.toolExplicit = true; }
     else if (a === '--web-search') { opts.tool = 'web-search'; opts.toolExplicit = true; }
+    else if (a === '--until-complete' || a === '--wait-forever' || a === '--hang') opts.waitForever = true;
     else if (a === '--image') opts.imageMode = true;
     else if (a === '--continue' || a === '-C') opts.continueMode = true;
     else if (a === '--fresh') opts.fresh = true;
@@ -2913,6 +3106,7 @@ function parseArgs(argv) {
         else if (k === 'tool') { opts.tool = normalizeToolName(v || DEFAULT_TOOL); opts.toolExplicit = true; }
         else if (k === 'deep-research' || k === 'deep-search') { opts.tool = /^(0|false|no)$/i.test(v) ? DEFAULT_TOOL : 'deep-research'; opts.toolExplicit = !/^(0|false|no)$/i.test(v); }
         else if (k === 'web-search') { opts.tool = /^(0|false|no)$/i.test(v) ? DEFAULT_TOOL : 'web-search'; opts.toolExplicit = !/^(0|false|no)$/i.test(v); }
+        else if (k === 'until-complete' || k === 'wait-forever' || k === 'hang') opts.waitForever = !/^(0|false|no)$/i.test(v);
         else if (k === 'model') { opts.model = v; opts.modelExplicit = true; }
         else if (k === 'wait') { const n = parseInt(v, 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
         else if (k === 'interval') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.interval = n; }
@@ -2987,6 +3181,13 @@ async function readPrompt(opts, state) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (RESEARCH_SUBCOMMANDS.has(opts.subcommand)) {
+    opts.researchMode = true;
+    opts.subcommand = 'run';
+    opts.tool = 'deep-research';
+    opts.toolExplicit = true;
+    opts.waitForever = true;
+  }
   if (opts.subcommand === 'image' || opts.subcommand === 'extract-images') opts.imageMode = true;
   if (opts.imageMode && opts.subcommand === 'run') opts.subcommand = 'image';
   if (opts.subcommand === 'image' && !opts.modelExplicit) opts.model = DEFAULT_IMAGE_MODEL;
@@ -3063,7 +3264,7 @@ async function main() {
   }
   // Only save back if we actually have something to record (don't pollute state
   // for read-only sub-commands like status).
-  if (opts.subcommand !== 'status' && opts.subcommand !== 'latest') saveState(state);
+  if (opts.subcommand !== 'status' && opts.subcommand !== 'latest' && opts.subcommand !== 'doctor') saveState(state);
 
   // --- Sub-commands ---
 
@@ -3148,6 +3349,8 @@ async function main() {
       result = await runPipeline(state, { ...opts, imageMode: true }, IMAGE_PIPELINE);
     } else if (opts.subcommand === 'latest') {
       result = await runLatest(state, opts);
+    } else if (opts.subcommand === 'doctor') {
+      result = await runDoctor(state, opts, daemonStatus);
     } else if (SUBCOMMAND_TO_STAGE[opts.subcommand]) {
       const stageName = SUBCOMMAND_TO_STAGE[opts.subcommand];
       const fn = STAGE_FNS[stageName];
@@ -3165,7 +3368,7 @@ async function main() {
       stageData: e.stageData,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       state: state.session,
-      hint: code === 4 ? 'see references/intervention-points.md; fix the issue, then re-run with --resume' : undefined,
+      hint: code === 4 ? 'see references/intervention-points.md; fix the issue, then re-run with --resume --until-complete' : undefined,
     };
     if (opts.json) console.log(JSON.stringify(out, null, 2));
     else {
@@ -3189,6 +3392,7 @@ async function main() {
   const waitData = (result.wait && result.wait.data) || (state.stages.wait && state.stages.wait.data) || {};
   const extractData = (result.extract && result.extract.data) || (state.stages.extract && state.stages.extract.data) || {};
   const imageData = (result.extractImages && result.extractImages.data) || (state.stages.extractImages && state.stages.extractImages.data) || {};
+  const doctorData = result.doctor && result.doctor.data || null;
 
   const out = {
     ok: true,
@@ -3203,6 +3407,7 @@ async function main() {
     images: imageData.images || [],
     wait: waitData,
   };
+  if (doctorData) out.doctor = doctorData;
   if (opts.json) {
     if (!opts.imageMode && extractData.path && fs.existsSync(extractData.path)) {
       out.response = fs.readFileSync(extractData.path, 'utf8');
@@ -3223,6 +3428,8 @@ async function main() {
       if (fs.existsSync(extractData.path)) {
         process.stdout.write(fs.readFileSync(extractData.path, 'utf8'));
       }
+    } else if (doctorData) {
+      console.log(JSON.stringify(doctorData, null, 2));
     } else if (extractData.path && fs.existsSync(extractData.path)) {
       process.stdout.write(fs.readFileSync(extractData.path, 'utf8'));
     } else if (opts.subcommand !== 'status' && opts.subcommand !== 'cleanup') {

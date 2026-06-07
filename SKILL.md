@@ -8,52 +8,65 @@ description: |
 
 Run a prompt on ChatGPT Pro (or Pro Extended) through the user's real browser and bring the response back. The default entry point is `search.js` in this directory. When the script can't proceed on its own, it stops at a well-defined point and tells you exactly what to do next.
 
+## Agent contract
+
+When using this skill from an agent, run the CLI in a long-lived shell command and wait for the command to exit with the complete answer. Do not return a "still searching" or "try latest later" response to the user while ChatGPT is still working.
+
+- Use `--until-complete` (aliases: `--wait-forever`, `--hang`) for normal agent calls, especially Pro Extended and Deep research.
+- For ChatGPT Deep research, prefer `research "..."`; it implies `--deep-research --until-complete` and waits for the exported report.
+- Before delegating research to another agent, run `doctor` once to verify WebBridge, ChatGPT login, and Deep research tool availability.
+- If the shell tool yields while the process is still running, keep the process/session alive and poll it again. The CLI writes wait progress to the session state file.
+- Use `node ... search.js -s <session> status` from another shell to inspect `active.stage`, `active.status`, `active.elapsed`, and `active.need` while a wait is in progress.
+- If a non-hanging run exits `3`, immediately re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; do not ask the user to manually re-run.
+- Only answer the user after exit `0` with extracted text/image paths, or exit `4` when the browser genuinely needs human intervention.
+
 ## Quick start
 
 ```bash
 # All-in-one: send a prompt, wait, save the response
-node ~/.claude/skills/gpt-pro-think/search.js "Your prompt"
+node ~/.claude/skills/gpt-pro-think/search.js --until-complete "Your prompt"
 
 # Force Extended Pro (Pro model + Extended reasoning)
-node ~/.claude/skills/gpt-pro-think/search.js "Your prompt" --model extended
+node ~/.claude/skills/gpt-pro-think/search.js --model extended --until-complete "Your prompt"
 
 # Use ChatGPT's Deep research tool for searched, cited research
-node ~/.claude/skills/gpt-pro-think/search.js --deep-research "Research current competitors and cite sources."
+node ~/.claude/skills/gpt-pro-think/search.js research "Research current competitors and cite sources."
 
-# Alias for users who say "deep search"; default wait becomes 60 minutes
-node ~/.claude/skills/gpt-pro-think/search.js --deep-search "Do a deep market scan."
+# Alias for users who say "deep search"
+node ~/.claude/skills/gpt-pro-think/search.js deep-search "Do a deep market scan."
 
 # Use the lighter Web search tool
-node ~/.claude/skills/gpt-pro-think/search.js --web-search "Find the latest release notes."
+node ~/.claude/skills/gpt-pro-think/search.js --web-search --until-complete "Find the latest release notes."
 
 # Read prompt from a file, get JSON, custom output path
 node ~/.claude/skills/gpt-pro-think/search.js -f ./prompt.md -o ./answer.md --json
 
 # Resume a previous run that was interrupted (skips already-done stages)
-node ~/.claude/skills/gpt-pro-think/search.js --resume
+node ~/.claude/skills/gpt-pro-think/search.js --resume --until-complete
 
 # Check/recover a named session and print the newest complete answer
-node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
 
 # Generate image(s) in ChatGPT and save them into the current project
 # Image mode defaults to Instant; use --model think for Thinking.
-node ~/.claude/skills/gpt-pro-think/search.js image "Create a square watercolor icon of a tiny robot reading." --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a square watercolor icon of a tiny robot reading." --image-dir ./assets/generated
 
 # Upload local file(s) into ChatGPT before sending a prompt
-node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf "Summarize this file and list action items."
+node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --until-complete "Summarize this file and list action items."
 
 # Recover a still-open / saved conversation and save the latest generated image(s)
-node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --image --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --image --until-complete --image-dir ./assets/generated
 
 # Multi-turn conversation: each --continue pushes another turn into the same
 # ChatGPT tab so the model keeps the context. Use --continue on EVERY turn,
 # including the first one, to keep the tab open.
-node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue "Explain X."
-node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue "Now give me an example."
-node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue "How would you test that?"
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue --until-complete "Explain X."
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue --until-complete "Now give me an example."
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue --until-complete "How would you test that?"
 
 # Health check / dry-run / all options
 node ~/.claude/skills/gpt-pro-think/search.js --status
+node ~/.claude/skills/gpt-pro-think/search.js doctor --json
 node ~/.claude/skills/gpt-pro-think/search.js --dry-run --model extended
 node ~/.claude/skills/gpt-pro-think/search.js --dry-run --deep-research
 node ~/.claude/skills/gpt-pro-think/search.js --help
@@ -79,6 +92,8 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 | `status` | Print the current session state and exit (no side effects) | — | n/a |
 | `cleanup` | Close the session | — | n/a |
 | `run` (default) | All of the above in order | — | — |
+| `research` | Agent-safe Deep research run: tool select, plan confirm, wait, export, extract | — | — |
+| `doctor` | Verify browser/WebBridge/login/tool selectors before a research run | — | n/a |
 
 `--resume` reads the per-session state file and skips stages already marked `done`; stages with an unmet precondition are re-run. See [references/script-architecture.md](references/script-architecture.md) for the state schema.
 
@@ -93,7 +108,7 @@ Default `wait` is tuned for Pro Extended: `--wait 1200` (20 min), `--interval 15
 
 If `wait` times out, it exits `3` and does **not** mark the `wait` stage done. Re-run `--resume`, or use `-s <session> latest` to recover the corresponding session and print the newest complete answer when it is ready.
 
-When using this skill from an agent, budget at least 20 minutes per Pro Extended prompt and up to 60 minutes for Deep research. If the command is still running with no stdout, keep polling the process; do not stop early unless the user explicitly cancels or the script exits.
+For agent-driven work, prefer `--until-complete`. It disables the wait timeout, keeps the CLI process alive, updates `state/<session>.json` with `active: { stage: "wait", status, elapsed, need, ... }`, and prints the extracted answer only after completion. If the command is still running with no stdout, keep polling the process; do not stop early unless the user explicitly cancels or the script exits.
 
 For Deep research, `wait` uses the connector state rather than only the visible ChatGPT message text. It prints the generated research plan, confirms it through the Deep research connector or a narrow Start/Confirm/Continue research button fallback, polls `get_state` because the top-level UI can remain stale, and probes DOCX export until the full report is available.
 
@@ -102,9 +117,10 @@ For Deep research, `wait` uses the connector state rather than only the visible 
 Use `--deep-research` when the user explicitly wants ChatGPT's Deep research tool, current-source investigation, or a searched report with citations. `--deep-search` is an alias because users often describe the same ChatGPT UI feature that way.
 
 ```bash
-node ~/.claude/skills/gpt-pro-think/search.js --deep-research "Research the current API gateway market and cite sources."
-node ~/.claude/skills/gpt-pro-think/search.js --deep-search --wait 5400 "Do a full competitive scan."
-node ~/.claude/skills/gpt-pro-think/search.js --web-search "Find the latest changelog and summarize it."
+node ~/.claude/skills/gpt-pro-think/search.js doctor --json
+node ~/.claude/skills/gpt-pro-think/search.js research "Research the current API gateway market and cite sources."
+node ~/.claude/skills/gpt-pro-think/search.js deep-search "Do a full competitive scan."
+node ~/.claude/skills/gpt-pro-think/search.js --web-search --until-complete "Find the latest changelog and summarize it."
 node ~/.claude/skills/gpt-pro-think/search.js ensure-tool deep-research
 node ~/.claude/skills/gpt-pro-think/search.js ensure-tool none
 ```
@@ -116,9 +132,9 @@ The tool stage runs after `ensure-model` and before `upload` / `send`. It opens 
 Use `--upload <path>` one or more times to attach local files before sending the prompt. The stage runs after `ensure-tool` and before `send`, targets ChatGPT's hidden `input#upload-files[type="file"]`, and waits up to `--upload-wait` seconds for attachment chips.
 
 ```bash
-node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf "Summarize this file."
-node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --upload ./data.csv "Compare these files."
-node ~/.claude/skills/gpt-pro-think/search.js -s file-thread --resume
+node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --until-complete "Summarize this file."
+node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Compare these files."
+node ~/.claude/skills/gpt-pro-think/search.js -s file-thread --resume --until-complete
 ```
 
 For a failed upload run, re-run with `--resume`; the state file retains the normalized absolute upload paths. For a new non-resume prompt, uploads are not carried over unless `--upload` is passed again.
@@ -134,10 +150,10 @@ Generated files are written to `--image-dir` (default `./gpt-pro-images`) using 
 For transparent illustrations, do not ask the web UI to make transparency directly. Ask for the subject on a high-contrast solid background, with no shadows and clear separation from the edge, then run the local cutout script. Prefer backgrounds unlikely to appear inside the subject, such as pure green (`#00ff00`), magenta (`#ff00ff`), or cyan (`#00ffff`).
 
 ```bash
-node ~/.claude/skills/gpt-pro-think/search.js image "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
-node ~/.claude/skills/gpt-pro-think/search.js image --model think "Create a detailed isometric app icon." --image-dir ./assets/generated
-node ~/.claude/skills/gpt-pro-think/search.js --image --model instant "Create four sticker-style UI mascots." --image-count 4 --image-dir ./assets/generated
-node ~/.claude/skills/gpt-pro-think/search.js -s design-thread latest --image --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js image --model think --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js --image --model instant --until-complete "Create four sticker-style UI mascots." --image-count 4 --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js -s design-thread latest --image --until-complete --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/search.js -s design-thread extract-images --resume --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24
 ```
@@ -166,13 +182,16 @@ node ~/.claude/skills/gpt-pro-think/search.js ensure-model extended
 node ~/.claude/skills/gpt-pro-think/search.js ensure-tool deep-research
 
 # A previous run timed out at "wait" — re-run from wait, keep the prompt
-node ~/.claude/skills/gpt-pro-think/search.js wait --resume
+node ~/.claude/skills/gpt-pro-think/search.js wait --resume --until-complete
 
 # A previous run lost the response — re-extract without re-sending
 node ~/.claude/skills/gpt-pro-think/search.js extract --resume
 
 # A previous run is still thinking — poll the same session until the full answer is ready
-node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --wait 1200
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
+
+# Monitor a long-running wait from another shell
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread status
 ```
 
 ## Exit codes
@@ -182,7 +201,7 @@ node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --wait 1200
 | `0` | Success | Use the saved file / stdout output |
 | `1` | Daemon or network error | Check `~/.kimi-webbridge/bin/kimi-webbridge status`; re-run |
 | `2` | Bad arguments | Read `--help` |
-| `3` | Timeout during `wait` | Re-run with `--resume` or `-s <session> latest --wait 1200`; `wait` is not marked done on timeout |
+| `3` | Timeout during `wait` | Re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; `wait` is not marked done on timeout |
 | `4` | **Human intervention required** | Read the message + see [references/intervention-points.md](references/intervention-points.md) |
 
 Exit `4` is the key contract: the script stops at a well-defined point, prints exactly which stage failed and why, and waits for the Agent (or user) to fix it in the browser before resuming.

@@ -50,7 +50,7 @@ Wait 3s for the page to load.
 
 ## Step 4 — Verify / switch to Pro Extended
 
-**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js --dry-run --deep-research` for ChatGPT Deep research, or `node search.js --dry-run --model instant` / `--model think` before image generation (see SKILL.md).
+**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js --dry-run --model instant` / `--model think` before image generation (see SKILL.md).
 
 **Method B — manual:** Take a `snapshot`, find the composer pill (text contains `Heavy` / `Extended Pro` / `Thinking` / `Instant`). To open its popover, dispatch the pointer-event sequence documented in [dom-selectors.md](dom-selectors.md). Click the menuitemradio with text matching the desired mode (`Pro • Extended` for Extended Pro).
 
@@ -59,7 +59,8 @@ Wait 3s for the page to load.
 For ChatGPT Deep research / deep search, prefer the script:
 
 ```bash
-node search.js --deep-research "Research current competitors and cite sources."
+node search.js doctor --json
+node search.js research "Research current competitors and cite sources."
 node search.js ensure-tool deep-research
 node search.js ensure-tool none
 ```
@@ -69,14 +70,14 @@ Manual selection:
 2. In the opened `[role="menu"]`, click the `[role="menuitemradio"]` with text `Deep research` or `Web search`.
 3. Verify the composer shows an active chip like `Deep research, click to remove`.
 
-If Deep research is enabled, plan for a longer wait. The script uses `--wait 3600` by default for `--deep-research`; manual fallback should use a similar budget.
+If Deep research is enabled, plan for a longer wait. Agent-driven runs should pass `--until-complete`; manual fallback should wait until the full report is available before extracting.
 
 ## Step 6 — Send the prompt
 
 If the prompt needs local files, prefer the script:
 
 ```bash
-node search.js --upload ./brief.pdf --upload ./data.csv "Summarize and compare these files."
+node search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Summarize and compare these files."
 ```
 
 Manual upload through WebBridge:
@@ -152,8 +153,8 @@ If extraction returns empty: try `.markdown` selector fallback, then fall back t
 Preferred path:
 
 ```bash
-node search.js image "Create a square watercolor icon." --image-dir ./assets/generated
-node search.js -s "$SESSION" latest --image --image-dir ./assets/generated
+node search.js image --until-complete "Create a square watercolor icon." --image-dir ./assets/generated
+node search.js -s "$SESSION" latest --image --until-complete --image-dir ./assets/generated
 node search.js -s "$SESSION" extract-images --resume --image-dir ./assets/generated
 ```
 
