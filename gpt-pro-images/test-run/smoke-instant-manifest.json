@@ -1,0 +1,18 @@
+{
+  "generatedAt": "2026-06-05T09:20:25.404Z",
+  "session": "image-smoke-20260605",
+  "conversationUrl": "https://chatgpt.com/c/6a229400-25f4-83a7-bff6-643d85dbfcd7",
+  "prompt": "Create one small square image: a clean flat-design blue teacup icon on a white background. No text, no watermark.",
+  "imageDir": "/Users/rick/Documents/MySkill/gpt-pro-think/gpt-pro-images/test-run",
+  "images": [
+    {
+      "path": "/Users/rick/Documents/MySkill/gpt-pro-think/gpt-pro-images/test-run/smoke-instant-01.png",
+      "bytes": 777804,
+      "mimeType": "image/png",
+      "width": 1254,
+      "height": 1254,
+      "src": "https://chatgpt.com/backend-api/estuary/content?id=file_000000001b3871f8bf0b4f00ca18efd4&ts=494625&p=fsns&cid=1&sig=d8e5fa175bae0067f95d9deb391fac546357e2f76108428004579d50d88fa0be&v=0"
+    }
+  ],
+  "failed": []
+}

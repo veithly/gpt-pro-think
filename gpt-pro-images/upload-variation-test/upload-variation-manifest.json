@@ -1,0 +1,18 @@
+{
+  "generatedAt": "2026-06-05T10:55:10.000Z",
+  "session": "upload-image-variation-20260605",
+  "conversationUrl": "https://chatgpt.com/c/6a22aa0c-cdec-83a5-9edb-3c8222f4be6a",
+  "prompt": "Using the uploaded image as reference, create one similar square flat-design blue teacup icon on a clean white background. Keep the style simple, no text, no watermark.",
+  "imageDir": "/Users/rick/Documents/MySkill/gpt-pro-think/gpt-pro-images/upload-variation-test",
+  "images": [
+    {
+      "path": "/Users/rick/Documents/MySkill/gpt-pro-think/gpt-pro-images/upload-variation-test/upload-variation-01.png",
+      "bytes": 802602,
+      "mimeType": "image/png",
+      "width": 1254,
+      "height": 1254,
+      "src": "https://chatgpt.com/backend-api/estuary/content?id=file_0000000081d8720bb06e5af244386f08&ts=494626&p=fsns&cid=1&sig=11fb0b5e0d2de0932b2e7415b593fe3f4ed38d329eb9a318ec2df902a89112cd&v=0"
+    }
+  ],
+  "failed": []
+}
