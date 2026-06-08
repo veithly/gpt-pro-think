@@ -29,6 +29,12 @@ A `search.js` failure-mode that returns `error.message` containing `No current w
 
 Each session maps to a separate tab group in the browser, so parallel prompts don't fight over a single tab.
 
+## Tab lifecycle
+
+One-shot commands (`run`, `research` / `deep-search`, `image`, `latest`, `doctor`, and `--dry-run`) close their ChatGPT tab on success by default. The state file remains, including the saved conversation URL, so later recovery is still possible.
+
+Use `--keep-session` or `--continue` only when an immediate follow-up needs the same open tab. For staged/manual work, run `search.js -s <session> cleanup` once the tab is no longer needed. Add `--cleanup-state` only when the recovery state should be deleted too.
+
 ## Directory structure (parallel runs)
 
 ```

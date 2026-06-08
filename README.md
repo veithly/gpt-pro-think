@@ -11,7 +11,8 @@ Drive [ChatGPT Pro](https://chatgpt.com) (or **Pro Extended** with deep reasonin
 - **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
 - **Image generation capture.** `image` / `--image` waits for generated images in ChatGPT's web UI, saves them under `--image-dir`, and writes a manifest.
 - **Long-wait safe.** Default wait is 20 minutes; `--until-complete` / `--wait-forever` / `--hang` keeps the CLI alive until the full answer or report is ready.
-- **Latest retrieval.** `latest` recovers a named session, waits for the newest complete reply, saves it, and prints it directly.
+- **Latest retrieval.** `latest` recovers a named session, waits for the newest complete reply, saves it, prints it directly, and closes the recovered tab unless `--keep-session` is passed.
+- **Browser cleanup.** One-shot runs close ChatGPT tabs on success by default; keep a tab open only for immediate follow-up turns.
 - **Idempotent stages.** Each sub-command can be re-run safely; the tab is reused, the model is only switched if needed, and the prompt is only re-sent if it changed.
 - **Surgical intervention.** The script stops at well-defined failure points (login wall, captcha, model switch failed, rate limit) with a clear message and a runbook for what to do.
 
@@ -52,10 +53,10 @@ cd gpt-pro-think
 # Health check
 ./search.js --status
 
-# Open tab and verify Extended Pro without sending
+# Verify Extended Pro without sending; closes the tab unless --keep-session is passed
 ./search.js --dry-run --model extended
 
-# Open tab and verify Deep research selection without sending
+# Verify Deep research selection without sending; closes the tab unless --keep-session is passed
 ./search.js --dry-run --deep-research
 
 # After a failure: pick up where it left off
@@ -70,6 +71,10 @@ node ./search.js image --until-complete "Create a square watercolor icon of a ti
 # Upload local file(s) before sending a prompt
 node ./search.js --upload ./brief.pdf --until-complete "Summarize this file and list the action items."
 ```
+
+## Browser tab lifecycle
+
+`run`, `research` / `deep-search`, `image`, `latest`, `doctor`, and `--dry-run` close the ChatGPT tab on successful completion. The state file is kept so a later run can recover the saved conversation URL. Pass `--keep-session` or use `--continue` only when the next immediate step needs the same open tab. If you use staged sub-commands manually and later decide the tab is no longer needed, run `./search.js -s <session> cleanup`.
 
 ## Sub-commands
 

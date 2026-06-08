@@ -19,6 +19,8 @@ When using this skill from an agent, run the CLI in a long-lived shell command a
 - Use `node ... search.js -s <session> status` from another shell to inspect `active.stage`, `active.status`, `active.elapsed`, and `active.need` while a wait is in progress.
 - If a non-hanging run exits `3`, immediately re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; do not ask the user to manually re-run.
 - Only answer the user after exit `0` with extracted text/image paths, or exit `4` when the browser genuinely needs human intervention.
+- Treat ChatGPT tabs as disposable. Full `run` / `research` / `image`, `latest`, `doctor`, and `--dry-run` close their tab on success by default. Use `--keep-session` only when another immediate step needs the same open tab.
+- If you opened a tab with staged sub-commands (`open`, `send`, `wait`, `extract`, etc.) or decide to abandon a named session, run `node ... search.js -s <session> cleanup` as soon as no later turn needs that tab. This closes the browser tab but keeps the state file for recovery unless `--cleanup-state` is passed.
 
 ## Quick start
 
@@ -44,7 +46,7 @@ node ~/.claude/skills/gpt-pro-think/search.js -f ./prompt.md -o ./answer.md --js
 # Resume a previous run that was interrupted (skips already-done stages)
 node ~/.claude/skills/gpt-pro-think/search.js --resume --until-complete
 
-# Check/recover a named session and print the newest complete answer
+# Check/recover a named session and print the newest complete answer; closes tab unless --keep-session is passed
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
 
 # Generate image(s) in ChatGPT and save them into the current project
@@ -176,10 +178,11 @@ Pass `--fresh` to skip recovery and start a brand new conversation (useful when 
 
 Examples:
 ```bash
-# Open a tab and verify Extended Pro, then stop
-node ~/.claude/skills/gpt-pro-think/search.js open
-node ~/.claude/skills/gpt-pro-think/search.js ensure-model extended
-node ~/.claude/skills/gpt-pro-think/search.js ensure-tool deep-research
+# Open a tab and verify Extended Pro, then close it when no later step needs it
+node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread open
+node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread ensure-model extended
+node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread ensure-tool deep-research
+node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread cleanup
 
 # A previous run timed out at "wait" — re-run from wait, keep the prompt
 node ~/.claude/skills/gpt-pro-think/search.js wait --resume --until-complete
@@ -189,6 +192,9 @@ node ~/.claude/skills/gpt-pro-think/search.js extract --resume
 
 # A previous run is still thinking — poll the same session until the full answer is ready
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
+
+# If a staged/manual session will not be used again, close the tab
+node ~/.claude/skills/gpt-pro-think/search.js -s my-thread cleanup
 
 # Monitor a long-running wait from another shell
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread status

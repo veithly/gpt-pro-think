@@ -1438,7 +1438,7 @@ async function runLatest(state, opts) {
     e.stageData = { session: state.session };
     throw e;
   }
-  const latestOpts = { ...opts, keepSession: true, forceWait: true, forceExtract: true, latestMode: true };
+  const latestOpts = { ...opts, forceWait: true, forceExtract: true, latestMode: true };
   const results = {};
   results.open = await stageOpen(state, latestOpts);
   results.loginCheck = await stageLoginCheck(state, latestOpts);
@@ -2926,8 +2926,9 @@ Sub-commands:
   extract              Pull the last assistant message to --output
   extract-images       Save generated image(s) from the latest assistant message
   latest               Recover this --session, wait for the latest complete reply,
-                       save it, and print it to stdout
+                       save it, print it, and close the tab unless --keep-session
   doctor               Verify WebBridge, ChatGPT login, and research tool selectors
+                       (closes the tab on success unless --keep-session)
   status               Print session state and exit
   cleanup              Close the session tab
 
@@ -2967,7 +2968,8 @@ Global flags (can appear before or after the subcommand):
                         (start a brand new conversation, even if state has a prior URL)
       --cleanup-state  Delete the state file when finished
       --dry-run        Like run but stop after ensure-model
-                       (or ensure-tool when a tool flag is passed)
+                       (or ensure-tool when a tool flag is passed);
+                       closes the tab unless --keep-session
       --status         Health check only, no session
       --json           Output result as JSON
   -v, --verbose        Verbose logging
@@ -3380,10 +3382,10 @@ async function main() {
 
   // --- Success ---
 
-  // Final cleanup — --continue implies --keep-session so the tab stays open
-  // for follow-up turns.
+  // Final cleanup: full runs, recovery reads, and health checks are one-shot
+  // by default. Use --keep-session / --continue when follow-up turns need the tab.
   if (opts.continueMode) opts.keepSession = true;
-  if (['run', 'image'].includes(opts.subcommand) && !opts.dryRun) {
+  if (['run', 'image', 'latest', 'doctor'].includes(opts.subcommand)) {
     try { await stageCleanup(state, opts); } catch (e) { log(`cleanup warning: ${e.message}`); }
   } else if (opts.subcommand !== 'cleanup' && !opts.keepSession && opts.subcommand !== 'status') {
     // For individual sub-commands, don't auto-cleanup unless it's the final stage

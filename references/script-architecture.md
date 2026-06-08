@@ -79,7 +79,7 @@ Passing `--until-complete` (aliases: `--wait-forever`, `--hang`) disables the wa
 
 `research`, `deep-research`, and `deep-search` are command aliases for the agent-safe Deep research flow. They normalize to `run` with `tool=deep-research` and `--until-complete`, so callers do not need to know about plan confirmation, stale top-frame widget state, or DOCX export extraction.
 
-`doctor` is a no-prompt readiness check. It verifies WebBridge health, opens or reuses a ChatGPT tab, checks login, opens the composer tools menu, and confirms `Deep research` / `Web search` are visible before an agent starts a long run.
+`doctor` is a no-prompt readiness check. It verifies WebBridge health, opens or reuses a ChatGPT tab, checks login, opens the composer tools menu, confirms `Deep research` / `Web search` are visible, and closes the tab on success unless `--keep-session` is passed.
 
 ## Sub-command lifecycle
 
@@ -99,14 +99,14 @@ Stages that take a prompt (`send`, `run`, `image`) also accept `-f` and `-` (std
 - `wait` timeouts exit `3` and are not marked done. The next `--resume` or `latest` command re-polls instead of extracting a partial answer by accident.
 - `--until-complete` is the preferred agent mode: it keeps the CLI process alive across long runs and only exits after `wait` completes, a terminal error occurs, or human intervention is required.
 - `research "..."` is the preferred Deep research mode for agents. It implies the Deep research tool and unlimited wait, then prints the extracted report.
-- `latest` is not part of the main pipeline. It opens/recovers the named session, force-runs `wait` and `extract`, then prints the newest complete answer. With `--image`, it force-runs image wait + `extractImages` and prints a saved-path summary.
+- `latest` is not part of the main pipeline. It opens/recovers the named session, force-runs `wait` and `extract`, prints the newest complete answer, and closes the tab on success unless `--keep-session` is passed. With `--image`, it force-runs image wait + `extractImages` and prints a saved-path summary.
 - `ensure-tool` can be run directly to pre-select or clear a tool without sending a prompt: `search.js ensure-tool deep-research` or `search.js ensure-tool none`.
 
 ## Automation / robustness
 
 - **Auto-retry on transient errors**: each `cmd()` call retries up to 3 times with exponential backoff (200ms, 600ms, 1800ms) for network / daemon / `extension_error: No current window` cases.
 - **Auto-reuse tabs**: `open` calls `find_tab` first; if a ChatGPT tab already exists in the session, it reuses it instead of opening a new one.
-- **Auto-cleanup**: on full success, the state file is kept (default) so the Agent can inspect what happened. Pass `--cleanup-state` to delete it. To keep the browser tab open, use `--keep-session` (state still records the run).
+- **Auto-cleanup**: one-shot `run`, `research` / `deep-search`, `image`, `latest`, `doctor`, and `--dry-run` commands close their ChatGPT tab on success. The state file is kept (default) so the Agent can inspect what happened or recover the saved conversation URL. Pass `--cleanup-state` to delete it. To keep the browser tab open, use `--keep-session` or `--continue` (state still records the run).
 - **Idempotent model switch**: `ensure-model` probes the popover, and only clicks the target option if the current selection is different.
 - **Idempotent tool switch**: `ensure-tool` checks the active tool chip and the `Add files and more` menu before clicking `Deep research`, `Web search`, `Create image`, or clearing the current selection.
 
