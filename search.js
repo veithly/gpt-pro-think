@@ -14,7 +14,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
 const DAEMON_HOST = '127.0.0.1';
 const DAEMON_PORT = 10086;
@@ -32,8 +32,11 @@ const DEFAULT_DEEP_RESEARCH_WAIT_SECONDS = 3600;
 const DEFAULT_INTERVAL_SECONDS = 15;
 const DEFAULT_MIN_RESPONSE_CHARS = 240;
 const DEFAULT_STABLE_SECONDS = 60;
+const DEFAULT_WAIT_REFRESH_SECONDS = 300;
+const DEFAULT_WAIT_REFRESH_SETTLE_MS = 5000;
 const DEFAULT_IMAGE_DIR = 'gpt-pro-images';
 const DEFAULT_IMAGE_COUNT = 1;
+const DEFAULT_IMAGE_CONCURRENCY = 3;
 const DEFAULT_MAX_IMAGES = 8;
 const DEFAULT_IMAGE_MODEL = 'instant';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
@@ -1131,11 +1134,13 @@ async function stageWait(state, opts) {
   }
   const maxWait = opts.waitForever ? Number.POSITIVE_INFINITY : Number.isFinite(opts.wait) ? opts.wait : DEFAULT_WAIT_SECONDS;
   const interval = Number.isFinite(opts.interval) ? opts.interval : DEFAULT_INTERVAL_SECONDS;
+  const refreshSec = Math.max(0, Number.isFinite(opts.refreshSec) ? opts.refreshSec : DEFAULT_WAIT_REFRESH_SECONDS);
   const recordWaitProgress = (progress = {}) => {
     setActiveStage(state, 'wait', {
       status: progress.status || 'waiting',
       kind: waitKind,
       ...waitLimitState(maxWait),
+      refreshIntervalSec: refreshSec,
       elapsed: Number.isFinite(progress.elapsed) ? progress.elapsed : 0,
       ...progress,
     });
@@ -1147,6 +1152,7 @@ async function stageWait(state, opts) {
     const result = await waitForImageCompletion(state.session, {
       maxWaitSec: maxWait,
       intervalSec: interval,
+      refreshSec,
       ...imageCriteria,
       onProgress: recordWaitProgress,
     });
@@ -1196,6 +1202,7 @@ async function stageWait(state, opts) {
     const result = await waitForDeepResearchCompletion(state.session, {
       maxWaitSec: maxWait,
       intervalSec: interval,
+      refreshSec,
       ...deepCriteria,
       onProgress: recordWaitProgress,
     });
@@ -1252,6 +1259,7 @@ async function stageWait(state, opts) {
   const result = await waitForCompletion(state.session, {
     maxWaitSec: maxWait,
     intervalSec: interval,
+    refreshSec,
     ...criteria,
     onProgress: recordWaitProgress,
   });
@@ -1644,6 +1652,82 @@ function emitWaitProgress(config, progress) {
   } catch (e) {
     log(`wait progress update failed: ${e.message}`);
   }
+}
+
+async function describeCurrentPage(session) {
+  return evaluate(
+    session,
+    `(() => JSON.stringify({
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      messageCount: document.querySelectorAll('[data-message-author-role]').length,
+      assistantCount: document.querySelectorAll('[data-message-author-role="assistant"]').length
+    }))()`
+  ).catch((e) => ({ error: e.message }));
+}
+
+async function refreshCurrentWaitPage(session, meta = {}) {
+  const before = await describeCurrentPage(session);
+  const url = before && before.url && CHATGPT_HOST_RE.test(before.url)
+    ? before.url
+    : 'https://chatgpt.com/';
+  const reason = [meta.kind || 'wait', meta.need || ''].filter(Boolean).join(' ');
+  log(`refreshing ChatGPT page after ${meta.elapsed || 0}s (${reason || 'wait'})`);
+  let method = 'navigate';
+  let navigateError = '';
+  let reloadError = '';
+  try {
+    unwrap(await cmd('navigate', { url, newTab: false }, session, { retries: 2 }), 'refresh navigate');
+  } catch (e) {
+    method = 'reload';
+    navigateError = e.message;
+    log(`refresh navigate failed, trying location.reload(): ${e.message}`);
+    await evaluate(session, `(() => { location.reload(); return true; })()`).catch((reloadErr) => {
+      reloadError = reloadErr.message;
+    });
+  }
+  await sleep(DEFAULT_WAIT_REFRESH_SETTLE_MS);
+  const after = await describeCurrentPage(session);
+  const error = reloadError
+    ? `${navigateError}; reload failed: ${reloadError}`
+    : navigateError;
+  return {
+    ok: !navigateError || !reloadError,
+    method,
+    elapsed: meta.elapsed || 0,
+    urlBefore: before && before.url || '',
+    urlAfter: after && after.url || '',
+    messageCount: after && after.messageCount || 0,
+    assistantCount: after && after.assistantCount || 0,
+    error,
+  };
+}
+
+async function maybeRefreshWaitPage(session, config, meta = {}) {
+  const refreshSec = Math.max(0, Number.isFinite(config.refreshSec) ? config.refreshSec : DEFAULT_WAIT_REFRESH_SECONDS);
+  const elapsed = Number.isFinite(meta.elapsed) ? meta.elapsed : 0;
+  const lastRefreshAt = Number.isFinite(meta.lastRefreshAt) ? meta.lastRefreshAt : 0;
+  if (!refreshSec || elapsed < refreshSec || elapsed - lastRefreshAt < refreshSec) return lastRefreshAt;
+  emitWaitProgress(config, {
+    status: 'refreshing',
+    elapsed,
+    need: meta.need || '',
+    last: meta.last || null,
+  });
+  const refresh = await refreshCurrentWaitPage(session, meta).catch((e) => ({
+    ok: false,
+    elapsed,
+    error: e.message,
+  }));
+  emitWaitProgress(config, {
+    status: 'waiting',
+    elapsed,
+    need: meta.need || '',
+    lastRefresh: refresh,
+    last: meta.last || null,
+  });
+  return elapsed;
 }
 
 function looksLikeThinkingPlaceholder(text) {
@@ -2240,6 +2324,7 @@ async function waitForDeepResearchCompletion(session, config) {
   let lastProgress = null;
   let lastToolState = null;
   let lastExtract = null;
+  let lastRefreshAt = 0;
 
   while (true) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
@@ -2352,6 +2437,13 @@ async function waitForDeepResearchCompletion(session, config) {
     }
 
     if (elapsed >= maxWaitSec) break;
+    lastRefreshAt = await maybeRefreshWaitPage(session, config, {
+      elapsed,
+      lastRefreshAt,
+      kind: 'deep-research',
+      need,
+      last: summarizeDeepResearchProgress(progress, toolState, lastExtract),
+    });
     await sleep(Math.min(intervalSec, Math.max(1, maxWaitSec - elapsed)) * 1000);
   }
 
@@ -2429,7 +2521,7 @@ function imageWaitCriteriaFromState(state, opts) {
   return {
     assistantBefore,
     requireNewAssistant: assistantBefore !== null,
-    requiredImages: Math.max(1, Number.isFinite(opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT),
+    requiredImages: 1,
     stableSec: Math.max(0, Number.isFinite(opts.stableSec) ? opts.stableSec : DEFAULT_STABLE_SECONDS),
   };
 }
@@ -2448,6 +2540,7 @@ async function waitForCompletion(session, config) {
   let prevSig = '';
   let stableSince = Date.now();
   let lastPage = null;
+  let lastRefreshAt = 0;
   while (true) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
     const page = await getConversationProgress(session);
@@ -2508,6 +2601,13 @@ async function waitForCompletion(session, config) {
     }
 
     if (elapsed >= maxWaitSec) break;
+    lastRefreshAt = await maybeRefreshWaitPage(session, config, {
+      elapsed,
+      lastRefreshAt,
+      kind: 'text',
+      need,
+      last: summarizeProgress(lastPage, criteria),
+    });
     await sleep(Math.min(intervalSec, Math.max(1, maxWaitSec - elapsed)) * 1000);
   }
   return { status: 'timeout', elapsed: maxWaitSec, last: summarizeProgress(lastPage, criteria) };
@@ -2527,6 +2627,7 @@ async function waitForImageCompletion(session, config) {
   let prevSig = '';
   let stableSince = Date.now();
   let lastPage = null;
+  let lastRefreshAt = 0;
   while (true) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
     const page = await getConversationProgress(session);
@@ -2536,7 +2637,7 @@ async function waitForImageCompletion(session, config) {
       : (page.assistantCount || 0) > 0;
     const images = page.lastAssistantImages || [];
     const imageCount = images.length;
-      const imagesReady = hasNewAssistant &&
+    const imagesReady = hasNewAssistant &&
       imageCount >= criteria.requiredImages &&
       images.slice(0, criteria.requiredImages).every((img) => img.ready !== false);
     const generating = !!page.busy || (page.stopCount || 0) > 0;
@@ -2593,6 +2694,13 @@ async function waitForImageCompletion(session, config) {
     }
 
     if (elapsed >= maxWaitSec) break;
+    lastRefreshAt = await maybeRefreshWaitPage(session, config, {
+      elapsed,
+      lastRefreshAt,
+      kind: 'image',
+      need,
+      last: summarizeImageProgress(lastPage, criteria),
+    });
     await sleep(Math.min(intervalSec, Math.max(1, maxWaitSec - elapsed)) * 1000);
   }
   return { status: 'timeout', elapsed: maxWaitSec, last: summarizeImageProgress(lastPage, criteria) };
@@ -2838,6 +2946,230 @@ async function saveExtractedImages(state, opts, extracted) {
   return { dir, manifestPath, images: saved, failed };
 }
 
+function parseJsonOutput(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) throw new Error('child produced no stdout');
+  try {
+    return JSON.parse(text);
+  } catch {}
+  const start = text.lastIndexOf('\n{');
+  if (start >= 0) {
+    try { return JSON.parse(text.slice(start + 1)); } catch {}
+  }
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    try { return JSON.parse(text.slice(first, last + 1)); } catch {}
+  }
+  throw new Error(`child stdout was not JSON: ${text.slice(0, 240)}`);
+}
+
+function prefixedChildLog(label, text) {
+  const lines = String(text || '').split(/\r?\n/).filter(Boolean);
+  for (const line of lines) log(`[${label}] ${line}`);
+}
+
+function buildImageChildArgs(opts, job, prompt) {
+  const args = [
+    __filename,
+    '-s', job.session,
+    'image',
+    '--json',
+    '--image-count', '1',
+    '--max-images', '1',
+    '--model', normalizeModelName(opts.model || DEFAULT_IMAGE_MODEL),
+    '--image-prefix', job.prefix,
+  ];
+  if (opts.imageDir) args.push('--image-dir', opts.imageDir);
+  if (opts.waitForever) args.push('--until-complete');
+  else if (Number.isFinite(opts.wait)) args.push('--wait', String(opts.wait));
+  if (Number.isFinite(opts.interval)) args.push('--interval', String(opts.interval));
+  if (Number.isFinite(opts.refreshSec)) args.push('--refresh', String(opts.refreshSec));
+  if (Number.isFinite(opts.stableSec)) args.push('--stable', String(opts.stableSec));
+  if (opts.resume) args.push('--resume');
+  if (opts.keepSession) args.push('--keep-session');
+  if (opts.cleanupState) args.push('--cleanup-state');
+  if (opts.toolExplicit) args.push('--tool', normalizeToolName(opts.tool));
+  if (opts.uploadSelector && opts.uploadSelector !== DEFAULT_UPLOAD_SELECTOR) args.push('--upload-selector', opts.uploadSelector);
+  if (Number.isFinite(opts.uploadWait)) args.push('--upload-wait', String(opts.uploadWait));
+  for (const file of normalizeUploadFiles(opts.uploads || [])) args.push('--upload', file);
+  args.push('--', prompt);
+  return args;
+}
+
+function runImageChild(job, opts, prompt) {
+  return new Promise((resolve) => {
+    const args = buildImageChildArgs(opts, job, prompt);
+    const child = spawn(process.execPath, args, {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      stderr += text;
+      prefixedChildLog(job.label, text);
+    });
+    child.on('error', (error) => {
+      resolve({
+        ok: false,
+        index: job.index,
+        session: job.session,
+        prefix: job.prefix,
+        error: error.message,
+        stderr,
+      });
+    });
+    child.on('close', (code) => {
+      let data = null;
+      let parseError = '';
+      try { data = parseJsonOutput(stdout); } catch (e) { parseError = e.message; }
+      const images = data && Array.isArray(data.images) ? data.images : [];
+      const ok = code === 0 && data && data.ok !== false && images.length > 0;
+      resolve({
+        ok,
+        index: job.index,
+        session: job.session,
+        prefix: job.prefix,
+        exitCode: code,
+        output: data && data.output || null,
+        images,
+        data,
+        error: ok ? '' : (data && (data.message || data.error) || parseError || (images.length ? `child exited ${code}` : 'child returned no images')),
+        stderr,
+      });
+    });
+  });
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function loop() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, loop);
+  await Promise.all(workers);
+  return results;
+}
+
+async function runParallelImageGeneration(state, opts, prompt) {
+  const requested = Math.max(1, Number.isFinite(opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT);
+  const concurrency = Math.max(1, Math.min(3, Number.isFinite(opts.imageConcurrency) ? opts.imageConcurrency : DEFAULT_IMAGE_CONCURRENCY));
+  const dir = path.resolve(opts.imageDir || state.imageDir || DEFAULT_IMAGE_DIR);
+  const basePrefix = sanitizeFileComponent(
+    opts.imagePrefix || state.imagePrefix || `gpt-image-${state.createdAt || Date.now()}`,
+    `gpt-image-${Date.now()}`
+  );
+  fs.mkdirSync(dir, { recursive: true });
+
+  const jobs = Array.from({ length: requested }, (_, i) => {
+    const num = String(i + 1).padStart(2, '0');
+    return {
+      index: i,
+      label: `image-${num}`,
+      session: `${state.session}-image-${num}`,
+      prefix: `${basePrefix}-${num}`,
+    };
+  });
+
+  log(`parallel image generation: ${requested} image(s), concurrency=${concurrency}, one ChatGPT conversation per image`);
+  const results = await runWithConcurrency(jobs, concurrency, async (job) => {
+    log(`[${job.label}] starting session=${job.session}`);
+    const result = await runImageChild(job, { ...opts, imageCount: 1, maxImages: 1 }, prompt);
+    if (result.ok) log(`[${job.label}] done (${result.images.length} image)`);
+    else log(`[${job.label}] failed: ${result.error}`);
+    return result;
+  });
+
+  const images = [];
+  const failed = [];
+  const childManifests = [];
+  for (const result of results) {
+    if (result.output) childManifests.push({ session: result.session, path: result.output });
+    if (result.ok) {
+      for (const image of result.images || []) {
+        images.push({
+          ...image,
+          session: result.session,
+          jobIndex: result.index + 1,
+        });
+      }
+    } else {
+      failed.push({
+        session: result.session,
+        jobIndex: result.index + 1,
+        exitCode: result.exitCode,
+        error: result.error,
+        output: result.output,
+      });
+    }
+  }
+
+  const manifest = {
+    generatedAt: new Date().toISOString(),
+    parallel: true,
+    session: state.session,
+    requestedImageCount: requested,
+    imageConcurrency: concurrency,
+    oneConversationPerImage: true,
+    prompt,
+    imageDir: dir,
+    images,
+    failed,
+    childManifests,
+    jobs: results.map((result) => ({
+      session: result.session,
+      jobIndex: result.index + 1,
+      ok: result.ok,
+      output: result.output,
+      imageCount: (result.images || []).length,
+      error: result.error || '',
+    })),
+  };
+  const manifestPath = uniquePath(dir, `${basePrefix}-parallel-manifest.json`);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+  const data = {
+    imageCount: images.length,
+    requestedImageCount: requested,
+    failedCount: failed.length,
+    dir,
+    manifestPath,
+    images,
+    failed,
+    childManifests,
+    imageConcurrency: concurrency,
+  };
+  state.output = manifestPath;
+  state.images = images;
+  state.parallelImages = data;
+  saveState(state);
+  if (opts.cleanupState) {
+    const p = statePath(state.session);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  }
+
+  return {
+    ok: failed.length === 0,
+    parallel: true,
+    session: state.session,
+    output: manifestPath,
+    imageCount: images.length,
+    requestedImageCount: requested,
+    failedCount: failed.length,
+    imageConcurrency: concurrency,
+    images,
+    failed,
+    childManifests,
+  };
+}
+
 // --- Sub-command pipeline ---------------------------------------------------
 
 const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract'];
@@ -2947,6 +3279,7 @@ Global flags (can appear before or after the subcommand):
                        --wait and leaves progress in the state file
                        (aliases: --wait-forever, --hang)
   -i, --interval SEC   Poll interval (default: ${DEFAULT_INTERVAL_SECONDS})
+      --refresh SEC    Refresh the same ChatGPT tab during wait (default: ${DEFAULT_WAIT_REFRESH_SECONDS}; 0 disables)
       --min-chars N    Min assistant chars before "complete" (default: ${DEFAULT_MIN_RESPONSE_CHARS}; use 0 for terse answers)
       --stable SEC     Assistant text must be unchanged this long (default: ${DEFAULT_STABLE_SECONDS})
       --upload PATH    Upload a local file before sending (repeatable)
@@ -2957,7 +3290,10 @@ Global flags (can appear before or after the subcommand):
       --image          Image mode for run/latest/wait (alias for the image flow)
       --image-dir DIR  Directory for saved generated images (default: ./${DEFAULT_IMAGE_DIR})
       --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
-      --image-count N  Minimum generated images to wait for (default: ${DEFAULT_IMAGE_COUNT})
+      --image-count N  Total images to generate. Uses one ChatGPT conversation
+                       per image; default: ${DEFAULT_IMAGE_COUNT}
+      --image-concurrency N
+                       Parallel image conversations, capped at ${DEFAULT_IMAGE_CONCURRENCY}
       --max-images N   Max image candidates to extract/save (default: ${DEFAULT_MAX_IMAGES})
       --resume         Skip stages already marked done in state file
       --keep-session   Do not close the browser tab when finished
@@ -3013,6 +3349,7 @@ Examples:
   search.js -s my-thread latest --wait 0 --stable 0 --json  # check current readiness only
   search.js image --until-complete "Create a square watercolor icon of a tiny robot reading."
   search.js image --model think --until-complete "Create a detailed isometric app icon."
+  search.js image --until-complete --image-count 5 --image-concurrency 3 "Create five distinct app icon concepts."
   search.js --image --model instant --until-complete "Create a product hero image." --image-dir ./assets/generated
   search.js -s my-thread latest --image --until-complete --image-dir ./assets/generated
 
@@ -3040,6 +3377,7 @@ function parseArgs(argv) {
     waitExplicit: false,
     waitForever: false,
     interval: DEFAULT_INTERVAL_SECONDS,
+    refreshSec: DEFAULT_WAIT_REFRESH_SECONDS,
     minChars: DEFAULT_MIN_RESPONSE_CHARS,
     minCharsExplicit: false,
     stableSec: DEFAULT_STABLE_SECONDS,
@@ -3047,6 +3385,7 @@ function parseArgs(argv) {
     imageDir: '',
     imagePrefix: '',
     imageCount: DEFAULT_IMAGE_COUNT,
+    imageConcurrency: DEFAULT_IMAGE_CONCURRENCY,
     maxImages: DEFAULT_MAX_IMAGES,
     resume: false,
     keepSession: false,
@@ -3087,11 +3426,13 @@ function parseArgs(argv) {
     else if (a === '-m' || a === '--model') { opts.model = argv[++i] || 'auto'; opts.modelExplicit = true; }
     else if (a === '-w' || a === '--wait') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
     else if (a === '-i' || a === '--interval') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.interval = n; }
+    else if (a === '--refresh' || a === '--refresh-seconds') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.refreshSec = n; }
     else if (a === '--min-chars') { opts.minChars = parseInt(argv[++i], 10); opts.minCharsExplicit = true; if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
     else if (a === '--stable' || a === '--stable-seconds') { opts.stableSec = parseInt(argv[++i], 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
     else if (a === '--image-dir') { opts.imageDir = argv[++i] || ''; }
     else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
     else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
+    else if (a === '--image-concurrency') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
     else if (a === '--max-images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.maxImages = n; }
     else if (a === '-') { opts.stdin = true; opts.subcommandArgs.push('-'); }
     else if (a === '--') { i++; while (i < argv.length) { positional.push(argv[i]); i++; } break; }
@@ -3112,12 +3453,14 @@ function parseArgs(argv) {
         else if (k === 'model') { opts.model = v; opts.modelExplicit = true; }
         else if (k === 'wait') { const n = parseInt(v, 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
         else if (k === 'interval') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.interval = n; }
+        else if (k === 'refresh' || k === 'refresh-seconds') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.refreshSec = n; }
         else if (k === 'min-chars') { opts.minChars = parseInt(v, 10); opts.minCharsExplicit = true; if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
         else if (k === 'stable' || k === 'stable-seconds') { opts.stableSec = parseInt(v, 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
         else if (k === 'image') opts.imageMode = !/^(0|false|no)$/i.test(v);
         else if (k === 'image-dir') opts.imageDir = v;
         else if (k === 'image-prefix') opts.imagePrefix = v;
         else if (k === 'image-count' || k === 'images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageCount = n; }
+        else if (k === 'image-concurrency') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
         else if (k === 'max-images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.maxImages = n; }
         else die(2, `unknown option: --${k}`);
       } else die(2, `unknown option: ${a}`);
@@ -3315,6 +3658,36 @@ async function main() {
     saveState(state);
   }
 
+  if (opts.subcommand === 'image' && !opts.dryRun && Math.max(1, Number.isFinite(opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT) > 1) {
+    if (
+      opts.resume &&
+      state.parallelImages &&
+      state.parallelImages.failedCount === 0 &&
+      state.parallelImages.requestedImageCount === opts.imageCount &&
+      state.parallelImages.manifestPath &&
+      fs.existsSync(state.parallelImages.manifestPath)
+    ) {
+      log(`resume: parallel image run already done, returning cached output`);
+      console.log(JSON.stringify({
+        ok: true,
+        cached: true,
+        parallel: true,
+        session: state.session,
+        output: state.parallelImages.manifestPath,
+        imageCount: state.parallelImages.imageCount || 0,
+        requestedImageCount: state.parallelImages.requestedImageCount,
+        failedCount: state.parallelImages.failedCount || 0,
+        imageConcurrency: state.parallelImages.imageConcurrency || DEFAULT_IMAGE_CONCURRENCY,
+        images: state.parallelImages.images || [],
+        childManifests: state.parallelImages.childManifests || [],
+      }, null, 2));
+      process.exit(0);
+    }
+    const parallelOut = await runParallelImageGeneration(state, opts, state.prompt);
+    console.log(JSON.stringify(parallelOut, null, 2));
+    process.exit(parallelOut.ok ? 0 : 4);
+  }
+
   // --- Execute ---
 
   // Short-circuit before doing any work: if --resume and extract is done and
@@ -3382,14 +3755,7 @@ async function main() {
 
   // --- Success ---
 
-  // Final cleanup: full runs, recovery reads, and health checks are one-shot
-  // by default. Use --keep-session / --continue when follow-up turns need the tab.
   if (opts.continueMode) opts.keepSession = true;
-  if (['run', 'image', 'latest', 'doctor'].includes(opts.subcommand)) {
-    try { await stageCleanup(state, opts); } catch (e) { log(`cleanup warning: ${e.message}`); }
-  } else if (opts.subcommand !== 'cleanup' && !opts.keepSession && opts.subcommand !== 'status') {
-    // For individual sub-commands, don't auto-cleanup unless it's the final stage
-  }
 
   const waitData = (result.wait && result.wait.data) || (state.stages.wait && state.stages.wait.data) || {};
   const extractData = (result.extract && result.extract.data) || (state.stages.extract && state.stages.extract.data) || {};
@@ -3438,6 +3804,14 @@ async function main() {
       // For non-extract sub-commands, print a brief summary
       console.log(JSON.stringify(out, null, 2));
     }
+  }
+
+  // Final cleanup happens after stdout so the watching agent sees the result
+  // as soon as it is extracted. Use --keep-session / --continue for follow-ups.
+  if (['run', 'image', 'latest', 'doctor'].includes(opts.subcommand)) {
+    try { await stageCleanup(state, opts); } catch (e) { log(`cleanup warning: ${e.message}`); }
+  } else if (opts.subcommand !== 'cleanup' && !opts.keepSession && opts.subcommand !== 'status') {
+    // For individual sub-commands, don't auto-cleanup unless it's the final stage
   }
   process.exit(0);
 }

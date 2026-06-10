@@ -77,12 +77,14 @@ pitch/gpt-pro/
 | Open 3 tabs + verify Extended | 2-3 min |
 | Select Deep research / Web search | 30s-1 min |
 | Send prompts | 1-2 min |
-| Wait for parallel responses | 10-20 min |
-| Wait for Deep research | 20-60+ min |
+| Wait for GPT Pro Think / Pro Extended | 30+ min patience budget |
+| Wait for Deep research | 50+ min patience budget |
 | Extract + save | 2-3 min |
 | Synthesize + final decision (if ≥3 prompts) | 15-20 min |
-| **Total (3 prompts, no synthesis)** | **~20-30 min** |
-| **Total (3 prompts + synthesis)** | **~35-50 min** |
+| **Total (3 prompts, no synthesis)** | **~35-45+ min** |
+| **Total (3 prompts + synthesis)** | **~65-80+ min** |
+
+During `wait`, the CLI refreshes the same ChatGPT tab every 5 minutes by default (`--refresh 300`). This is a same-tab recovery refresh, not a new research run and not a prompt re-send.
 
 ## When to escalate
 

@@ -10,7 +10,7 @@ Drive [ChatGPT Pro](https://chatgpt.com) (or **Pro Extended** with deep reasonin
 - **Agent-safe research command.** `research "..."` hides the Deep research plan/iframe/export details and returns the final report.
 - **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
 - **Image generation capture.** `image` / `--image` waits for generated images in ChatGPT's web UI, saves them under `--image-dir`, and writes a manifest.
-- **Long-wait safe.** Default wait is 20 minutes; `--until-complete` / `--wait-forever` / `--hang` keeps the CLI alive until the full answer or report is ready.
+- **Long-wait safe.** Default wait is 20 minutes; `--until-complete` / `--wait-forever` / `--hang` keeps the CLI alive until the full answer or report is ready. During wait, the same ChatGPT tab refreshes every 5 minutes by default. Agent runs should budget at least 30 minutes for GPT Pro Think and at least 50 minutes for Deep research.
 - **Latest retrieval.** `latest` recovers a named session, waits for the newest complete reply, saves it, prints it directly, and closes the recovered tab unless `--keep-session` is passed.
 - **Browser cleanup.** One-shot runs close ChatGPT tabs on success by default; keep a tab open only for immediate follow-up turns.
 - **Idempotent stages.** Each sub-command can be re-run safely; the tab is reused, the model is only switched if needed, and the prompt is only re-sent if it changed.
@@ -99,7 +99,7 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 | `research` / `deep-search` | Agent-safe Deep research run; waits for exported report | — |
 | `doctor` | Verify WebBridge, ChatGPT login, and research tool selectors | — |
 
-Completion defaults are tuned for Pro Extended: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. For agent-driven work, pass `--until-complete` so the process hangs, writes `active` wait progress into `state/<session>.json`, and only prints after the full answer is extracted. Use `--min-chars 0` only when you intentionally expect a terse answer.
+Completion defaults are tuned for Pro Extended: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`, `--refresh 300`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. For agent-driven work, pass `--until-complete` so the process hangs, writes `active` wait progress into `state/<session>.json`, refreshes the same tab every 5 minutes, and only prints after the full answer is extracted. Ten minutes without stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing has printed. Use `--min-chars 0` only when you intentionally expect a terse answer.
 
 Deep research uses a separate completion path: the script prints the generated plan, confirms it through the connector or a narrow Start/Confirm/Continue research button fallback, polls the connector's `get_state` because the visible ChatGPT status can lag behind, and extracts the final report through DOCX export. Agents should use `research "..."` instead of hand-assembling these steps.
 
@@ -121,12 +121,12 @@ node ./search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Comp
 node ./search.js -s file-thread --resume --until-complete
 ```
 
-For image generation, use `image` or `--image`. Full image runs default to `--model instant` because ChatGPT image generation must be sent from Thinking/Instant rather than Extended Pro; pass `--model think` / `--model thinking` for the Thinking option. The script waits for at least `--image-count` large generated image(s) in the newest assistant message, waits until generation controls disappear and the image set is stable for `--stable` seconds, then writes files into `--image-dir` (default `./gpt-pro-images`). It also writes a JSON manifest with paths, dimensions, byte sizes, and any failed candidates.
+For image generation, use `image` or `--image`. Full image runs default to `--model instant` because ChatGPT image generation must be sent from Thinking/Instant rather than Extended Pro; pass `--model think` / `--model thinking` for the Thinking option. ChatGPT currently yields one usable image per conversation, so `--image-count N` means total images: the script starts one conversation per image, runs up to `--image-concurrency` conversations in parallel (default/cap: `3`), queues the rest, and writes a top-level parallel manifest into `--image-dir`.
 
 ```bash
 node ./search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
 node ./search.js image --model think --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
-node ./search.js --image --model instant --until-complete "Create four sticker-style UI mascots." --image-count 4 --image-dir ./assets/generated
+node ./search.js --image --model instant --until-complete "Create four sticker-style UI mascots." --image-count 4 --image-concurrency 3 --image-dir ./assets/generated
 node ./search.js -s design-thread latest --image --until-complete --image-dir ./assets/generated
 node ./search.js -s design-thread extract-images --resume --image-dir ./assets/generated
 node ./scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24

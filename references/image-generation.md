@@ -13,6 +13,16 @@ node search.js image --model think --until-complete "Create a detailed isometric
 
 `image` defaults to `--model instant`. `--model think` is normalized to `thinking`.
 
+## Multiple images
+
+ChatGPT currently produces one usable generated image per conversation. To generate multiple images, use `--image-count N`; the script creates one child ChatGPT session per image and runs up to three at once.
+
+```bash
+node search.js image --until-complete --image-count 5 --image-concurrency 3 "Create five distinct square app icon concepts..." --image-dir ./assets/generated
+```
+
+The parent process starts at most `--image-concurrency` sessions in parallel (default/cap: `3`). When one child finishes, the queue starts the next new conversation automatically. The top-level `*-parallel-manifest.json` records every saved image, child manifest, failed job, and source child session.
+
 ## Saving
 
 The extractor saves large generated images from the latest assistant result and writes a manifest:

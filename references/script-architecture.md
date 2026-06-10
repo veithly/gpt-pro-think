@@ -45,6 +45,13 @@ Schema (v1):
     "elapsed": 120,
     "waitLimitSec": null,
     "unlimited": true,
+    "refreshIntervalSec": 300,
+    "lastRefresh": {
+      "method": "navigate",
+      "elapsed": 300,
+      "urlBefore": "https://chatgpt.com/c/...",
+      "urlAfter": "https://chatgpt.com/c/..."
+    },
     "need": "running/export-probe>=1"
   },
   "stages": {
@@ -69,13 +76,15 @@ The `prompt` field is what was *actually sent* (or attempted). On `--resume`, th
 
 `tool` records an explicit ChatGPT composer tool target. `auto` means "do not change whatever ChatGPT currently has selected." `--deep-research` and `--deep-search` normalize to `deep-research`; `--web-search` normalizes to `web-search`; `--tool none` clears an active tool chip. If an explicit tool target changes, `ensureTool`, `send`, `wait`, `extract`, and `extractImages` are cleared so the next run cannot reuse a response produced under the wrong tool.
 
-In image mode, `wait.data.kind` is `image`. The wait stage looks for large image elements in the latest assistant message, requires at least `--image-count`, waits until generation controls disappear, and requires the image signature to stay unchanged for `--stable` seconds. `extractImages` saves image bytes into `--image-dir` and writes a manifest JSON; `state.output` points to that manifest.
+In image mode, `wait.data.kind` is `image`. A single ChatGPT conversation waits for one large generated image in the latest assistant message, waits until generation controls disappear, and requires the image signature to stay unchanged for `--stable` seconds. `extractImages` saves image bytes into `--image-dir` and writes a manifest JSON; `state.output` points to that manifest.
+
+For full `image` runs with `--image-count N > 1`, `--image-count` is the total requested image count, not a per-conversation wait target. The parent process starts one child session per image (`<base-session>-image-01`, etc.), runs at most `--image-concurrency` sessions in parallel (default/cap: `3`), and writes a top-level `*-parallel-manifest.json` that records child manifests, saved images, failed jobs, and the child session for each image. Each child still uses the normal single-image pipeline with `--image-count 1`.
 
 Full image runs default to `model: "instant"` unless `--model` is passed. `--model think` is normalized to `thinking`; both `thinking` and `instant` are valid targets for ChatGPT web image generation.
 
 Deep research runs default to `--wait 3600` unless `--wait` is passed, because ChatGPT's Deep research tool can run much longer than Pro Extended text replies.
 
-Passing `--until-complete` (aliases: `--wait-forever`, `--hang`) disables the wait timeout for text, image, and Deep research waits. During an active wait, the script rewrites `active` in the state file with progress fields such as `elapsed`, `need`, status-specific counts, and `last`. On completion, `active` is removed and the `wait` stage is marked done.
+Passing `--until-complete` (aliases: `--wait-forever`, `--hang`) disables the wait timeout for text, image, and Deep research waits. During an active wait, the script rewrites `active` in the state file with progress fields such as `elapsed`, `need`, status-specific counts, `last`, and `lastRefresh`. It refreshes the same ChatGPT tab every `--refresh` seconds (default `300`; `0` disables) so a frozen page can recover without opening a new tab or re-sending the prompt. On completion, `active` is removed and the `wait` stage is marked done.
 
 `research`, `deep-research`, and `deep-search` are command aliases for the agent-safe Deep research flow. They normalize to `run` with `tool=deep-research` and `--until-complete`, so callers do not need to know about plan confirmation, stale top-frame widget state, or DOCX export extraction.
 
@@ -97,7 +106,7 @@ Stages that take a prompt (`send`, `run`, `image`) also accept `-f` and `-` (std
 - `cleanup` is always safe to re-run.
 - The state file is rewritten on every successful stage completion. If the process crashes mid-stage, the file shows the last completed stage and the next one will retry.
 - `wait` timeouts exit `3` and are not marked done. The next `--resume` or `latest` command re-polls instead of extracting a partial answer by accident.
-- `--until-complete` is the preferred agent mode: it keeps the CLI process alive across long runs and only exits after `wait` completes, a terminal error occurs, or human intervention is required.
+- `--until-complete` is the preferred agent mode: it keeps the CLI process alive across long runs and only exits after `wait` completes, a terminal error occurs, or human intervention is required. Successful run output is written to stdout before tab cleanup so a watching agent sees the result as soon as extraction finishes.
 - `research "..."` is the preferred Deep research mode for agents. It implies the Deep research tool and unlimited wait, then prints the extracted report.
 - `latest` is not part of the main pipeline. It opens/recovers the named session, force-runs `wait` and `extract`, prints the newest complete answer, and closes the tab on success unless `--keep-session` is passed. With `--image`, it force-runs image wait + `extractImages` and prints a saved-path summary.
 - `ensure-tool` can be run directly to pre-select or clear a tool without sending a prompt: `search.js ensure-tool deep-research` or `search.js ensure-tool none`.

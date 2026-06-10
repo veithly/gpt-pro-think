@@ -119,7 +119,7 @@ curl -s -X POST http://127.0.0.1:10086/command \
 
 ## Step 7 — Wait for responses
 
-Pro Extended commonly takes **about 10 min** per response and can take **20 min** for long prompts. Deep research can take **20-60 min**. For 3 parallel Pro Extended tabs, total wait ≈ **10-20 min**; for Deep research, use fewer parallel sends and expect longer waits.
+For agent-driven runs, keep a hard patience budget of at least **30 min** for GPT Pro Think / Pro Extended and at least **50 min** for Deep research. Ten minutes with no stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing printed. The CLI refreshes the same tab every 5 minutes by default (`--refresh 300`) while it waits. For parallel Pro Extended tabs, expect the wait to stretch; for Deep research, use fewer parallel sends and wait for the exported report.
 
 Poll every 2-3 min. Treat completion as conservative:
 - `Stop generating` button count = 0
@@ -173,7 +173,7 @@ The automatic extractor saves only visible large image candidates from the lates
 1. Combine key insights from all responses
 2. Add cross-reference and contradiction analysis
 3. Send meta-prompt in a new session `gpt-pro-decision`
-4. Wait ~10 min, collect final decision into `final-decision.md`
+4. Wait with the same 30+ min GPT Pro Think patience budget, then collect final decision into `final-decision.md`
 
 ## Step 10 — Cleanup
 

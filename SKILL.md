@@ -13,6 +13,10 @@ Run a prompt on ChatGPT Pro (or Pro Extended) through the user's real browser an
 When using this skill from an agent, run the CLI in a long-lived shell command and wait for the command to exit with the complete answer. Do not return a "still searching" or "try latest later" response to the user while ChatGPT is still working.
 
 - Use `--until-complete` (aliases: `--wait-forever`, `--hang`) for normal agent calls, especially Pro Extended and Deep research.
+- During `wait`, the CLI refreshes the same ChatGPT tab every 5 minutes by default (`--refresh 300`) to recover from a frozen page. This is a same-tab refresh, not a new page and not a re-send.
+- As soon as wait/extract completes, the CLI writes the answer or image manifest to stdout before tab cleanup, so the watching agent should consume that output immediately.
+- Patience budget is mandatory: allow at least **30 minutes** for a normal GPT Pro Think / Pro Extended response and at least **50 minutes** for ChatGPT Deep research before suspecting the run is stuck.
+- Ten minutes with no stdout is normal. Do **not** assume the run is broken, open a new ChatGPT page, start a fresh browser research, or re-send the prompt just because nothing has printed for 10 minutes.
 - For ChatGPT Deep research, prefer `research "..."`; it implies `--deep-research --until-complete` and waits for the exported report.
 - Before delegating research to another agent, run `doctor` once to verify WebBridge, ChatGPT login, and Deep research tool availability.
 - If the shell tool yields while the process is still running, keep the process/session alive and poll it again. The CLI writes wait progress to the session state file.
@@ -101,7 +105,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 
 ### Waiting and completion criteria
 
-Default `wait` is tuned for Pro Extended: `--wait 1200` (20 min), `--interval 15`, `--stable 60`, `--min-chars 240`. When `--deep-research` / `--deep-search` is used and no explicit `--wait` is passed, the default wait becomes `3600` seconds (60 min). A response counts as complete only when:
+Default `wait` is tuned for Pro Extended: `--wait 1200` (20 min), `--interval 15`, `--stable 60`, `--min-chars 240`. Agent-driven runs should use `--until-complete` and keep a patience budget of at least **30 minutes** for GPT Pro Think / Pro Extended and at least **50 minutes** for Deep research. When `--deep-research` / `--deep-search` is used and no explicit `--wait` is passed, the default wait becomes `3600` seconds (60 min). A response counts as complete only when:
 
 - A new assistant message exists after the current turn was sent
 - The visible assistant text is not a short thinking/placeholder string
@@ -110,7 +114,7 @@ Default `wait` is tuned for Pro Extended: `--wait 1200` (20 min), `--interval 15
 
 If `wait` times out, it exits `3` and does **not** mark the `wait` stage done. Re-run `--resume`, or use `-s <session> latest` to recover the corresponding session and print the newest complete answer when it is ready.
 
-For agent-driven work, prefer `--until-complete`. It disables the wait timeout, keeps the CLI process alive, updates `state/<session>.json` with `active: { stage: "wait", status, elapsed, need, ... }`, and prints the extracted answer only after completion. If the command is still running with no stdout, keep polling the process; do not stop early unless the user explicitly cancels or the script exits.
+For agent-driven work, prefer `--until-complete`. It disables the wait timeout, keeps the CLI process alive, updates `state/<session>.json` with `active: { stage: "wait", status, elapsed, need, lastRefresh, ... }`, refreshes the same ChatGPT tab every 5 minutes by default, and prints the extracted answer only after completion. If the command is still running with no stdout, keep polling the process; do not stop early unless the user explicitly cancels, the script exits, or the patience budget has been exceeded and `status` shows no progress.
 
 For Deep research, `wait` uses the connector state rather than only the visible ChatGPT message text. It prints the generated research plan, confirms it through the Deep research connector or a narrow Start/Confirm/Continue research button fallback, polls `get_state` because the top-level UI can remain stale, and probes DOCX export until the full report is available.
 
@@ -145,16 +149,18 @@ If upload fails with `upload_not_allowed`, the browser/WebBridge extension block
 
 ### Image generation
 
-Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to `--model instant` because image generation must be sent from Thinking/Instant rather than Extended Pro; pass `--model think` / `--model thinking` to select Thinking. The image flow uses the same open/login/model/send stages, then waits for at least `--image-count` large generated image(s) in the newest assistant message. It treats the image result as complete only after ChatGPT generation controls are gone and the image set is stable for `--stable` seconds.
+Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to `--model instant` because image generation must be sent from Thinking/Instant rather than Extended Pro; pass `--model think` / `--model thinking` to select Thinking.
 
-Generated files are written to `--image-dir` (default `./gpt-pro-images`) using `--image-prefix` or `gpt-image-<createdAt>`. A manifest JSON is saved next to the images with file paths, dimensions, byte sizes, the source conversation URL, and any failed candidates.
+ChatGPT currently generates one usable image per conversation. For `--image-count N`, the script treats `N` as the total requested image count, starts one ChatGPT conversation per image, and runs up to `--image-concurrency` conversations in parallel (default/cap: `3`). If `N` is greater than the concurrency cap, it queues the rest and starts the next new conversation as soon as a running image finishes. Each child conversation waits for one generated image; the parent writes a parallel manifest that links every saved image to its child session.
+
+Generated files are written to `--image-dir` (default `./gpt-pro-images`) using `--image-prefix` or `gpt-image-<createdAt>`. For multi-image runs, child files use numbered prefixes and the top-level `*-parallel-manifest.json` records child manifests, file paths, dimensions, byte sizes, source sessions, and any failed jobs.
 
 For transparent illustrations, do not ask the web UI to make transparency directly. Ask for the subject on a high-contrast solid background, with no shadows and clear separation from the edge, then run the local cutout script. Prefer backgrounds unlikely to appear inside the subject, such as pure green (`#00ff00`), magenta (`#ff00ff`), or cyan (`#00ffff`).
 
 ```bash
 node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/search.js image --model think --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
-node ~/.claude/skills/gpt-pro-think/search.js --image --model instant --until-complete "Create four sticker-style UI mascots." --image-count 4 --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js --image --model instant --until-complete "Create four sticker-style UI mascots." --image-count 4 --image-concurrency 3 --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/search.js -s design-thread latest --image --until-complete --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/search.js -s design-thread extract-images --resume --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24
@@ -216,7 +222,7 @@ Exit `4` is the key contract: the script stops at a well-defined point, prints e
 
 - Need a second LLM opinion or extended-reasoning analysis
 - Cross-model validation of a design, plan, or piece of analysis
-- Deep research where the user accepts a 20-60 min wait per prompt
+- Deep research where the user accepts a 50+ min wait per prompt
 
 ## When NOT to use
 
