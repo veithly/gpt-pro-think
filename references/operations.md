@@ -56,6 +56,7 @@ pitch/gpt-pro/
 
 | Failure | Fix |
 |---|---|
+| Daemon not running | `search.js` auto-starts Kimi WebBridge and removes a stale pid file when the recorded process is gone; if health check still fails, inspect `~/.kimi-webbridge/bin/kimi-webbridge logs` and run `~/.kimi-webbridge/bin/kimi-webbridge restart` manually |
 | `fill` returns "No node with given id" | Click the input first, then retry `fill` |
 | Model not switching | Take a snapshot, find the composer pill, dispatch the pointer-event sequence (see [dom-selectors.md](dom-selectors.md)), then click the desired menuitemradio |
 | Tool not switching | Run `search.js doctor --json`; if it fails, open **Add files and more**, choose `Deep research` / `Web search` manually, then run `search.js ensure-tool deep-research --resume --until-complete` |
@@ -88,6 +89,6 @@ During `wait`, the CLI refreshes the same ChatGPT tab every 5 minutes by default
 
 ## When to escalate
 
-- Daemon unhealthy AND `~/.kimi-webbridge/bin/kimi-webbridge start` fails → see the `kimi-webbridge` skill's `references/operations.md`
+- Daemon unhealthy after the CLI's auto-start attempt and `~/.kimi-webbridge/bin/kimi-webbridge restart` still fails → see the `kimi-webbridge` skill's `references/operations.md`
 - Extension version out of sync with skill version → user must update the extension: https://kimi.com/features/webbridge
 - Model not switchable automatically → ask user to switch manually in the browser, then re-run

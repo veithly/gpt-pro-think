@@ -14,7 +14,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 
 const DAEMON_HOST = '127.0.0.1';
 const DAEMON_PORT = 10086;
@@ -23,6 +23,7 @@ const STATUS_BIN = path.join(
   '.kimi-webbridge', 'bin',
   process.platform === 'win32' ? 'kimi-webbridge.exe' : 'kimi-webbridge'
 );
+const DAEMON_PID_FILE = path.join(path.dirname(path.dirname(STATUS_BIN)), 'daemon.pid');
 const STATE_DIR = path.join(__dirname, 'state');
 const STATE_VERSION = 1;
 const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractImages'];
@@ -37,8 +38,11 @@ const DEFAULT_WAIT_REFRESH_SETTLE_MS = 5000;
 const DEFAULT_IMAGE_DIR = 'gpt-pro-images';
 const DEFAULT_IMAGE_COUNT = 1;
 const DEFAULT_IMAGE_CONCURRENCY = 3;
-const DEFAULT_MAX_IMAGES = 8;
-const DEFAULT_IMAGE_MODEL = 'instant';
+const DEFAULT_IMAGE_EXTENDED_MAX_COUNT = 10;
+const DEFAULT_IMAGE_FALLBACK_COUNT = 1;
+const DEFAULT_MAX_IMAGES = 10;
+const DEFAULT_IMAGE_MODEL = 'extended';
+const DEFAULT_IMAGE_FALLBACK_MODEL = 'instant';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 60;
 const DEFAULT_TOOL = 'auto';
@@ -114,6 +118,30 @@ const IMAGE_COLLECTOR_JS = `
       return true;
     });
   };
+  const collectImagesFromRoots = (roots, maxImages = Infinity) => {
+    const entries = [];
+    const seen = new Set();
+    const list = Array.isArray(roots) ? roots : [];
+    for (let rootIndex = 0; rootIndex < list.length; rootIndex++) {
+      const root = list[rootIndex];
+      if (!root) continue;
+      const nodes = [...root.querySelectorAll('img')];
+      for (const image of collectMeaningfulImages(root)) {
+        const src = String(image.src || '');
+        if (!src || seen.has(src)) continue;
+        seen.add(src);
+        entries.push({
+          ...image,
+          index: entries.length,
+          localIndex: image.index,
+          rootIndex,
+          node: nodes[image.index] || null
+        });
+        if (entries.length >= maxImages) return entries;
+      }
+    }
+    return entries;
+  };
 `;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -124,6 +152,30 @@ function normalizeModelName(model) {
   if (value === 'extended-pro') return 'extended';
   if (value === 'think') return 'thinking';
   return value || 'auto';
+}
+
+function imageCountFromOpts(opts) {
+  return Math.max(1, Number.isFinite(opts && opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT);
+}
+
+function imageCountLimitForModel(model) {
+  return normalizeModelName(model) === DEFAULT_IMAGE_MODEL
+    ? DEFAULT_IMAGE_EXTENDED_MAX_COUNT
+    : DEFAULT_IMAGE_FALLBACK_COUNT;
+}
+
+function applyModelTarget(state, nextModel) {
+  const model = normalizeModelName(nextModel);
+  if (!model || model === 'auto') return false;
+  if (normalizeModelName(state.model) === model) return false;
+  state.model = model;
+  delete state.imageModelFallback;
+  clearStage(state, 'ensureModel');
+  clearStage(state, 'send');
+  clearStage(state, 'wait');
+  clearStage(state, 'extract');
+  clearStage(state, 'extractImages');
+  return true;
 }
 
 function normalizeToolName(tool) {
@@ -222,19 +274,96 @@ function unwrap(r, actionHint) {
 // --- Health check ------------------------------------------------------------
 
 async function healthCheck() {
+  let s = await readDaemonStatus();
+  if (!s.running) {
+    s = await startDaemonAndWait(s);
+  }
+  if (!s.running) throw new Error(`daemon not running (${formatDaemonStatus(s)})`);
+  if (!s.extension_connected) return rejectWithHint('browser extension not connected', 'open/focus Chrome or Edge and confirm the Kimi WebBridge extension is connected');
+  return s;
+}
+
+async function readDaemonStatus() {
+  const { stdout } = await runDaemonCli(['status'], 10000, 'status');
+  try {
+    return JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`Cannot parse status output: ${stdout.slice(0, 200)}`);
+  }
+}
+
+async function startDaemonAndWait(initialStatus) {
+  const stalePidRemoved = clearStaleDaemonPid(initialStatus);
+  if (stalePidRemoved) log(`removed stale kimi-webbridge pid file (${formatDaemonStatus(initialStatus)})`);
+  log('daemon not running; starting kimi-webbridge...');
+  const startResult = await runDaemonCli(['start'], 15000, 'start');
+  if (startResult.stdout.trim()) log(startResult.stdout.trim());
+  if (startResult.stderr.trim()) log(startResult.stderr.trim());
+
+  let last = initialStatus;
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    last = await readDaemonStatus();
+    if (last.running) return { ...last, autoStarted: true, stalePidRemoved };
+  }
+  const e = new Error(`daemon did not become ready after start (${formatDaemonStatus(last)})`);
+  e.hint = stalePidRemoved
+    ? 'check ~/.kimi-webbridge/bin/kimi-webbridge logs'
+    : 'try: ~/.kimi-webbridge/bin/kimi-webbridge restart';
+  throw e;
+}
+
+function runDaemonCli(args, timeout, label) {
   return new Promise((resolve, reject) => {
-    execFile(STATUS_BIN, ['status'], { timeout: 10000 }, (err, stdout) => {
-      if (err) return reject(new Error(`kimi-webbridge status failed: ${err.message}`));
-      try {
-        const s = JSON.parse(stdout);
-        if (!s.running) return reject(new Error('daemon not running'));
-        if (!s.extension_connected) return reject(new Error('browser extension not connected'));
-        resolve(s);
-      } catch (e) {
-        reject(new Error(`Cannot parse status output: ${stdout.slice(0, 200)}`));
+    execFile(STATUS_BIN, args, { timeout }, (err, stdout = '', stderr = '') => {
+      if (err) {
+        const e = new Error(`kimi-webbridge ${label} failed: ${err.message}${stderr ? `: ${stderr.trim()}` : ''}`);
+        e.stdout = stdout;
+        e.stderr = stderr;
+        reject(e);
+        return;
       }
+      resolve({ stdout, stderr });
     });
   });
+}
+
+function clearStaleDaemonPid(status) {
+  const pid = Number(status && status.pid);
+  if (!Number.isInteger(pid) || pid <= 0 || isProcessAlive(pid) || !fs.existsSync(DAEMON_PID_FILE)) return false;
+  fs.unlinkSync(DAEMON_PID_FILE);
+  return true;
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
+
+function rejectWithHint(message, hint) {
+  const e = new Error(message);
+  e.hint = hint;
+  throw e;
+}
+
+function formatDaemonStatus(status) {
+  if (!status || typeof status !== 'object') return 'unknown status';
+  const parts = [];
+  if ('running' in status) parts.push(`running=${!!status.running}`);
+  if (status.pid) parts.push(`pid=${status.pid}`);
+  if ('extension_connected' in status) parts.push(`extension_connected=${!!status.extension_connected}`);
+  if (status.note) parts.push(`note=${status.note}`);
+  return parts.join(', ') || JSON.stringify(status).slice(0, 200);
+}
+
+function formatVersionForLog(version) {
+  const value = String(version || 'unknown');
+  return /^v/i.test(value) ? value : `v${value}`;
 }
 
 // --- State file --------------------------------------------------------------
@@ -470,7 +599,8 @@ async function waitForMessages(session, maxSeconds) {
   return last || { msgCount: 0, url: '' };
 }
 
-async function getConversationProgress(session) {
+async function getConversationProgress(session, imageMinAssistantIndex = null) {
+  const imageMinIndexExpr = Number.isFinite(imageMinAssistantIndex) ? JSON.stringify(imageMinAssistantIndex) : 'null';
   const v = await evaluate(
     session,
     `(() => {
@@ -486,7 +616,13 @@ async function getConversationProgress(session) {
       const bodyText = textOf(document.body);
       const last = assistants[assistants.length - 1] || imageRoots[imageRoots.length - 1] || null;
       const lastText = textOf(last);
-      const lastImages = collectMeaningfulImages(last);
+      const imageMinIndex = ${imageMinIndexExpr};
+      let imageScopes = last ? [last] : [];
+      if (imageMinIndex !== null) {
+        if (assistants.length) imageScopes = assistants.slice(Math.min(imageMinIndex, assistants.length));
+        else imageScopes = imageRoots.slice(Math.min(imageMinIndex, imageRoots.length));
+      }
+      const lastImages = collectImagesFromRoots(imageScopes).map(({ node, ...image }) => image);
       const imageSignature = lastImages.map((img) => {
         const src = String(img.src || '');
         return [img.width, img.height, img.complete ? 1 : 0, src.slice(0, 80), src.slice(-80)].join(':');
@@ -571,19 +707,56 @@ async function stageLoginCheck(state) {
   return { skipped: false, data };
 }
 
-async function stageEnsureModel(state) {
+async function stageEnsureModel(state, opts = {}) {
+  const target = normalizeModelName(state.model);
   if (state.stages.ensureModel && state.stages.ensureModel.done) {
-    return { skipped: true, data: state.stages.ensureModel.data };
+    const prior = state.stages.ensureModel.data || {};
+    const priorTo = normalizeModelName(prior.to || prior.state && prior.state.model || '');
+    const priorTarget = normalizeModelName(prior.target || prior.requested || '');
+    if (target === 'auto' || priorTo === target || (!priorTo && priorTarget === target)) {
+      return { skipped: true, data: prior };
+    }
+    log(`ensure-model: state says done for ${priorTo || priorTarget || 'unknown'}, target is ${target}; re-checking`);
+    clearStage(state, 'ensureModel');
   }
-  const target = state.model;
   const result = await ensureModel(state.session, target);
   if (target !== 'auto' && !result.ok) {
-    const e = new Error(`could not ensure model=${target} (current=${result.state.model}). Please switch manually in the browser, then re-run with --resume.`);
+    if (opts.imageMode && target === DEFAULT_IMAGE_MODEL && opts.imageModelFallback !== false) {
+      const reason = result.error || `current=${result.state && result.state.model || 'unknown'}`;
+      log(`Pro Extended unavailable for image generation (${reason}); falling back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and limiting this run to ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
+      const fallbackResult = await ensureModel(state.session, DEFAULT_IMAGE_FALLBACK_MODEL);
+      if (fallbackResult.ok) {
+        const fallbackData = {
+          target,
+          requested: target,
+          from: result.state && result.state.model || 'unknown',
+          to: fallbackResult.state && fallbackResult.state.model || DEFAULT_IMAGE_FALLBACK_MODEL,
+          effort: fallbackResult.state && fallbackResult.state.effort || 'unknown',
+          changed: !!fallbackResult.changed,
+          fallback: {
+            from: target,
+            to: DEFAULT_IMAGE_FALLBACK_MODEL,
+            reason,
+            maxImageCount: DEFAULT_IMAGE_FALLBACK_COUNT,
+          },
+        };
+        state.model = DEFAULT_IMAGE_FALLBACK_MODEL;
+        state.imageModelFallback = { ...fallbackData.fallback, at: Date.now() };
+        markStage(state, 'ensureModel', fallbackData);
+        saveState(state);
+        return { skipped: false, data: fallbackData };
+      }
+      const e = new Error(`could not ensure model=${target}; fallback model=${DEFAULT_IMAGE_FALLBACK_MODEL} also failed. Please switch manually in the browser, then re-run with --resume.`);
+      e.code = 'model_switch_failed';
+      e.stageData = { ...result, target, fallback: fallbackResult };
+      throw e;
+    }
+    const e = new Error(`could not ensure model=${target} (current=${result.state && result.state.model || 'unknown'}). Please switch manually in the browser, then re-run with --resume.`);
     e.code = 'model_switch_failed';
     e.stageData = { ...result, target };
     throw e;
   }
-  const data = { from: 'unknown', to: result.state.model, effort: result.state.effort, changed: result.changed };
+  const data = { target, requested: target, from: 'unknown', to: result.state.model, effort: result.state.effort, changed: result.changed };
   markStage(state, 'ensureModel', data);
   saveState(state);
   return { skipped: false, data };
@@ -1403,11 +1576,14 @@ async function stageExtractImages(state, opts) {
   }
   const data = {
     imageCount: saved.images.length,
+    requestedImageCount: imageCountFromOpts(opts),
+    requiredImages: criteria.requiredImages,
     failedCount: saved.failed.length,
     dir: saved.dir,
     manifestPath: saved.manifestPath,
     images: saved.images,
     failed: saved.failed,
+    model: normalizeModelName(state.model || opts.model || DEFAULT_IMAGE_MODEL),
     turn: state.turns || 1,
     assistantCount: extracted.assistantCount,
     assistantIndex: extracted.index,
@@ -2518,10 +2694,12 @@ function waitCriteriaFromState(state, opts) {
 function imageWaitCriteriaFromState(state, opts) {
   const sendData = state.stages && state.stages.send && state.stages.send.data;
   const assistantBefore = sendData && Number.isFinite(sendData.assistantBefore) ? sendData.assistantBefore : null;
+  const model = normalizeModelName(state.model || opts.model || DEFAULT_IMAGE_MODEL);
+  const requiredImages = Math.min(imageCountFromOpts(opts), imageCountLimitForModel(model));
   return {
     assistantBefore,
     requireNewAssistant: assistantBefore !== null,
-    requiredImages: 1,
+    requiredImages,
     stableSec: Math.max(0, Number.isFinite(opts.stableSec) ? opts.stableSec : DEFAULT_STABLE_SECONDS),
   };
 }
@@ -2630,7 +2808,7 @@ async function waitForImageCompletion(session, config) {
   let lastRefreshAt = 0;
   while (true) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
-    const page = await getConversationProgress(session);
+    const page = await getConversationProgress(session, criteria.assistantBefore);
     lastPage = page;
     const hasNewAssistant = criteria.requireNewAssistant
       ? (page.assistantCount || 0) > criteria.assistantBefore
@@ -2746,9 +2924,18 @@ async function extractLastAssistantImages(session, criteria = {}, maxImages = DE
     if (minIndex !== null && effectiveCount <= minIndex) {
       return JSON.stringify({ error: 'no_new_assistant', assistantCount: effectiveCount, minIndex, images: [] });
     }
-    const last = msgs[msgs.length - 1] || imageRoots[imageRoots.length - 1];
-    const nodes = [...last.querySelectorAll('img')];
-    const candidates = collectMeaningfulImages(last).slice(0, ${JSON.stringify(cappedMax)});
+    let scopes = [];
+    if (minIndex !== null) {
+      if (msgs.length) scopes = msgs.slice(Math.min(minIndex, msgs.length));
+      else scopes = imageRoots.slice(Math.min(minIndex, imageRoots.length));
+    } else {
+      const last = msgs[msgs.length - 1] || imageRoots[imageRoots.length - 1];
+      if (last) scopes = [last];
+    }
+    if (!scopes.length) {
+      return JSON.stringify({ error: 'no_new_assistant', assistantCount: effectiveCount, minIndex, images: [] });
+    }
+    const candidates = collectImagesFromRoots(scopes, ${JSON.stringify(cappedMax)});
     const bytesToBase64 = (bytes) => {
       let binary = '';
       const chunk = 0x8000;
@@ -2757,8 +2944,10 @@ async function extractLastAssistantImages(session, criteria = {}, maxImages = DE
       }
       return btoa(binary);
     };
-    const readImage = async (meta) => {
-      const img = nodes[meta.index];
+    const readImage = async (entry) => {
+      const img = entry.node;
+      const meta = { ...entry };
+      delete meta.node;
       const src = meta.src || (img && (img.currentSrc || img.src || img.getAttribute('src'))) || '';
       let dataUrl = '';
       let mimeType = '';
@@ -2936,6 +3125,9 @@ async function saveExtractedImages(state, opts, extracted) {
     session: state.session,
     conversationUrl: extracted.url || state.conversationUrl || '',
     prompt: state.prompt || '',
+    requestedImageCount: imageCountFromOpts(opts),
+    requiredImages: imageWaitCriteriaFromState(state, opts).requiredImages,
+    model: normalizeModelName(state.model || opts.model || DEFAULT_IMAGE_MODEL),
     imageDir: dir,
     images: saved,
     failed,
@@ -2946,227 +3138,53 @@ async function saveExtractedImages(state, opts, extracted) {
   return { dir, manifestPath, images: saved, failed };
 }
 
-function parseJsonOutput(stdout) {
-  const text = String(stdout || '').trim();
-  if (!text) throw new Error('child produced no stdout');
-  try {
-    return JSON.parse(text);
-  } catch {}
-  const start = text.lastIndexOf('\n{');
-  if (start >= 0) {
-    try { return JSON.parse(text.slice(start + 1)); } catch {}
+async function prepareImageGenerationPlan(state, opts) {
+  const requested = imageCountFromOpts(opts);
+  opts.originalImageCount = Number.isFinite(opts.originalImageCount) ? opts.originalImageCount : requested;
+
+  const targetModel = normalizeModelName(state.model || opts.model || DEFAULT_IMAGE_MODEL);
+  const limit = imageCountLimitForModel(targetModel);
+  if (requested > limit) {
+    log(`image-count ${requested} exceeds model=${targetModel} limit ${limit}; limiting this run to ${limit}`);
+    opts.imageCount = limit;
   }
-  const first = text.indexOf('{');
-  const last = text.lastIndexOf('}');
-  if (first >= 0 && last > first) {
-    try { return JSON.parse(text.slice(first, last + 1)); } catch {}
-  }
-  throw new Error(`child stdout was not JSON: ${text.slice(0, 240)}`);
-}
 
-function prefixedChildLog(label, text) {
-  const lines = String(text || '').split(/\r?\n/).filter(Boolean);
-  for (const line of lines) log(`[${label}] ${line}`);
-}
-
-function buildImageChildArgs(opts, job, prompt) {
-  const args = [
-    __filename,
-    '-s', job.session,
-    'image',
-    '--json',
-    '--image-count', '1',
-    '--max-images', '1',
-    '--model', normalizeModelName(opts.model || DEFAULT_IMAGE_MODEL),
-    '--image-prefix', job.prefix,
-  ];
-  if (opts.imageDir) args.push('--image-dir', opts.imageDir);
-  if (opts.waitForever) args.push('--until-complete');
-  else if (Number.isFinite(opts.wait)) args.push('--wait', String(opts.wait));
-  if (Number.isFinite(opts.interval)) args.push('--interval', String(opts.interval));
-  if (Number.isFinite(opts.refreshSec)) args.push('--refresh', String(opts.refreshSec));
-  if (Number.isFinite(opts.stableSec)) args.push('--stable', String(opts.stableSec));
-  if (opts.resume) args.push('--resume');
-  if (opts.keepSession) args.push('--keep-session');
-  if (opts.cleanupState) args.push('--cleanup-state');
-  if (opts.toolExplicit) args.push('--tool', normalizeToolName(opts.tool));
-  if (opts.uploadSelector && opts.uploadSelector !== DEFAULT_UPLOAD_SELECTOR) args.push('--upload-selector', opts.uploadSelector);
-  if (Number.isFinite(opts.uploadWait)) args.push('--upload-wait', String(opts.uploadWait));
-  for (const file of normalizeUploadFiles(opts.uploads || [])) args.push('--upload', file);
-  args.push('--', prompt);
-  return args;
-}
-
-function runImageChild(job, opts, prompt) {
-  return new Promise((resolve) => {
-    const args = buildImageChildArgs(opts, job, prompt);
-    const child = spawn(process.execPath, args, {
-      cwd: process.cwd(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
-    child.stderr.on('data', (chunk) => {
-      const text = chunk.toString('utf8');
-      stderr += text;
-      prefixedChildLog(job.label, text);
-    });
-    child.on('error', (error) => {
-      resolve({
-        ok: false,
-        index: job.index,
-        session: job.session,
-        prefix: job.prefix,
-        error: error.message,
-        stderr,
-      });
-    });
-    child.on('close', (code) => {
-      let data = null;
-      let parseError = '';
-      try { data = parseJsonOutput(stdout); } catch (e) { parseError = e.message; }
-      const images = data && Array.isArray(data.images) ? data.images : [];
-      const ok = code === 0 && data && data.ok !== false && images.length > 0;
-      resolve({
-        ok,
-        index: job.index,
-        session: job.session,
-        prefix: job.prefix,
-        exitCode: code,
-        output: data && data.output || null,
-        images,
-        data,
-        error: ok ? '' : (data && (data.message || data.error) || parseError || (images.length ? `child exited ${code}` : 'child returned no images')),
-        stderr,
-      });
-    });
-  });
-}
-
-async function runWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let next = 0;
-  async function loop() {
-    while (next < items.length) {
-      const index = next++;
-      results[index] = await worker(items[index], index);
-    }
-  }
-  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, loop);
-  await Promise.all(workers);
-  return results;
-}
-
-async function runParallelImageGeneration(state, opts, prompt) {
-  const requested = Math.max(1, Number.isFinite(opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT);
-  const concurrency = Math.max(1, Math.min(3, Number.isFinite(opts.imageConcurrency) ? opts.imageConcurrency : DEFAULT_IMAGE_CONCURRENCY));
-  const dir = path.resolve(opts.imageDir || state.imageDir || DEFAULT_IMAGE_DIR);
-  const basePrefix = sanitizeFileComponent(
-    opts.imagePrefix || state.imagePrefix || `gpt-image-${state.createdAt || Date.now()}`,
-    `gpt-image-${Date.now()}`
-  );
-  fs.mkdirSync(dir, { recursive: true });
-
-  const jobs = Array.from({ length: requested }, (_, i) => {
-    const num = String(i + 1).padStart(2, '0');
+  if (targetModel !== DEFAULT_IMAGE_MODEL || imageCountFromOpts(opts) <= 1) {
     return {
-      index: i,
-      label: `image-${num}`,
-      session: `${state.session}-image-${num}`,
-      prefix: `${basePrefix}-${num}`,
+      model: targetModel,
+      requested,
+      planned: imageCountFromOpts(opts),
+      extendedAvailable: targetModel === DEFAULT_IMAGE_MODEL,
+      fallback: targetModel !== DEFAULT_IMAGE_MODEL,
     };
-  });
-
-  log(`parallel image generation: ${requested} image(s), concurrency=${concurrency}, one ChatGPT conversation per image`);
-  const results = await runWithConcurrency(jobs, concurrency, async (job) => {
-    log(`[${job.label}] starting session=${job.session}`);
-    const result = await runImageChild(job, { ...opts, imageCount: 1, maxImages: 1 }, prompt);
-    if (result.ok) log(`[${job.label}] done (${result.images.length} image)`);
-    else log(`[${job.label}] failed: ${result.error}`);
-    return result;
-  });
-
-  const images = [];
-  const failed = [];
-  const childManifests = [];
-  for (const result of results) {
-    if (result.output) childManifests.push({ session: result.session, path: result.output });
-    if (result.ok) {
-      for (const image of result.images || []) {
-        images.push({
-          ...image,
-          session: result.session,
-          jobIndex: result.index + 1,
-        });
-      }
-    } else {
-      failed.push({
-        session: result.session,
-        jobIndex: result.index + 1,
-        exitCode: result.exitCode,
-        error: result.error,
-        output: result.output,
-      });
-    }
   }
 
-  const manifest = {
-    generatedAt: new Date().toISOString(),
-    parallel: true,
-    session: state.session,
-    requestedImageCount: requested,
-    imageConcurrency: concurrency,
-    oneConversationPerImage: true,
-    prompt,
-    imageDir: dir,
-    images,
-    failed,
-    childManifests,
-    jobs: results.map((result) => ({
-      session: result.session,
-      jobIndex: result.index + 1,
-      ok: result.ok,
-      output: result.output,
-      imageCount: (result.images || []).length,
-      error: result.error || '',
-    })),
-  };
-  const manifestPath = uniquePath(dir, `${basePrefix}-parallel-manifest.json`);
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-
-  const data = {
-    imageCount: images.length,
-    requestedImageCount: requested,
-    failedCount: failed.length,
-    dir,
-    manifestPath,
-    images,
-    failed,
-    childManifests,
-    imageConcurrency: concurrency,
-  };
-  state.output = manifestPath;
-  state.images = images;
-  state.parallelImages = data;
-  saveState(state);
-  if (opts.cleanupState) {
-    const p = statePath(state.session);
-    if (fs.existsSync(p)) fs.unlinkSync(p);
+  log(`preflight: verifying Pro Extended before starting ${imageCountFromOpts(opts)} image sessions`);
+  const preflightOpts = { ...opts, imageMode: true, imageModelFallback: true, cleanupState: false };
+  await stageOpen(state, preflightOpts);
+  await stageLoginCheck(state, preflightOpts);
+  const ensureResult = await stageEnsureModel(state, preflightOpts);
+  const ensureData = ensureResult && ensureResult.data || {};
+  if (ensureData.fallback) {
+    opts.imageCount = DEFAULT_IMAGE_FALLBACK_COUNT;
+    opts.maxImages = Math.min(Number.isFinite(opts.maxImages) ? opts.maxImages : DEFAULT_MAX_IMAGES, DEFAULT_IMAGE_FALLBACK_COUNT);
+    log(`preflight: Pro Extended unavailable; continuing in ${DEFAULT_IMAGE_FALLBACK_MODEL} with ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
+    return {
+      model: DEFAULT_IMAGE_FALLBACK_MODEL,
+      requested,
+      planned: opts.imageCount,
+      extendedAvailable: false,
+      fallback: true,
+      reason: ensureData.fallback.reason || '',
+    };
   }
 
   return {
-    ok: failed.length === 0,
-    parallel: true,
-    session: state.session,
-    output: manifestPath,
-    imageCount: images.length,
-    requestedImageCount: requested,
-    failedCount: failed.length,
-    imageConcurrency: concurrency,
-    images,
-    failed,
-    childManifests,
+    model: DEFAULT_IMAGE_MODEL,
+    requested,
+    planned: imageCountFromOpts(opts),
+    extendedAvailable: true,
+    fallback: false,
   };
 }
 
@@ -3268,7 +3286,8 @@ Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
   -m, --model NAME     Target model: auto|pro|extended|extended-pro|thinking|think|instant
-                       (default: auto; image defaults to ${DEFAULT_IMAGE_MODEL})
+                       (default: auto; image defaults to Pro Extended;
+                       falls back to ${DEFAULT_IMAGE_FALLBACK_MODEL} if unavailable)
       --tool NAME      Target ChatGPT tool: auto|none|deep-research|deep-search|web-search|create-image
       --deep-research  Select ChatGPT's Deep research tool before sending
       --deep-search    Alias for --deep-research
@@ -3290,10 +3309,12 @@ Global flags (can appear before or after the subcommand):
       --image          Image mode for run/latest/wait (alias for the image flow)
       --image-dir DIR  Directory for saved generated images (default: ./${DEFAULT_IMAGE_DIR})
       --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
-      --image-count N  Total images to generate. Uses one ChatGPT conversation
-                       per image; default: ${DEFAULT_IMAGE_COUNT}
+      --image-count N  Total images to wait for/save from one prompt. Pro
+                       Extended allows up to ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}; fallback/non-Extended
+                       models allow ${DEFAULT_IMAGE_FALLBACK_COUNT}. Include the same count in
+                       the prompt text; default: ${DEFAULT_IMAGE_COUNT}
       --image-concurrency N
-                       Parallel image conversations, capped at ${DEFAULT_IMAGE_CONCURRENCY}
+                       Legacy no-op; Pro Extended multi-image runs stay in one prompt
       --max-images N   Max image candidates to extract/save (default: ${DEFAULT_MAX_IMAGES})
       --resume         Skip stages already marked done in state file
       --keep-session   Do not close the browser tab when finished
@@ -3348,9 +3369,9 @@ Examples:
   search.js -s my-thread latest --until-complete # wait for and print latest complete reply
   search.js -s my-thread latest --wait 0 --stable 0 --json  # check current readiness only
   search.js image --until-complete "Create a square watercolor icon of a tiny robot reading."
-  search.js image --model think --until-complete "Create a detailed isometric app icon."
-  search.js image --until-complete --image-count 5 --image-concurrency 3 "Create five distinct app icon concepts."
-  search.js --image --model instant --until-complete "Create a product hero image." --image-dir ./assets/generated
+  search.js image --model extended --until-complete "Create a detailed isometric app icon."
+  search.js image --until-complete --image-count 5 "Create exactly five distinct app icon concepts as separate images."
+  search.js --image --model extended --until-complete "Create a product hero image." --image-dir ./assets/generated
   search.js -s my-thread latest --image --until-complete --image-dir ./assets/generated
 
   # Multi-turn conversation (keeps context between prompts)
@@ -3385,7 +3406,9 @@ function parseArgs(argv) {
     imageDir: '',
     imagePrefix: '',
     imageCount: DEFAULT_IMAGE_COUNT,
+    originalImageCount: null,
     imageConcurrency: DEFAULT_IMAGE_CONCURRENCY,
+    imageModelFallback: true,
     maxImages: DEFAULT_MAX_IMAGES,
     resume: false,
     keepSession: false,
@@ -3433,6 +3456,7 @@ function parseArgs(argv) {
     else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
     else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
     else if (a === '--image-concurrency') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
+    else if (a === '--no-image-model-fallback') opts.imageModelFallback = false;
     else if (a === '--max-images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.maxImages = n; }
     else if (a === '-') { opts.stdin = true; opts.subcommandArgs.push('-'); }
     else if (a === '--') { i++; while (i < argv.length) { positional.push(argv[i]); i++; } break; }
@@ -3461,6 +3485,7 @@ function parseArgs(argv) {
         else if (k === 'image-prefix') opts.imagePrefix = v;
         else if (k === 'image-count' || k === 'images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageCount = n; }
         else if (k === 'image-concurrency') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
+        else if (k === 'no-image-model-fallback') opts.imageModelFallback = /^(0|false|no)$/i.test(v);
         else if (k === 'max-images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.maxImages = n; }
         else die(2, `unknown option: --${k}`);
       } else die(2, `unknown option: ${a}`);
@@ -3522,6 +3547,26 @@ async function readPrompt(opts, state) {
   return { text: '', source: '' };
 }
 
+function exitRunError(e, opts, state, startTime) {
+  const code = e.code === 'wait_timeout' ? 3 : e.code === 'no_session_context' ? 2 : 4;
+  const out = {
+    ok: false,
+    code: e.code || 'unknown',
+    stage: e.stage || opts.subcommand,
+    message: e.message,
+    stageData: e.stageData,
+    elapsed: Math.floor((Date.now() - startTime) / 1000),
+    state: state.session,
+    hint: code === 4 ? 'see references/intervention-points.md; fix the issue, then re-run with --resume --until-complete' : undefined,
+  };
+  if (opts.json) console.log(JSON.stringify(out, null, 2));
+  else {
+    log(`failed at stage=${out.stage} code=${out.code}: ${out.message}`);
+    if (out.hint) log(out.hint);
+  }
+  process.exit(code);
+}
+
 // --- Main -------------------------------------------------------------------
 
 async function main() {
@@ -3536,6 +3581,7 @@ async function main() {
   if (opts.subcommand === 'image' || opts.subcommand === 'extract-images') opts.imageMode = true;
   if (opts.imageMode && opts.subcommand === 'run') opts.subcommand = 'image';
   if (opts.subcommand === 'image' && !opts.modelExplicit) opts.model = DEFAULT_IMAGE_MODEL;
+  if (opts.imageMode) opts.originalImageCount = imageCountFromOpts(opts);
   opts.tool = normalizeToolName(opts.tool);
   if (opts.tool === 'deep-research' && !opts.waitExplicit) opts.wait = DEFAULT_DEEP_RESEARCH_WAIT_SECONDS;
   if (opts.help) { printHelp(); return; }
@@ -3546,9 +3592,10 @@ async function main() {
   try {
     daemonStatus = await healthCheck();
   } catch (e) {
-    die(1, `health check failed: ${e.message}`, { hint: 'try: ~/.kimi-webbridge/bin/kimi-webbridge start' });
+    die(1, `health check failed: ${e.message}`, { hint: e.hint || 'try: ~/.kimi-webbridge/bin/kimi-webbridge restart' });
   }
-  log(`daemon v${daemonStatus.version} | extension v${daemonStatus.extension_version}`);
+  if (daemonStatus.autoStarted) log('daemon auto-started');
+  log(`daemon ${formatVersionForLog(daemonStatus.version)} | extension ${formatVersionForLog(daemonStatus.extension_version)}`);
 
   if (opts.statusOnly) {
     console.log(JSON.stringify({ status: 'ok', ...daemonStatus }, null, 2));
@@ -3591,7 +3638,9 @@ async function main() {
   if (opts.uploadSelector && opts.uploadSelector !== DEFAULT_UPLOAD_SELECTOR) state.uploadSelector = opts.uploadSelector;
   if (opts.imageDir) state.imageDir = opts.imageDir;
   if (opts.imagePrefix) state.imagePrefix = opts.imagePrefix;
-  if (opts.model && opts.model !== 'auto') state.model = normalizeModelName(opts.model);
+  if (opts.model && opts.model !== 'auto' && (opts.modelExplicit || !opts.resume || !state.model)) {
+    applyModelTarget(state, opts.model);
+  }
   if (!opts.resume && ['send', 'run', 'image'].includes(opts.subcommand) && !opts.toolExplicit && state.tool && state.tool !== DEFAULT_TOOL) {
     state.tool = DEFAULT_TOOL;
     clearStage(state, 'ensureTool');
@@ -3638,7 +3687,14 @@ async function main() {
 
   // For ensure-model subcommand, override the target if first arg given
   if (opts.subcommand === 'ensure-model' && opts.subcommandArgs.length) {
-    state.model = normalizeModelName(opts.subcommandArgs[0]);
+    const nextModel = normalizeModelName(opts.subcommandArgs[0]);
+    if (nextModel === 'auto') {
+      state.model = 'auto';
+      delete state.imageModelFallback;
+      clearStage(state, 'ensureModel');
+    } else {
+      applyModelTarget(state, nextModel);
+    }
     saveState(state);
   }
 
@@ -3658,34 +3714,14 @@ async function main() {
     saveState(state);
   }
 
-  if (opts.subcommand === 'image' && !opts.dryRun && Math.max(1, Number.isFinite(opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT) > 1) {
-    if (
-      opts.resume &&
-      state.parallelImages &&
-      state.parallelImages.failedCount === 0 &&
-      state.parallelImages.requestedImageCount === opts.imageCount &&
-      state.parallelImages.manifestPath &&
-      fs.existsSync(state.parallelImages.manifestPath)
-    ) {
-      log(`resume: parallel image run already done, returning cached output`);
-      console.log(JSON.stringify({
-        ok: true,
-        cached: true,
-        parallel: true,
-        session: state.session,
-        output: state.parallelImages.manifestPath,
-        imageCount: state.parallelImages.imageCount || 0,
-        requestedImageCount: state.parallelImages.requestedImageCount,
-        failedCount: state.parallelImages.failedCount || 0,
-        imageConcurrency: state.parallelImages.imageConcurrency || DEFAULT_IMAGE_CONCURRENCY,
-        images: state.parallelImages.images || [],
-        childManifests: state.parallelImages.childManifests || [],
-      }, null, 2));
-      process.exit(0);
+  const startTime = Date.now();
+
+  if (opts.subcommand === 'image' && !opts.dryRun) {
+    try {
+      await prepareImageGenerationPlan(state, opts);
+    } catch (e) {
+      exitRunError(e, opts, state, startTime);
     }
-    const parallelOut = await runParallelImageGeneration(state, opts, state.prompt);
-    console.log(JSON.stringify(parallelOut, null, 2));
-    process.exit(parallelOut.ok ? 0 : 4);
   }
 
   // --- Execute ---
@@ -3715,7 +3751,6 @@ async function main() {
     }
   }
 
-  const startTime = Date.now();
   let result;
   try {
     if (opts.subcommand === 'run') {
@@ -3734,23 +3769,7 @@ async function main() {
       die(2, `unknown subcommand: ${opts.subcommand}`);
     }
   } catch (e) {
-    const code = e.code === 'wait_timeout' ? 3 : e.code === 'no_session_context' ? 2 : 4;
-    const out = {
-      ok: false,
-      code: e.code || 'unknown',
-      stage: e.stage || opts.subcommand,
-      message: e.message,
-      stageData: e.stageData,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
-      state: state.session,
-      hint: code === 4 ? 'see references/intervention-points.md; fix the issue, then re-run with --resume --until-complete' : undefined,
-    };
-    if (opts.json) console.log(JSON.stringify(out, null, 2));
-    else {
-      log(`failed at stage=${out.stage} code=${out.code}: ${out.message}`);
-      if (out.hint) log(out.hint);
-    }
-    process.exit(code);
+    exitRunError(e, opts, state, startTime);
   }
 
   // --- Success ---

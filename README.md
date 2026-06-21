@@ -20,7 +20,7 @@ Drive [ChatGPT Pro](https://chatgpt.com) (or **Pro Extended** with deep reasonin
 
 Prerequisites:
 - Node.js ≥ 18 (zero npm dependencies; uses only built-ins)
-- [Kimi WebBridge](https://kimi.com/features/webbridge) installed (`~/.kimi-webbridge/bin/kimi-webbridge status` should report healthy)
+- [Kimi WebBridge](https://kimi.com/features/webbridge) installed (the CLI auto-starts the daemon when `status` reports `running:false`)
 - A Chrome/Edge window open with the WebBridge extension connected
 - ChatGPT Pro/Pro Extended account, logged in
 
@@ -99,6 +99,8 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 | `research` / `deep-search` | Agent-safe Deep research run; waits for exported report | — |
 | `doctor` | Verify WebBridge, ChatGPT login, and research tool selectors | — |
 
+Before any command talks to ChatGPT, it checks Kimi WebBridge health and auto-starts the daemon when `status` reports `running:false`. If a dead process left `~/.kimi-webbridge/daemon.pid` behind, the CLI removes that stale pid file before starting. Browser/extension connectivity is still verified after startup.
+
 Completion defaults are tuned for Pro Extended: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`, `--refresh 300`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. For agent-driven work, pass `--until-complete` so the process hangs, writes `active` wait progress into `state/<session>.json`, refreshes the same tab every 5 minutes, and only prints after the full answer is extracted. Ten minutes without stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing has printed. Use `--min-chars 0` only when you intentionally expect a terse answer.
 
 Deep research uses a separate completion path: the script prints the generated plan, confirms it through the connector or a narrow Start/Confirm/Continue research button fallback, polls the connector's `get_state` because the visible ChatGPT status can lag behind, and extracts the final report through DOCX export. Agents should use `research "..."` instead of hand-assembling these steps.
@@ -121,12 +123,12 @@ node ./search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Comp
 node ./search.js -s file-thread --resume --until-complete
 ```
 
-For image generation, use `image` or `--image`. Full image runs default to `--model instant` because ChatGPT image generation must be sent from Thinking/Instant rather than Extended Pro; pass `--model think` / `--model thinking` for the Thinking option. ChatGPT currently yields one usable image per conversation, so `--image-count N` means total images: the script starts one conversation per image, runs up to `--image-concurrency` conversations in parallel (default/cap: `3`), queues the rest, and writes a top-level parallel manifest into `--image-dir`.
+For image generation, use `image` or `--image`. Full image runs default to Pro Extended (`--model extended`) and fall back to Instant only when Pro Extended is unavailable. With Pro Extended, one prompt can return about 10 separate generated images; pass `--image-count N` so the script waits for and saves up to 10 images from that same response. Fallback/non-Extended image runs are limited to 1 image. Include the same count in the prompt text.
 
 ```bash
 node ./search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
-node ./search.js image --model think --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
-node ./search.js --image --model instant --until-complete "Create four sticker-style UI mascots." --image-count 4 --image-concurrency 3 --image-dir ./assets/generated
+node ./search.js image --model extended --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
+node ./search.js --image --model extended --until-complete "Create exactly four sticker-style UI mascots as separate images." --image-count 4 --image-dir ./assets/generated
 node ./search.js -s design-thread latest --image --until-complete --image-dir ./assets/generated
 node ./search.js -s design-thread extract-images --resume --image-dir ./assets/generated
 node ./scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24
@@ -137,7 +139,7 @@ node ./scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./asse
 | Code | Meaning | What to do |
 |---|---|---|
 | `0` | Success | Use the saved file / stdout output |
-| `1` | Daemon or network error | Re-run after fixing the daemon |
+| `1` | Daemon, extension, or network error | The CLI auto-starts the daemon first; follow the printed hint if startup or extension connection still fails |
 | `2` | Bad arguments | Read `--help` |
 | `3` | Timeout during `wait` | Re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; timeout does not mark `wait` done |
 | `4` | **Human intervention required** | See [references/intervention-points.md](references/intervention-points.md) |

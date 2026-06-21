@@ -14,6 +14,8 @@ Successful response: `{"ok": true, "data": {...}}`. Error: `{"ok": false, "error
 
 ## Step 1 — Health check
 
+`search.js` auto-starts the Kimi WebBridge daemon when `status` reports `running:false`. Use this manual check only when the script still exits with a health-check error.
+
 ```bash
 ~/.kimi-webbridge/bin/kimi-webbridge status
 ```
@@ -21,7 +23,7 @@ Successful response: `{"ok": true, "data": {...}}`. Error: `{"ok": false, "error
 | Result | Action |
 |---|---|
 | `running: true, extension_connected: true` | Healthy, continue |
-| `running: false` | `~/.kimi-webbridge/bin/kimi-webbridge start` |
+| `running: false` | `~/.kimi-webbridge/bin/kimi-webbridge start`; if the status note mentions a stale PID and the process is gone, remove `~/.kimi-webbridge/daemon.pid` and start again |
 | `extension_connected: false` | Ask user: "请打开浏览器，确保 Kimi WebBridge 扩展已连接" |
 | Command not found | `curl -fsSL https://cdn.kimi.com/webbridge/install.sh \| bash` |
 
@@ -50,7 +52,7 @@ Wait 3s for the page to load.
 
 ## Step 4 — Verify / switch to Pro Extended
 
-**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js --dry-run --model instant` / `--model think` before image generation (see SKILL.md).
+**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js image --dry-run --model extended` before image generation. Image runs default to Pro Extended and fall back to Instant only when Extended is unavailable (see SKILL.md).
 
 **Method B — manual:** Take a `snapshot`, find the composer pill (text contains `Heavy` / `Extended Pro` / `Thinking` / `Instant`). To open its popover, dispatch the pointer-event sequence documented in [dom-selectors.md](dom-selectors.md). Click the menuitemradio with text matching the desired mode (`Pro • Extended` for Extended Pro).
 
