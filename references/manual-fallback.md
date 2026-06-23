@@ -52,7 +52,7 @@ Wait 3s for the page to load.
 
 ## Step 4 — Verify / switch to Pro Extended
 
-**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js image --dry-run --model extended` before image generation. Image runs default to Pro Extended and fall back to Instant only when Extended is unavailable (see SKILL.md).
+**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js image --dry-run --model extended` before image generation. Image runs default to strict Pro Extended; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable (see SKILL.md).
 
 **Method B — manual:** Take a `snapshot`, find the composer pill (text contains `Heavy` / `Extended Pro` / `Thinking` / `Instant`). To open its popover, dispatch the pointer-event sequence documented in [dom-selectors.md](dom-selectors.md). Click the menuitemradio with text matching the desired mode (`Pro • Extended` for Extended Pro).
 

@@ -123,7 +123,7 @@ node ./search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Comp
 node ./search.js -s file-thread --resume --until-complete
 ```
 
-For image generation, use `image` or `--image`. Full image runs default to Pro Extended (`--model extended`) and fall back to Instant only when Pro Extended is unavailable. With Pro Extended, one prompt can return about 10 separate generated images; pass `--image-count N` so the script waits for and saves up to 10 images from that same response. Fallback/non-Extended image runs are limited to 1 image. Include the same count in the prompt text.
+For image generation, use `image` or `--image`. Full image runs default to strict Pro Extended (`--model extended`); if Pro Extended cannot be selected, the command fails instead of silently using Instant. Add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. With Pro Extended, one prompt can return about 10 separate generated images; pass `--image-count N` so the script waits for and saves up to 10 images from that same response. Include the same count in the prompt text.
 
 ```bash
 node ./search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated

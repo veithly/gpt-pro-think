@@ -4,7 +4,7 @@ Use this reference when generating images through ChatGPT's web UI with `search.
 
 ## Model choice
 
-ChatGPT web image generation should be sent through Pro Extended first. The script defaults image runs to `--model extended` and falls back to `Instant` only when Pro Extended is unavailable.
+ChatGPT web image generation should be sent through Pro Extended first. The script defaults image runs to strict `--model extended`; if Pro Extended cannot be selected, it fails instead of silently using Instant. Use `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable.
 
 ```bash
 node search.js image --model extended --until-complete "Create one square app icon..." --image-dir ./assets/generated
@@ -21,7 +21,7 @@ Pro Extended can produce multiple separate generated images in one response. To 
 node search.js image --until-complete --image-count 5 "Create exactly five distinct square app icon concepts as separate images..." --image-dir ./assets/generated
 ```
 
-With Pro Extended available, the total image cap is 10 per prompt. If Pro Extended is unavailable, the script falls back to Instant and limits the run to 1 image. `--image-concurrency` is a legacy no-op for the current Extended flow.
+With Pro Extended available, the total image cap is 10 per prompt. If `--allow-image-model-fallback` is used and Pro Extended is unavailable, the script falls back to Instant and limits the run to 1 image. `--image-concurrency` is a legacy no-op for the current Extended flow.
 
 ## Saving
 

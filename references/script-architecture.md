@@ -78,9 +78,9 @@ The `prompt` field is what was *actually sent* (or attempted). On `--resume`, th
 
 In image mode, `wait.data.kind` is `image`. A single ChatGPT conversation waits for the requested number of generated images in the current turn, waits until generation controls disappear, and requires the combined image signature to stay unchanged for `--stable` seconds. `extractImages` saves image bytes into `--image-dir` and writes a manifest JSON; `state.output` points to that manifest.
 
-For full `image` runs with `--image-count N > 1`, `--image-count` is the number of images to wait for and save from one prompt. The parent process verifies Pro Extended before sending. If Pro Extended is available, the total image cap is 10 per prompt; if it is unavailable, the pipeline falls back to `instant` and caps the run at 1 image. `--image-concurrency` is retained as a legacy flag but is not used by the current Extended single-prompt flow.
+For full `image` runs with `--image-count N > 1`, `--image-count` is the number of images to wait for and save from one prompt. The parent process verifies Pro Extended before sending. If Pro Extended is available, the total image cap is 10 per prompt; if it is unavailable, the pipeline fails by default rather than silently using Instant. With `--allow-image-model-fallback`, it falls back to `instant` and caps the run at 1 image. `--image-concurrency` is retained as a legacy flag but is not used by the current Extended single-prompt flow.
 
-Full image runs default to `model: "extended"` unless `--model` is passed. If Pro Extended cannot be selected, the image pipeline falls back to `instant` and caps the run at 1 image. `--model think` is normalized to `thinking`; explicit `thinking` and `instant` targets are valid for single-image fallback-style generation.
+Full image runs default to `model: "extended"` unless `--model` is passed. If Pro Extended cannot be selected, the image pipeline fails unless `--allow-image-model-fallback` is passed. `--model think` is normalized to `thinking`; explicit `thinking` and `instant` targets are valid for single-image fallback-style generation.
 
 Deep research runs default to `--wait 3600` unless `--wait` is passed, because ChatGPT's Deep research tool can run much longer than Pro Extended text replies.
 

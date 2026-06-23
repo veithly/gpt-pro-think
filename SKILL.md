@@ -55,7 +55,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --resume --until-complete
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
 
 # Generate image(s) in ChatGPT and save them into the current project
-# Image mode defaults to Pro Extended; it falls back to Instant only if Extended is unavailable.
+# Image mode defaults to strict Pro Extended; add --allow-image-model-fallback only when Instant fallback is acceptable.
 node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a square watercolor icon of a tiny robot reading." --image-dir ./assets/generated
 
 # Upload local file(s) into ChatGPT before sending a prompt
@@ -150,9 +150,9 @@ If upload fails with `upload_not_allowed`, the browser/WebBridge extension block
 
 ### Image generation
 
-Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to Pro Extended (`--model extended`) and falls back to Instant only when Pro Extended is unavailable. You can still pass `--model think` / `--model thinking` or `--model instant` explicitly for a single fallback-style image run.
+Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to strict Pro Extended (`--model extended`). If Pro Extended cannot be selected, the command fails instead of silently using Instant; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. You can still pass `--model think` / `--model thinking` or `--model instant` explicitly for a single fallback-style image run.
 
-Pro Extended can return about 10 separate generated images from one prompt. For `--image-count N`, the script treats `N` as the number of images to wait for and save from the same ChatGPT response (cap: 10). Always include the same count in the prompt text, for example "Create exactly 6 separate square images...". If Pro Extended is unavailable, the script falls back to Instant and limits the run to 1 image.
+Pro Extended can return about 10 separate generated images from one prompt. For `--image-count N`, the script treats `N` as the number of images to wait for and save from the same ChatGPT response (cap: 10). Always include the same count in the prompt text, for example "Create exactly 6 separate square images...". If `--allow-image-model-fallback` is used and Pro Extended is unavailable, the script falls back to Instant and limits the run to 1 image.
 
 Generated files are written to `--image-dir` (default `./gpt-pro-images`) using `--image-prefix` or `gpt-image-<createdAt>`. For multi-image runs, saved files use numbered suffixes and the manifest records file paths, dimensions, byte sizes, source session, requested image count, required image count, and any failed downloads.
 

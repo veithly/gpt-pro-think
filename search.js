@@ -721,7 +721,7 @@ async function stageEnsureModel(state, opts = {}) {
   }
   const result = await ensureModel(state.session, target);
   if (target !== 'auto' && !result.ok) {
-    if (opts.imageMode && target === DEFAULT_IMAGE_MODEL && opts.imageModelFallback !== false) {
+    if (opts.imageMode && target === DEFAULT_IMAGE_MODEL && opts.imageModelFallback === true) {
       const reason = result.error || `current=${result.state && result.state.model || 'unknown'}`;
       log(`Pro Extended unavailable for image generation (${reason}); falling back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and limiting this run to ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
       const fallbackResult = await ensureModel(state.session, DEFAULT_IMAGE_FALLBACK_MODEL);
@@ -3160,7 +3160,7 @@ async function prepareImageGenerationPlan(state, opts) {
   }
 
   log(`preflight: verifying Pro Extended before starting ${imageCountFromOpts(opts)} image sessions`);
-  const preflightOpts = { ...opts, imageMode: true, imageModelFallback: true, cleanupState: false };
+  const preflightOpts = { ...opts, imageMode: true, cleanupState: false };
   await stageOpen(state, preflightOpts);
   await stageLoginCheck(state, preflightOpts);
   const ensureResult = await stageEnsureModel(state, preflightOpts);
@@ -3286,8 +3286,7 @@ Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
   -m, --model NAME     Target model: auto|pro|extended|extended-pro|thinking|think|instant
-                       (default: auto; image defaults to Pro Extended;
-                       falls back to ${DEFAULT_IMAGE_FALLBACK_MODEL} if unavailable)
+                       (default: auto; image defaults to strict Pro Extended)
       --tool NAME      Target ChatGPT tool: auto|none|deep-research|deep-search|web-search|create-image
       --deep-research  Select ChatGPT's Deep research tool before sending
       --deep-search    Alias for --deep-research
@@ -3315,6 +3314,9 @@ Global flags (can appear before or after the subcommand):
                        the prompt text; default: ${DEFAULT_IMAGE_COUNT}
       --image-concurrency N
                        Legacy no-op; Pro Extended multi-image runs stay in one prompt
+      --allow-image-model-fallback
+                       If Pro Extended cannot be selected in image mode, fall
+                       back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and one image
       --max-images N   Max image candidates to extract/save (default: ${DEFAULT_MAX_IMAGES})
       --resume         Skip stages already marked done in state file
       --keep-session   Do not close the browser tab when finished
@@ -3408,7 +3410,7 @@ function parseArgs(argv) {
     imageCount: DEFAULT_IMAGE_COUNT,
     originalImageCount: null,
     imageConcurrency: DEFAULT_IMAGE_CONCURRENCY,
-    imageModelFallback: true,
+    imageModelFallback: false,
     maxImages: DEFAULT_MAX_IMAGES,
     resume: false,
     keepSession: false,
@@ -3456,6 +3458,7 @@ function parseArgs(argv) {
     else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
     else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
     else if (a === '--image-concurrency') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
+    else if (a === '--allow-image-model-fallback') opts.imageModelFallback = true;
     else if (a === '--no-image-model-fallback') opts.imageModelFallback = false;
     else if (a === '--max-images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.maxImages = n; }
     else if (a === '-') { opts.stdin = true; opts.subcommandArgs.push('-'); }
@@ -3485,6 +3488,7 @@ function parseArgs(argv) {
         else if (k === 'image-prefix') opts.imagePrefix = v;
         else if (k === 'image-count' || k === 'images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageCount = n; }
         else if (k === 'image-concurrency') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
+        else if (k === 'allow-image-model-fallback') opts.imageModelFallback = !/^(0|false|no)$/i.test(v);
         else if (k === 'no-image-model-fallback') opts.imageModelFallback = /^(0|false|no)$/i.test(v);
         else if (k === 'max-images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.maxImages = n; }
         else die(2, `unknown option: --${k}`);
