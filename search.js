@@ -771,10 +771,11 @@ async function stageEnsureTool(state, opts) {
   if (!opts.continueMode && prior && prior.done && prior.data && prior.data.target === target) {
     const current = await detectToolState(state.session);
     const selected = current.selectedTool || '';
-    if ((target === 'none' && !selected) || selected === target) {
+    const duplicateSelection = Number(current.selectedCount || 0) > 1;
+    if (((target === 'none' && !selected) || selected === target) && !duplicateSelection) {
       return { skipped: true, data: { ...prior.data, state: current } };
     }
-    log(`ensure-tool: state says done but current tool is ${selected || 'none'}, re-checking`);
+    log(`ensure-tool: state says done but current tool is ${selected || 'none'}${duplicateSelection ? ' (duplicate selection detected)' : ''}, re-checking`);
     clearStage(state, 'ensureTool');
   }
   if (target !== 'none' && !TOOL_TARGETS[target]) {
@@ -790,11 +791,21 @@ async function stageEnsureTool(state, opts) {
 
   if (target === 'none') {
     if (before.selectedTool) {
-      picked = await clickActiveToolButton(state.session, before.selectedTool);
-      if (!picked || !picked.clicked) picked = await clickCheckedToolMenuItem(state.session);
+      picked = await clearSelectedTool(state.session, before);
       changed = !!(picked && picked.clicked);
     }
+  } else if (before.selectedTool === target && Number(before.selectedCount || 0) > 1) {
+    const cleared = await clearSelectedTool(state.session, before);
+    changed = !!(cleared && cleared.clicked);
+    await sleep(250);
+    picked = await clickToolMenuItem(state.session, target);
+    changed = !!(picked && picked.clicked) || changed;
   } else if (before.selectedTool !== target) {
+    if (before.selectedTool) {
+      const cleared = await clearSelectedTool(state.session, before);
+      changed = !!(cleared && cleared.clicked);
+      await sleep(250);
+    }
     picked = await clickToolMenuItem(state.session, target);
     changed = !!(picked && picked.clicked);
   }
@@ -837,6 +848,12 @@ async function detectToolState(session) {
     `(() => {
       const targets = ${JSON.stringify(targets)};
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      };
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       const matchesAny = (text, labels) => {
         const t = norm(text);
@@ -853,11 +870,25 @@ async function detectToolState(session) {
         }
         return '';
       };
+      const findToolMenu = () => {
+        const hasItems = (root) => {
+          if (!root) return false;
+          return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
+            .some((el) => targetFor(textOf(el), false));
+        };
+        const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasItems(el));
+        if (legacy) return { kind: 'menu', node: legacy };
+        const popover = [...document.querySelectorAll('.popover,[class*="popover"]')].find((el) => visible(el) && hasItems(el));
+        if (popover) return { kind: 'popover', node: popover };
+        return null;
+      };
       const describe = (el) => {
         const text = textOf(el);
         const aria = el.getAttribute('aria-label') || '';
         const title = el.getAttribute('title') || '';
         const role = el.getAttribute('role') || '';
+        const keyword = el.getAttribute('data-keyword') || '';
+        const systemHint = el.getAttribute('data-system-hint-type') || '';
         const hay = [text, aria, title].filter(Boolean).join(' ');
         return {
           text,
@@ -867,30 +898,41 @@ async function detectToolState(session) {
           checked: el.getAttribute('aria-checked') || '',
           state: el.getAttribute('data-state') || '',
           testid: el.getAttribute('data-testid') || '',
-          tool: targetFor(hay, /click to remove|remove|移除|取消|清除/i.test(hay)),
+          keyword,
+          systemHint,
+          tool: targetFor([hay, keyword, systemHint].filter(Boolean).join(' '), /click to remove|remove|移除|取消|清除/i.test(hay)),
         };
       };
-      const menus = [...document.querySelectorAll('[role="menu"]')];
-      const toolsMenu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
-      const radios = toolsMenu
-        ? [...toolsMenu.querySelectorAll('[role="menuitemradio"]')].map(describe).filter((item) => item.tool)
+      const toolsMenu = findToolMenu();
+      const menuItems = toolsMenu
+        ? [...toolsMenu.node.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')].map(describe).filter((item) => item.tool)
         : [];
-      const checkedRadio = radios.find((item) => item.checked === 'true' || item.state === 'checked') || null;
+      const checkedRadio = menuItems.find((item) => item.checked === 'true' || item.state === 'checked') || null;
       const removable = [...document.querySelectorAll('button,[role="button"]')]
         .map(describe)
         .filter((item) => item.tool && /click to remove|remove|移除|取消|清除/i.test([item.aria, item.title].join(' ')));
-      const selected = removable[0] || checkedRadio || null;
+      const inlinePills = [...document.querySelectorAll('[data-inline-selection-pill]')]
+        .filter((el) => visible(el))
+        .map(describe)
+        .filter((item) => item.tool);
+      const selected = inlinePills[inlinePills.length - 1] || removable[0] || checkedRadio || null;
+      const selectedSource = selected
+        ? (inlinePills.includes(selected) ? 'inline-pill' : (removable[0] === selected ? 'chip' : 'menu'))
+        : '';
       return JSON.stringify({
         selectedTool: selected ? selected.tool : '',
         selectedLabel: selected ? (selected.text || selected.aria || selected.title || '') : '',
-        selectedSource: selected ? (removable[0] ? 'chip' : 'menu') : '',
-        activeTools: removable,
+        selectedSource,
+        selectedCount: inlinePills.length || (selected ? 1 : 0),
+        selectedTools: inlinePills.map((item) => item.tool),
+        activeTools: [...inlinePills, ...removable],
         menuOpen: !!toolsMenu,
-        radios,
+        menuKind: toolsMenu ? toolsMenu.kind : '',
+        radios: menuItems,
       });
     })()`
   );
-  return v || { selectedTool: '', activeTools: [], menuOpen: false, radios: [] };
+  return v || { selectedTool: '', selectedSource: '', selectedCount: 0, selectedTools: [], activeTools: [], menuOpen: false, radios: [] };
 }
 
 async function readToolsMenu(session) {
@@ -901,6 +943,12 @@ async function readToolsMenu(session) {
     `(() => {
       const targets = ${JSON.stringify(targets)};
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      };
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       const targetFor = (text) => {
         const t = norm(text);
@@ -912,16 +960,24 @@ async function readToolsMenu(session) {
         }
         return '';
       };
-      const menus = [...document.querySelectorAll('[role="menu"]')];
-      const menu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
-      const items = menu ? [...menu.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')].map((el) => ({
+      const hasItems = (root) => {
+        if (!root) return false;
+        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
+          .some((el) => targetFor(textOf(el)));
+      };
+      const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasItems(el)) || null;
+      const popover = legacy ? null : [...document.querySelectorAll('.popover,[class*="popover"]')].find((el) => visible(el) && hasItems(el)) || null;
+      const root = legacy || popover || null;
+      const kind = legacy ? 'menu' : popover ? 'popover' : '';
+      const items = root ? [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')].map((el) => ({
         text: textOf(el),
         role: el.getAttribute('role') || '',
         checked: el.getAttribute('aria-checked') || '',
         state: el.getAttribute('data-state') || '',
+        keyword: el.getAttribute('data-keyword') || '',
         tool: targetFor(textOf(el)),
-      })) : [];
-      return JSON.stringify({ open: !!menu, text: menu ? textOf(menu) : '', items });
+      })).filter((item) => item.tool) : [];
+      return JSON.stringify({ open: !!root, kind, text: root ? textOf(root) : '', items });
     })()`
   );
   return v || { open: false, items: [] };
@@ -961,6 +1017,12 @@ async function clickToolMenuItem(session, target) {
     `(() => {
       const labels = ${JSON.stringify(cfg.labels)};
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      };
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       const matches = (text) => {
         const t = norm(text);
@@ -969,10 +1031,16 @@ async function clickToolMenuItem(session, target) {
           return t === l || t.includes(l);
         });
       };
-      const menus = [...document.querySelectorAll('[role="menu"]')];
-      const menu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
-      if (!menu) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
-      const items = [...menu.querySelectorAll('[role="menuitemradio"]')];
+      const hasItems = (root) => {
+        if (!root) return false;
+        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
+          .some((el) => matches(textOf(el)));
+      };
+      const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasItems(el)) || null;
+      const popover = legacy ? null : [...document.querySelectorAll('.popover,[class*="popover"]')].find((el) => visible(el) && hasItems(el)) || null;
+      const root = legacy || popover || null;
+      if (!root) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
+      const items = [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')];
       const item = items.find((el) => matches(textOf(el)));
       if (!item) return JSON.stringify({ clicked: false, reason: 'item_not_found', items: items.map((el) => textOf(el)) });
       const r = item.getBoundingClientRect();
@@ -983,6 +1051,50 @@ async function clickToolMenuItem(session, target) {
     })()`
   );
   return { target: normalized, menu, ...(picked || {}) };
+}
+
+async function clearInlineToolPills(session) {
+  return evaluate(
+    session,
+    `(() => {
+      const pm = document.querySelector('.ProseMirror');
+      const pills = [...document.querySelectorAll('[data-inline-selection-pill]')];
+      if (!pm || !pills.length) {
+        return JSON.stringify({ clicked: false, reason: 'inline_pills_not_found', remaining: pills.length });
+      }
+      pm.focus();
+      const sel = window.getSelection();
+      let removed = 0;
+      for (const pill of pills.slice().reverse()) {
+        const range = document.createRange();
+        range.selectNode(pill);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        const ok = document.execCommand('delete');
+        if (ok || !document.body.contains(pill)) removed += 1;
+      }
+      sel.removeAllRanges();
+      pm.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+      return JSON.stringify({
+        clicked: removed > 0,
+        removed,
+        remaining: document.querySelectorAll('[data-inline-selection-pill]').length,
+        text: ((pm.innerText || pm.textContent) || '').trim(),
+      });
+    })()`
+  );
+}
+
+async function clearSelectedTool(session, current = null) {
+  const state = current || await detectToolState(session);
+  if (!state || !state.selectedTool) return { clicked: false, reason: 'no_selected_tool' };
+  if (state.selectedSource === 'inline-pill') {
+    return clearInlineToolPills(session);
+  }
+  let picked = await clickActiveToolButton(session, state.selectedTool);
+  if (picked && picked.clicked) return picked;
+  picked = await clickCheckedToolMenuItem(session);
+  return picked || { clicked: false, reason: 'tool_clear_failed', selectedTool: state.selectedTool };
 }
 
 async function clickActiveToolButton(session, target) {
@@ -1026,10 +1138,20 @@ async function clickCheckedToolMenuItem(session) {
     session,
     `(() => {
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
-      const menus = [...document.querySelectorAll('[role="menu"]')];
-      const menu = menus.find((m) => /Deep research|Web search|Create image|深度研究|深度搜索|网页搜索|联网搜索|创建图像|生成图片/i.test(textOf(m))) || null;
-      if (!menu) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
-      const item = [...menu.querySelectorAll('[role="menuitemradio"]')].find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      };
+      const hasChecked = (root) => {
+        if (!root) return false;
+        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')]
+          .some((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
+      };
+      const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasChecked(el)) || null;
+      if (!legacy) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
+      const item = [...legacy.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')].find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
       if (!item) return JSON.stringify({ clicked: false, reason: 'checked_item_not_found' });
       const r = item.getBoundingClientRect();
       for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
