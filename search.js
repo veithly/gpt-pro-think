@@ -26,7 +26,7 @@ const STATUS_BIN = path.join(
 const DAEMON_PID_FILE = path.join(path.dirname(path.dirname(STATUS_BIN)), 'daemon.pid');
 const STATE_DIR = path.join(__dirname, 'state');
 const STATE_VERSION = 1;
-const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractImages'];
+const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractImages', 'extractFiles'];
 const CHATGPT_HOST_RE = /^https?:\/\/(www\.)?chatgpt\.com\//;
 const DEFAULT_WAIT_SECONDS = 1200;
 const DEFAULT_DEEP_RESEARCH_WAIT_SECONDS = 3600;
@@ -36,6 +36,9 @@ const DEFAULT_STABLE_SECONDS = 60;
 const DEFAULT_WAIT_REFRESH_SECONDS = 300;
 const DEFAULT_WAIT_REFRESH_SETTLE_MS = 5000;
 const DEFAULT_IMAGE_DIR = 'gpt-pro-images';
+const DEFAULT_FILE_DIR = 'gpt-pro-files';
+const DEFAULT_MAX_FILES = 20;
+const DEFAULT_FILE_DOWNLOAD_WAIT_MS = 6000;
 const DEFAULT_IMAGE_COUNT = 1;
 const DEFAULT_IMAGE_CONCURRENCY = 3;
 const DEFAULT_IMAGE_EXTENDED_MAX_COUNT = 10;
@@ -148,10 +151,43 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.error('[search]', ...a);
 
 function normalizeModelName(model) {
-  const value = String(model || 'auto').trim().toLowerCase();
-  if (value === 'extended-pro') return 'extended';
+  const value = String(model || 'auto').trim().toLowerCase().replace(/[_\s]+/g, '-');
+  if (value === 'extended-pro' || value === 'pro-extended') return 'extended';
   if (value === 'think') return 'thinking';
   return value || 'auto';
+}
+
+function modelStateFromLabel(label) {
+  const raw = String(label || '').replace(/\s+/g, ' ').trim();
+  const value = raw.toLowerCase().replace(/[•·]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!raw) return { model: 'unknown', effort: 'unknown', label: raw };
+  if (/^(pro(?:[- ]extended)?|pro extended)$/.test(value)) return { model: 'extended', effort: 'pro-extended', label: raw };
+  if (/^(instant|极速(?: 5\.5)?|fast(?: 5\.5)?)$/.test(value)) return { model: 'instant', effort: 'instant', label: raw };
+  if (/^(medium|中|中等)$/.test(value)) return { model: 'thinking', effort: 'medium', label: raw };
+  if (/^(high|高)$/.test(value)) return { model: 'thinking', effort: 'high', label: raw };
+  if (/^(extra[- ]high|极高)$/.test(value)) return { model: 'thinking', effort: 'extra-high', label: raw };
+  if (/^(thinking|reasoning|heavy|深度思考)$/.test(value)) return { model: 'thinking', effort: 'unknown', label: raw };
+  return { model: 'unknown', effort: 'unknown', label: raw };
+}
+
+function modelMenuLabels(target) {
+  const normalized = normalizeModelName(target);
+  if (normalized === 'extended') return ['Pro Extended', 'Pro'];
+  if (normalized === 'pro') return ['Pro', 'Pro Extended'];
+  if (normalized === 'thinking') return ['Thinking', 'High', '高', 'Medium', '中', 'Extra High', '极高'];
+  if (normalized === 'instant') return ['Instant', '极速 5.5'];
+  return [];
+}
+
+function modelStateMatchesTarget(state, target) {
+  const normalized = normalizeModelName(target);
+  const current = normalizeModelName(state && state.model || 'unknown');
+  if (normalized === 'auto') return current !== 'unknown';
+  if (normalized === 'extended') return current === 'extended';
+  if (normalized === 'instant') return current === 'instant';
+  if (normalized === 'thinking') return current === 'thinking';
+  if (normalized === 'pro') return current === 'pro' || current === 'thinking' || current === 'extended';
+  return current === normalized;
 }
 
 function imageCountFromOpts(opts) {
@@ -175,6 +211,7 @@ function applyModelTarget(state, nextModel) {
   clearStage(state, 'wait');
   clearStage(state, 'extract');
   clearStage(state, 'extractImages');
+  clearStage(state, 'extractFiles');
   return true;
 }
 
@@ -425,11 +462,13 @@ function newState(session, opts) {
     uploadSelector: opts.uploadSelector || DEFAULT_UPLOAD_SELECTOR,
     imageDir: opts.imageDir || '',
     imagePrefix: opts.imagePrefix || '',
+    fileDir: opts.fileDir || DEFAULT_FILE_DIR,
     model: opts.model || 'auto',
     tool: normalizeToolName(opts.tool || DEFAULT_TOOL),
-    conversationUrl: '',
+    conversationUrl: opts.conversationUrl || '',
     conversationTitle: '',
     images: [],
+    files: [],
     turns: 0,
     active: null,
     stages: {},
@@ -825,6 +864,7 @@ async function stageEnsureTool(state, opts) {
     clearStage(state, 'wait');
     clearStage(state, 'extract');
     clearStage(state, 'extractImages');
+    clearStage(state, 'extractFiles');
   }
   const data = {
     target,
@@ -916,16 +956,23 @@ async function detectToolState(session) {
         .map(describe)
         .filter((item) => item.tool);
       const selected = inlinePills[inlinePills.length - 1] || removable[0] || checkedRadio || null;
-      const selectedSource = selected
-        ? (inlinePills.includes(selected) ? 'inline-pill' : (removable[0] === selected ? 'chip' : 'menu'))
+      const deepResearchMode = [...document.querySelectorAll('[role="tablist"],[role="tabpanel"]')]
+        .filter(visible)
+        .find((el) => /deep research|深度研究/i.test([el.getAttribute('aria-label') || '', textOf(el)].join(' '))) || null;
+      const modeSelection = deepResearchMode
+        ? { tool: 'deep-research', text: textOf(deepResearchMode), aria: deepResearchMode.getAttribute('aria-label') || '' }
+        : null;
+      const effectiveSelected = modeSelection || selected;
+      const selectedSource = effectiveSelected
+        ? (modeSelection ? 'research-mode' : (inlinePills.includes(effectiveSelected) ? 'inline-pill' : (removable[0] === effectiveSelected ? 'chip' : 'menu')))
         : '';
       return JSON.stringify({
-        selectedTool: selected ? selected.tool : '',
-        selectedLabel: selected ? (selected.text || selected.aria || selected.title || '') : '',
+        selectedTool: effectiveSelected ? effectiveSelected.tool : '',
+        selectedLabel: effectiveSelected ? (effectiveSelected.text || effectiveSelected.aria || effectiveSelected.title || '') : '',
         selectedSource,
-        selectedCount: inlinePills.length || (selected ? 1 : 0),
+        selectedCount: inlinePills.length || (effectiveSelected ? 1 : 0),
         selectedTools: inlinePills.map((item) => item.tool),
-        activeTools: [...inlinePills, ...removable],
+        activeTools: [...inlinePills, ...removable, ...(modeSelection ? [modeSelection] : [])],
         menuOpen: !!toolsMenu,
         menuKind: toolsMenu ? toolsMenu.kind : '',
         radios: menuItems,
@@ -1001,8 +1048,12 @@ async function openToolsMenu(session) {
       return JSON.stringify({ opened: true });
     })()`
   );
-  await sleep(800);
-  menu = await readToolsMenu(session);
+  const deadline = Date.now() + 4000;
+  do {
+    await sleep(250);
+    menu = await readToolsMenu(session);
+    if (menu.open) return { ...menu, opened: !!(opened && opened.opened), openAttempt: opened };
+  } while (Date.now() < deadline);
   return { ...menu, opened: !!(opened && opened.opened), openAttempt: opened };
 }
 
@@ -1088,7 +1139,7 @@ async function clearInlineToolPills(session) {
 async function clearSelectedTool(session, current = null) {
   const state = current || await detectToolState(session);
   if (!state || !state.selectedTool) return { clicked: false, reason: 'no_selected_tool' };
-  if (state.selectedSource === 'inline-pill') {
+  if (state.selectedSource === 'inline-pill' || (Array.isArray(state.selectedTools) && state.selectedTools.includes(state.selectedTool))) {
     return clearInlineToolPills(session);
   }
   let picked = await clickActiveToolButton(session, state.selectedTool);
@@ -1146,12 +1197,12 @@ async function clickCheckedToolMenuItem(session) {
       };
       const hasChecked = (root) => {
         if (!root) return false;
-        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')]
+        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
           .some((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
       };
       const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasChecked(el)) || null;
       if (!legacy) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
-      const item = [...legacy.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')].find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
+      const item = [...legacy.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')].find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
       if (!item) return JSON.stringify({ clicked: false, reason: 'checked_item_not_found' });
       const r = item.getBoundingClientRect();
       for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
@@ -1290,6 +1341,31 @@ async function waitForSendButtonReady(session, maxSeconds) {
   return { ok: false, ...(last || {}) };
 }
 
+async function fillComposerPreservingInlineTools(session, prompt) {
+  return evaluate(
+    session,
+    `(() => {
+      const ce = document.querySelector('#prompt-textarea, [contenteditable="true"]');
+      const root = ce && ce.querySelector('p');
+      const pills = root ? [...root.querySelectorAll('[data-inline-selection-pill]')] : [];
+      if (!ce || !root || !pills.length) return JSON.stringify({ preserved: false, reason: 'inline_tool_pill_not_found' });
+      for (const child of [...root.childNodes]) {
+        if (!pills.includes(child)) child.remove();
+      }
+      ce.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(root);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const ok = document.execCommand('insertText', false, ${JSON.stringify(prompt)});
+      ce.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ${JSON.stringify(prompt)} }));
+      return JSON.stringify({ preserved: true, ok, pills: pills.length, text: (ce.innerText || ce.textContent || '').trim() });
+    })()`
+  );
+}
+
 async function stageUpload(state, opts) {
   const files = uploadFilesForState(state);
   if (!files.length) {
@@ -1350,6 +1426,7 @@ async function stageUpload(state, opts) {
   clearStage(state, 'wait');
   clearStage(state, 'extract');
   clearStage(state, 'extractImages');
+  clearStage(state, 'extractFiles');
   markStage(state, 'upload', data);
   saveState(state);
   return { skipped: false, data };
@@ -1380,9 +1457,14 @@ async function stageSend(state, opts) {
     );
     if (!inserted || !inserted.ok) throw new Error('send: failed to insert text into contenteditable');
   } else {
-    log(`filling ${prompt.length} chars...`);
-    const fillRes = unwrap(await cmd('fill', { selector: '[contenteditable="true"]', value: prompt }, state.session), 'fill');
-    if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
+    const preserved = await fillComposerPreservingInlineTools(state.session, prompt);
+    if (preserved && preserved.preserved) {
+      log(`filling ${prompt.length} chars while preserving ${preserved.pills} inline tool pill(s)`);
+    } else {
+      log(`filling ${prompt.length} chars...`);
+      const fillRes = unwrap(await cmd('fill', { selector: '[contenteditable="true"]', value: prompt }, state.session), 'fill');
+      if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
+    }
   }
   await sleep(300);
   const readyWait = uploadFiles.length ? Math.max(10, Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS) : 10;
@@ -1410,6 +1492,7 @@ async function stageSend(state, opts) {
   clearStage(state, 'wait');
   clearStage(state, 'extract');
   clearStage(state, 'extractImages');
+  clearStage(state, 'extractFiles');
   markStage(state, 'send', data);
   state.prompt = prompt;
   state.turns = data.turn;
@@ -1720,6 +1803,33 @@ async function stageExtractImages(state, opts) {
   return { skipped: false, data };
 }
 
+async function stageExtractFiles(state, opts = {}) {
+  if (!opts.forceExtract && !opts.continueMode && state.stages.extractFiles && state.stages.extractFiles.done) {
+    return { skipped: true, data: state.stages.extractFiles.data };
+  }
+  const sendData = state.stages.send && state.stages.send.data;
+  const assistantBefore = sendData && Number.isFinite(sendData.assistantBefore) ? sendData.assistantBefore : null;
+  const extracted = await extractAssistantFiles(
+    state.session,
+    { assistantBefore },
+    { allFiles: !!opts.allFiles, maxFiles: opts.maxFiles }
+  );
+  const saved = await saveExtractedFiles(state, opts, extracted);
+  const data = {
+    fileCount: saved.files.length,
+    failedCount: saved.failed.length,
+    dir: saved.dir,
+    files: saved.files,
+    failed: saved.failed,
+    assistantCount: extracted.assistantCount,
+    assistantIndex: extracted.index,
+    allFiles: !!opts.allFiles,
+  };
+  markStage(state, 'extractFiles', data);
+  saveState(state);
+  return { skipped: false, data };
+}
+
 async function stageStatus(state) {
   // Read-only: print the state.
   return { skipped: true, data: state };
@@ -1754,6 +1864,15 @@ async function runLatest(state, opts) {
   } else {
     results.extract = await stageExtract(state, latestOpts);
   }
+  results.extractFiles = await stageExtractFiles(state, latestOpts);
+  return results;
+}
+
+async function runExtractFiles(state, opts) {
+  const results = {};
+  results.open = await stageOpen(state, opts);
+  results.loginCheck = await stageLoginCheck(state, opts);
+  results.extractFiles = await stageExtractFiles(state, opts);
   return results;
 }
 
@@ -1847,35 +1966,39 @@ async function detectModel(session) {
   const popover = await probePopover(session);
   const v = await evaluate(
     session,
-    `(() => { const pill = [...document.querySelectorAll('button.__composer-pill')].map(b => (b.innerText||'').trim()).filter(Boolean); return JSON.stringify({ pills: pill }); })()`
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const pill = [...document.querySelectorAll('button.__composer-pill')].map((b) => ({
+        text: textOf(b),
+        testid: b.getAttribute('data-testid') || '',
+      })).filter((item) => item.text);
+      const selected = [...document.querySelectorAll('[role=menuitemradio]')]
+        .find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
+      return JSON.stringify({
+        pills: pill,
+        selected: selected ? {
+          text: textOf(selected),
+          testid: selected.getAttribute('data-testid') || '',
+          state: selected.getAttribute('data-state') || '',
+          ariaChecked: selected.getAttribute('aria-checked') || '',
+        } : null,
+      });
+    })()`
   );
-  const pills = (v && v.pills) || [];
-  let mode = 'unknown';
-  let sub = 'unknown';
-  if (popover) {
-    const selected = await evaluate(
-      session,
-      `(() => { const items = [...document.querySelectorAll('[role=menuitemradio]')]; const cur = items.find(el => el.getAttribute('aria-checked') === 'true'); if (!cur) return null; return { testid: cur.getAttribute('data-testid'), text: (cur.innerText||'').trim() }; })()`
-    );
-    if (selected) {
-      const t = selected.testid || '';
-      if (/-pro$/.test(t)) mode = /Extended/i.test(selected.text) ? 'extended' : 'pro';
-      else if (/-thinking$/.test(t)) mode = 'thinking';
-      else if (/-instant$/.test(t) || t.endsWith('-5-5')) mode = 'instant';
-      const m = selected.text.match(/•\s*(\w+)/);
-      if (m) sub = m[1].toLowerCase();
-    }
+  const pills = (v && Array.isArray(v.pills) ? v.pills : []).map((item) => item.text);
+  let parsed = null;
+  if (popover && v && v.selected) {
+    parsed = modelStateFromLabel(v.selected.text);
   }
-  if (mode === 'unknown' && pills[0]) {
-    const p = pills[0].toLowerCase();
-    if (/extended/.test(p)) mode = 'extended';
-    else if (/pro/.test(p)) mode = 'pro';
-    else if (/thinking/.test(p)) mode = 'thinking';
-    else if (/instant/.test(p)) mode = 'instant';
-    else if (/heavy/.test(p)) mode = 'extended';
-    else mode = p;
+  if ((!parsed || parsed.model === 'unknown') && v && Array.isArray(v.pills) && v.pills[0]) {
+    parsed = modelStateFromLabel(v.pills[0].text);
   }
-  return { model: mode, effort: sub, pills };
+  return {
+    model: parsed && parsed.model || 'unknown',
+    effort: parsed && parsed.effort || 'unknown',
+    label: parsed && parsed.label || '',
+    pills,
+  };
 }
 
 async function detectModelReady(session, maxSeconds = 10) {
@@ -1895,7 +2018,25 @@ async function probePopover(session) {
   );
   if (!opened) return null;
   await sleep(700);
-  const html = await evaluate(session, `(() => { const m = document.querySelector('[role=menu]'); return m ? m.outerHTML : null; })()`);
+  const html = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      };
+      const looksLikeModelMenu = (el) => /instant|medium|high|extra high|pro extended|\bpro\b|极速|极高|中|高/.test(textOf(el).toLowerCase());
+      const menu =
+        [...document.querySelectorAll('[data-testid="composer-intelligence-picker-content"]')].find((el) => visible(el) && looksLikeModelMenu(el)) ||
+        [...document.querySelectorAll('[role=menu]')].find((el) => visible(el) && looksLikeModelMenu(el)) ||
+        [...document.querySelectorAll('.popover,[class*="popover"]')].find((el) => visible(el) && looksLikeModelMenu(el)) ||
+        null;
+      return menu ? menu.outerHTML : null;
+    })()`
+  );
   await evaluate(session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); document.body.click(); })()`);
   await sleep(300);
   return html;
@@ -1904,10 +2045,9 @@ async function probePopover(session) {
 async function ensureModel(session, target) {
   if (target === 'auto') return { ok: true, state: await detectModelReady(session, 4), changed: false };
   const state = await detectModelReady(session, 12);
-  if (target === 'extended' && state.model === 'extended') return { ok: true, state, changed: false };
-  if (target === 'pro' && (state.model === 'pro' || state.model === 'thinking')) return { ok: true, state, changed: false };
-  const labelRe = target === 'extended' || target === 'pro' ? 'Pro' : target === 'thinking' ? 'Thinking' : target === 'instant' ? 'Instant' : null;
-  if (!labelRe) return { ok: false, state, changed: false, error: `unknown target: ${target}` };
+  if (modelStateMatchesTarget(state, target)) return { ok: true, state, changed: false };
+  const labels = modelMenuLabels(target);
+  if (!labels.length) return { ok: false, state, changed: false, error: `unknown target: ${target}` };
   await evaluate(
     session,
     `(() => { const pill = [...document.querySelectorAll('button.__composer-pill')][0]; if (!pill) return false; const r = pill.getBoundingClientRect(); for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) { pill.dispatchEvent(new PointerEvent(t, {bubbles:true, cancelable:true, clientX:r.x+5, clientY:r.y+5, button:0})); } return true; })()`
@@ -1915,14 +2055,40 @@ async function ensureModel(session, target) {
   await sleep(800);
   const picked = await evaluate(
     session,
-    `(() => { const items = [...document.querySelectorAll('[role=menuitemradio]')]; for (const it of items) { const span = it.querySelector('span'); const primary = span ? (span.childNodes[0] && span.childNodes[0].textContent || span.innerText).trim().split('\\n')[0] : ''; if (primary === ${JSON.stringify(labelRe)}) { const fullText = (it.innerText||'').trim(); if (${JSON.stringify(target)} === 'extended' && !/Extended/i.test(fullText)) continue; it.click(); return { primary, fullText, testid: it.getAttribute('data-testid') }; } } return null; })()`
+    `(() => {
+      const labels = ${JSON.stringify(labels)};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const items = [...document.querySelectorAll('[role=menuitemradio]')];
+      const primaryText = (el) => {
+        const direct = [...el.querySelectorAll('span')].map((node) => textOf(node)).find(Boolean);
+        const firstLine = textOf(el).split('\\n').map((part) => part.trim()).find(Boolean) || '';
+        return direct || firstLine;
+      };
+      for (const wanted of labels) {
+        const item = items.find((it) => norm(primaryText(it)) === norm(wanted) || norm(textOf(it)) === norm(wanted));
+        if (!item) continue;
+        const r = item.getBoundingClientRect();
+        for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+          item.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+        }
+        return {
+          primary: primaryText(item),
+          fullText: textOf(item),
+          testid: item.getAttribute('data-testid') || '',
+          ariaChecked: item.getAttribute('aria-checked') || '',
+          dataState: item.getAttribute('data-state') || '',
+        };
+      }
+      return null;
+    })()`
   );
   await sleep(700);
   await evaluate(session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); document.body.click(); })()`);
   await sleep(300);
-  if (!picked) return { ok: false, state, changed: false, error: `could not find "${labelRe}" option in popover` };
+  if (!picked) return { ok: false, state, changed: false, error: `could not find "${labels[0]}" option in popover` };
   const after = await detectModel(session);
-  return { ok: after.model === target || (target === 'extended' && after.model === 'extended'), state: after, changed: true, picked };
+  return { ok: modelStateMatchesTarget(after, target), state: after, changed: true, picked };
 }
 
 // --- Wait & extract ----------------------------------------------------------
@@ -3123,6 +3289,159 @@ async function extractLastAssistantImages(session, criteria = {}, maxImages = DE
   };
 }
 
+async function extractAssistantFiles(session, criteria = {}, options = {}) {
+  const minAssistantIndex = Number.isFinite(criteria.assistantBefore) ? criteria.assistantBefore : null;
+  const maxFiles = Math.max(1, Math.min(100, Number.isFinite(options.maxFiles) ? options.maxFiles : DEFAULT_MAX_FILES));
+  const allFiles = !!options.allFiles;
+  const code = `(async () => {
+    const fileNameRe = /\\.(md|markdown|txt|pdf|docx?|xlsx?|csv|json|ya?ml|zip|pptx?|html?|css|js|ts|py|java|go|rs|sql|png|jpe?g|webp|gif|svg)$/i;
+    const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').replace(/\\s+/g, ' ').trim();
+    const bytesToBase64 = (bytes) => {
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      return btoa(binary);
+    };
+    const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    if (!msgs.length) return JSON.stringify({ error: 'no_messages', files: [], assistantCount: 0 });
+    const minIndex = ${minAssistantIndex === null ? 'null' : JSON.stringify(minAssistantIndex)};
+    if (minIndex !== null && msgs.length <= minIndex) {
+      return JSON.stringify({ error: 'no_new_assistant', files: [], assistantCount: msgs.length, minIndex });
+    }
+    const scopes = ${JSON.stringify(allFiles)}
+      ? (minIndex === null ? msgs : msgs.slice(Math.min(minIndex, msgs.length)))
+      : [msgs[msgs.length - 1]];
+    const buttons = [];
+    const seenLabels = new Set();
+    for (const root of scopes) {
+      for (const button of [...root.querySelectorAll('button.behavior-btn[aria-label], button[aria-label]')]) {
+        const label = (button.getAttribute('aria-label') || textOf(button)).trim();
+        if (!label || !fileNameRe.test(label) || seenLabels.has(label)) continue;
+        seenLabels.add(label);
+        buttons.push({ button, label });
+        if (buttons.length >= ${JSON.stringify(maxFiles)}) break;
+      }
+      if (buttons.length >= ${JSON.stringify(maxFiles)}) break;
+    }
+    if (!buttons.length) return JSON.stringify({ files: [], assistantCount: msgs.length });
+
+    const originalFetch = window.fetch.bind(window);
+    const captured = [];
+    const simpleMetadata = [];
+    const captureContentResponse = async (response, requestUrl, fileName) => {
+      const responseUrl = response.url || requestUrl;
+      const contentType = response.headers.get('content-type') || '';
+      const looksLikeContent = /\\/backend-api\\/estuary\\/content(?:\\?|$)/i.test(requestUrl) || /\\/backend-api\\/estuary\\/content(?:\\?|$)/i.test(responseUrl);
+      if (!looksLikeContent && /json|text\\//i.test(contentType)) return false;
+      try {
+        const copy = response.clone();
+        const buffer = new Uint8Array(await copy.arrayBuffer());
+        if (!buffer.byteLength) return false;
+        captured.push({
+          sourceUrl: responseUrl,
+          mimeType: contentType,
+          bytes: buffer.byteLength,
+          dataBase64: bytesToBase64(buffer),
+          fileName,
+        });
+        return true;
+      } catch (e) {
+        captured.push({ sourceUrl: responseUrl, fileName, error: e && e.message ? e.message : String(e) });
+        return false;
+      }
+    };
+    const downloadFromSimpleMetadata = async (metadata, fileName) => {
+      const fileId = metadata && (metadata.file_id || metadata.id);
+      if (!fileId) return false;
+      const auth = await originalFetch('/api/auth/session', { credentials: 'include' })
+        .then((response) => response.json())
+        .then((session) => session && session.accessToken)
+        .catch(() => '');
+      if (!auth) return false;
+      const conversationId = (location.pathname.match(/\\/c\\/([^/?]+)/i) || [])[1] || '';
+      const query = conversationId ? '?conversation_id=' + encodeURIComponent(conversationId) : '';
+      const downloadEndpoint = '/backend-api/files/' + encodeURIComponent(fileId) + '/download' + query;
+      const downloadResponse = await originalFetch(downloadEndpoint, {
+        credentials: 'include',
+        headers: { Authorization: 'Bearer ' + auth },
+      });
+      if (!downloadResponse.ok) return false;
+      let payload = null;
+      try { payload = await downloadResponse.clone().json(); } catch {}
+      const downloadUrl = payload && (payload.download_url || payload.downloadUrl || payload.url);
+      if (!downloadUrl) return false;
+      const contentUrl = new URL(downloadUrl, location.href).href;
+      return { downloadUrl: contentUrl, authorization: 'Bearer ' + auth, fileName };
+    };
+    window.fetch = async (...args) => {
+      const response = await originalFetch(...args);
+      const rawUrl = typeof args[0] === 'string' ? args[0] : args[0] && args[0].url || '';
+      const url = new URL(rawUrl, location.href).href;
+      const responseUrl = response.url || url;
+      if (/\\/backend-api\\/estuary\\/content(?:\\?|$)/i.test(url) || /\\/backend-api\\/estuary\\/content(?:\\?|$)/i.test(responseUrl)) {
+        await captureContentResponse(response, url, '');
+      } else if (/\\/backend-api\\/files\\/[^/]+\\/simple(?:\\?|$)/i.test(url)) {
+        try {
+          const metadata = JSON.parse(await response.clone().text());
+          simpleMetadata.push(metadata);
+        } catch {}
+      }
+      return response;
+    };
+
+    try {
+      for (const entry of buttons) {
+        const before = captured.length;
+        const metadataBefore = simpleMetadata.length;
+        entry.button.click();
+        const deadline = Date.now() + ${JSON.stringify(DEFAULT_FILE_DOWNLOAD_WAIT_MS)};
+        while (captured.length === before && simpleMetadata.length === metadataBefore && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (captured.length === before) {
+          const freshMetadata = simpleMetadata.slice(metadataBefore);
+          for (const metadata of freshMetadata) {
+            try {
+              const fallback = await downloadFromSimpleMetadata(metadata, entry.label);
+              if (fallback && fallback.downloadUrl) {
+                captured.push({
+                  sourceUrl: fallback.downloadUrl,
+                  downloadUrl: fallback.downloadUrl,
+                  downloadAuthorization: fallback.authorization,
+                  fileName: entry.label,
+                });
+                break;
+              }
+            } catch {}
+          }
+        }
+        const fresh = captured.slice(before);
+        for (const file of fresh) file.fileName = entry.label;
+      }
+    } finally {
+      window.fetch = originalFetch;
+    }
+    const files = [];
+    const seenSources = new Set();
+    for (const file of captured) {
+      if ((!file.dataBase64 && !file.downloadUrl) || !file.sourceUrl || seenSources.has(file.sourceUrl)) continue;
+      seenSources.add(file.sourceUrl);
+      files.push(file);
+    }
+    return JSON.stringify({ files, simpleMetadata, assistantCount: msgs.length, index: msgs.length - 1, url: location.href });
+  })()`;
+  const v = await evaluate(session, code);
+  if (!v) return { files: [], error: 'no_value' };
+  if (typeof v === 'string') return { files: [], error: v };
+  return {
+    files: Array.isArray(v.files) ? v.files : [],
+    error: v.error,
+    assistantCount: v.assistantCount,
+    index: v.index,
+    url: v.url,
+  };
+}
+
 function sanitizeFileComponent(value, fallback) {
   const clean = String(value || '')
     .trim()
@@ -3144,10 +3463,17 @@ function mimeToExt(mimeType, fallback = 'png') {
 }
 
 function compactSource(src) {
-  const value = String(src || '');
+  let value = String(src || '');
   if (/^data:/i.test(value)) {
     const header = value.slice(0, Math.min(value.indexOf(',') + 1 || 80, 120));
     return `${header}...(${value.length} chars)`;
+  }
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+      for (const key of ['sig', 'token', 'access_token', 'authorization', 'auth']) url.searchParams.delete(key);
+      value = url.toString();
+    } catch {}
   }
   if (value.length > 500) return `${value.slice(0, 220)}...${value.slice(-220)}`;
   return value;
@@ -3186,6 +3512,16 @@ function uniquePath(dir, fileName) {
 async function downloadImageFromUrl(url) {
   if (typeof fetch !== 'function') throw new Error('Node fetch is unavailable');
   const response = await fetch(url);
+  if (!response.ok) throw new Error(`download ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const mimeType = response.headers.get('content-type') || '';
+  return { buffer, mimeType };
+}
+
+async function downloadFileFromUrl(url, authorization = '') {
+  if (typeof fetch !== 'function') throw new Error('Node fetch is unavailable');
+  const headers = authorization ? { Authorization: authorization } : undefined;
+  const response = await fetch(url, headers ? { headers } : undefined);
   if (!response.ok) throw new Error(`download ${response.status}`);
   const buffer = Buffer.from(await response.arrayBuffer());
   const mimeType = response.headers.get('content-type') || '';
@@ -3260,6 +3596,80 @@ async function saveExtractedImages(state, opts, extracted) {
   return { dir, manifestPath, images: saved, failed };
 }
 
+function fileKeyFromSource(sourceUrl, fileName) {
+  const source = String(sourceUrl || '');
+  const id = source.match(/[?&]id=([^&]+)/i) || source.match(/\/files\/(file_[^/?]+)/i);
+  return id ? decodeURIComponent(id[1]) : String(fileName || '').trim().toLowerCase();
+}
+
+function fileNameFromSource(sourceUrl, fallback) {
+  try {
+    const value = new URL(sourceUrl);
+    const name = value.searchParams.get('fn');
+    if (name) return name;
+  } catch {}
+  return fallback || '';
+}
+
+async function saveExtractedFiles(state, opts, extracted) {
+  const dir = path.resolve(opts.fileDir || state.fileDir || DEFAULT_FILE_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  const saved = [];
+  const failed = [];
+  const prior = Array.isArray(state.files) ? state.files : [];
+  const files = Array.isArray(extracted.files) ? extracted.files : [];
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i] || {};
+    const key = fileKeyFromSource(file.sourceUrl, file.fileName);
+    const previous = prior.find((item) => item.key === key && item.path && path.dirname(path.resolve(item.path)) === dir && fs.existsSync(item.path));
+    if (previous) {
+      saved.push(previous);
+      continue;
+    }
+    try {
+      let buffer = file.dataBase64 ? Buffer.from(file.dataBase64, 'base64') : null;
+      let mimeType = file.mimeType || '';
+      if ((!buffer || !buffer.length) && file.downloadUrl) {
+        const downloaded = await downloadFileFromUrl(file.downloadUrl, file.downloadAuthorization || '');
+        buffer = downloaded.buffer;
+        mimeType = downloaded.mimeType || mimeType;
+      }
+      if (!buffer || !buffer.length) throw new Error(file.error || 'file bytes unavailable');
+      const rawName = path.basename(file.fileName || fileNameFromSource(file.sourceUrl, '') || `chatgpt-file-${i + 1}`);
+      const name = sanitizeFileComponent(rawName, `chatgpt-file-${i + 1}`);
+      const filePath = uniquePath(dir, name);
+      fs.writeFileSync(filePath, buffer);
+      const item = {
+        key,
+        path: filePath,
+        fileName: rawName,
+        bytes: buffer.length,
+        mimeType,
+        sourceUrl: compactSource(file.sourceUrl),
+      };
+      saved.push(item);
+      log(`saved file -> ${filePath}`);
+    } catch (e) {
+      failed.push({
+        key,
+        fileName: file.fileName || fileNameFromSource(file.sourceUrl, ''),
+        sourceUrl: compactSource(file.sourceUrl),
+        error: e.message,
+      });
+    }
+  }
+
+  const merged = [...prior];
+  for (const item of saved) {
+    const index = merged.findIndex((existing) => existing.key === item.key);
+    if (index >= 0) merged[index] = item;
+    else merged.push(item);
+  }
+  state.files = merged;
+  return { dir, files: saved, failed };
+}
+
 async function prepareImageGenerationPlan(state, opts) {
   const requested = imageCountFromOpts(opts);
   opts.originalImageCount = Number.isFinite(opts.originalImageCount) ? opts.originalImageCount : requested;
@@ -3312,8 +3722,8 @@ async function prepareImageGenerationPlan(state, opts) {
 
 // --- Sub-command pipeline ---------------------------------------------------
 
-const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract'];
-const IMAGE_PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extractImages'];
+const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractFiles'];
+const IMAGE_PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extractImages', 'extractFiles'];
 
 async function runPipeline(state, opts, pipeline = PIPELINE) {
   const results = {};
@@ -3355,6 +3765,7 @@ const STAGE_FNS = {
   wait: stageWait,
   extract: stageExtract,
   extractImages: stageExtractImages,
+  extractFiles: stageExtractFiles,
 };
 
 // Map kebab-case subcommand names to stage function keys.
@@ -3368,12 +3779,13 @@ const SUBCOMMAND_TO_STAGE = {
   wait: 'wait',
   extract: 'extract',
   'extract-images': 'extractImages',
+  'extract-files': 'extractFiles',
 };
 
 // --- CLI --------------------------------------------------------------------
 
 const RESEARCH_SUBCOMMANDS = new Set(['research', 'deep-research', 'deep-search']);
-const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'latest', 'doctor', 'status', 'cleanup'];
+const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'extract-files', 'latest', 'doctor', 'status', 'cleanup'];
 
 function printHelp() {
   process.stdout.write(`search.js - drive ChatGPT Pro via kimi-webbridge (stateful, resumable)
@@ -3397,6 +3809,7 @@ Sub-commands:
   wait                 Poll until response completes
   extract              Pull the last assistant message to --output
   extract-images       Save generated image(s) from the latest assistant message
+  extract-files        Save files created in the conversation
   latest               Recover this --session, wait for the latest complete reply,
                        save it, print it, and close the tab unless --keep-session
   doctor               Verify WebBridge, ChatGPT login, and research tool selectors
@@ -3429,6 +3842,11 @@ Global flags (can appear before or after the subcommand):
                        Seconds to wait for attachment chips (default: ${DEFAULT_UPLOAD_WAIT_SECONDS})
       --image          Image mode for run/latest/wait (alias for the image flow)
       --image-dir DIR  Directory for saved generated images (default: ./${DEFAULT_IMAGE_DIR})
+      --file-dir DIR   Directory for files created in ChatGPT (default: ./${DEFAULT_FILE_DIR})
+      --all-files      Extract file buttons from all loaded assistant messages
+      --max-files N    Max files to extract (default: ${DEFAULT_MAX_FILES})
+      --conversation-url URL
+                       Conversation URL to recover before extract-files
       --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
       --image-count N  Total images to wait for/save from one prompt. Pro
                        Extended allows up to ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}; fallback/non-Extended
@@ -3529,6 +3947,10 @@ function parseArgs(argv) {
     imageMode: false,
     imageDir: '',
     imagePrefix: '',
+    fileDir: DEFAULT_FILE_DIR,
+    conversationUrl: '',
+    allFiles: false,
+    maxFiles: DEFAULT_MAX_FILES,
     imageCount: DEFAULT_IMAGE_COUNT,
     originalImageCount: null,
     imageConcurrency: DEFAULT_IMAGE_CONCURRENCY,
@@ -3567,6 +3989,7 @@ function parseArgs(argv) {
     else if (a === '--continue' || a === '-C') opts.continueMode = true;
     else if (a === '--fresh') opts.fresh = true;
     else if (a === '--cleanup-state') opts.cleanupState = true;
+    else if (a === '--all-files') opts.allFiles = true;
     else if (a === '-f' || a === '--file') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); }
     else if (a === '-s' || a === '--session') { opts.session = argv[++i] || opts.session; }
     else if (a === '-o' || a === '--output') { opts.output = argv[++i] || ''; }
@@ -3578,11 +4001,14 @@ function parseArgs(argv) {
     else if (a === '--stable' || a === '--stable-seconds') { opts.stableSec = parseInt(argv[++i], 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
     else if (a === '--image-dir') { opts.imageDir = argv[++i] || ''; }
     else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
+    else if (a === '--file-dir') { opts.fileDir = argv[++i] || DEFAULT_FILE_DIR; }
+    else if (a === '--conversation-url' || a === '--url') { opts.conversationUrl = argv[++i] || ''; }
     else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
     else if (a === '--image-concurrency') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
     else if (a === '--allow-image-model-fallback') opts.imageModelFallback = true;
     else if (a === '--no-image-model-fallback') opts.imageModelFallback = false;
     else if (a === '--max-images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.maxImages = n; }
+    else if (a === '--max-files') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.maxFiles = n; }
     else if (a === '-') { opts.stdin = true; opts.subcommandArgs.push('-'); }
     else if (a === '--') { i++; while (i < argv.length) { positional.push(argv[i]); i++; } break; }
     else if (a.startsWith('--')) {
@@ -3608,11 +4034,15 @@ function parseArgs(argv) {
         else if (k === 'image') opts.imageMode = !/^(0|false|no)$/i.test(v);
         else if (k === 'image-dir') opts.imageDir = v;
         else if (k === 'image-prefix') opts.imagePrefix = v;
+        else if (k === 'file-dir') opts.fileDir = v || DEFAULT_FILE_DIR;
+        else if (k === 'conversation-url' || k === 'url') opts.conversationUrl = v;
+        else if (k === 'all-files') opts.allFiles = !/^(0|false|no)$/i.test(v);
         else if (k === 'image-count' || k === 'images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageCount = n; }
         else if (k === 'image-concurrency') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
         else if (k === 'allow-image-model-fallback') opts.imageModelFallback = !/^(0|false|no)$/i.test(v);
         else if (k === 'no-image-model-fallback') opts.imageModelFallback = /^(0|false|no)$/i.test(v);
         else if (k === 'max-images') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.maxImages = n; }
+        else if (k === 'max-files') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.maxFiles = n; }
         else die(2, `unknown option: --${k}`);
       } else die(2, `unknown option: ${a}`);
     }
@@ -3740,12 +4170,21 @@ async function main() {
       uploadSelector: opts.uploadSelector,
       imageDir: opts.imageDir,
       imagePrefix: opts.imagePrefix,
+      fileDir: opts.fileDir,
+      conversationUrl: opts.conversationUrl,
       model: normalizeModelName(opts.model),
       tool: opts.tool,
     });
   }
   if (!state.tool) state.tool = DEFAULT_TOOL;
+  if (!Array.isArray(state.files)) state.files = [];
   if (opts.output) state.output = opts.output;
+  if (opts.fileDir) state.fileDir = opts.fileDir;
+  if (opts.conversationUrl && state.conversationUrl !== opts.conversationUrl) {
+    state.conversationUrl = opts.conversationUrl;
+    clearStage(state, 'open');
+    clearStage(state, 'extractFiles');
+  }
   if (!opts.resume && ['send', 'run', 'image'].includes(opts.subcommand) && !opts.uploads.length && state.uploads && state.uploads.length) {
     state.uploads = [];
     clearStage(state, 'upload');
@@ -3758,6 +4197,7 @@ async function main() {
       clearStage(state, 'wait');
       clearStage(state, 'extract');
       clearStage(state, 'extractImages');
+      clearStage(state, 'extractFiles');
     }
     state.uploads = nextUploads;
   }
@@ -3767,7 +4207,7 @@ async function main() {
   if (opts.model && opts.model !== 'auto' && (opts.modelExplicit || !opts.resume || !state.model)) {
     applyModelTarget(state, opts.model);
   }
-  if (!opts.resume && ['send', 'run', 'image'].includes(opts.subcommand) && !opts.toolExplicit && state.tool && state.tool !== DEFAULT_TOOL) {
+  if (!opts.resume && ['run', 'image'].includes(opts.subcommand) && !opts.toolExplicit && state.tool && state.tool !== DEFAULT_TOOL) {
     state.tool = DEFAULT_TOOL;
     clearStage(state, 'ensureTool');
   }
@@ -3779,6 +4219,7 @@ async function main() {
       clearStage(state, 'wait');
       clearStage(state, 'extract');
       clearStage(state, 'extractImages');
+      clearStage(state, 'extractFiles');
     }
     state.tool = nextTool;
   }
@@ -3833,6 +4274,7 @@ async function main() {
       clearStage(state, 'wait');
       clearStage(state, 'extract');
       clearStage(state, 'extractImages');
+      clearStage(state, 'extractFiles');
     }
     state.tool = nextTool;
     opts.tool = nextTool;
@@ -3887,6 +4329,8 @@ async function main() {
       result = await runLatest(state, opts);
     } else if (opts.subcommand === 'doctor') {
       result = await runDoctor(state, opts, daemonStatus);
+    } else if (opts.subcommand === 'extract-files') {
+      result = await runExtractFiles(state, opts);
     } else if (SUBCOMMAND_TO_STAGE[opts.subcommand]) {
       const stageName = SUBCOMMAND_TO_STAGE[opts.subcommand];
       const fn = STAGE_FNS[stageName];
@@ -3905,6 +4349,7 @@ async function main() {
   const waitData = (result.wait && result.wait.data) || (state.stages.wait && state.stages.wait.data) || {};
   const extractData = (result.extract && result.extract.data) || (state.stages.extract && state.stages.extract.data) || {};
   const imageData = (result.extractImages && result.extractImages.data) || (state.stages.extractImages && state.stages.extractImages.data) || {};
+  const fileData = (result.extractFiles && result.extractFiles.data) || (state.stages.extractFiles && state.stages.extractFiles.data) || {};
   const doctorData = result.doctor && result.doctor.data || null;
 
   const out = {
@@ -3918,6 +4363,8 @@ async function main() {
     length: extractData.length || 0,
     imageCount: imageData.imageCount || 0,
     images: imageData.images || [],
+    fileCount: fileData.fileCount || 0,
+    files: fileData.files || state.files || [],
     wait: waitData,
   };
   if (doctorData) out.doctor = doctorData;
@@ -3953,7 +4400,7 @@ async function main() {
 
   // Final cleanup happens after stdout so the watching agent sees the result
   // as soon as it is extracted. Use --keep-session / --continue for follow-ups.
-  if (['run', 'image', 'latest', 'doctor'].includes(opts.subcommand)) {
+  if (['run', 'image', 'latest', 'doctor', 'extract-files'].includes(opts.subcommand)) {
     try { await stageCleanup(state, opts); } catch (e) { log(`cleanup warning: ${e.message}`); }
   } else if (opts.subcommand !== 'cleanup' && !opts.keepSession && opts.subcommand !== 'status') {
     // For individual sub-commands, don't auto-cleanup unless it's the final stage

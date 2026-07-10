@@ -10,6 +10,7 @@ Drive [ChatGPT Pro](https://chatgpt.com) (or **Pro Extended** with deep reasonin
 - **Agent-safe research command.** `research "..."` hides the Deep research plan/iframe/export details and returns the final report.
 - **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
 - **Image generation capture.** `image` / `--image` waits for generated images in ChatGPT's web UI, saves them under `--image-dir`, and writes a manifest.
+- **Conversation file capture.** Text runs save files created by ChatGPT under `gpt-pro-files/`; `extract-files` can recover Markdown and other attachments from an existing conversation URL.
 - **Long-wait safe.** Default wait is 20 minutes; `--until-complete` / `--wait-forever` / `--hang` keeps the CLI alive until the full answer or report is ready. During wait, the same ChatGPT tab refreshes every 5 minutes by default. Agent runs should budget at least 30 minutes for GPT Pro Think and at least 50 minutes for Deep research.
 - **Latest retrieval.** `latest` recovers a named session, waits for the newest complete reply, saves it, prints it directly, and closes the recovered tab unless `--keep-session` is passed.
 - **Browser cleanup.** One-shot runs close ChatGPT tabs on success by default; keep a tab open only for immediate follow-up turns.
@@ -70,6 +71,10 @@ node ./search.js image --until-complete "Create a square watercolor icon of a ti
 
 # Upload local file(s) before sending a prompt
 node ./search.js --upload ./brief.pdf --until-complete "Summarize this file and list the action items."
+
+# Recover and save files created in an existing ChatGPT conversation
+./search.js -s g0-files --conversation-url "https://chatgpt.com/c/<conversation-id>" extract-files
+./search.js -s g0-files --conversation-url "https://chatgpt.com/c/<conversation-id>" extract-files --file-dir ./artifacts --all-files
 ```
 
 ## Browser tab lifecycle
@@ -92,6 +97,7 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 | `extract` | Save the last assistant message | ✓ |
 | `image [prompt]` | Run the full image-generation flow and save generated images | — |
 | `extract-images` | Save generated images from the latest assistant message | ✓ |
+| `extract-files` | Save files created in the conversation; use `--conversation-url` for a historical conversation | ✓ |
 | `latest` | Recover the session, wait for the latest complete reply, save + print it | ✓ |
 | `status` | Print the current session state | — |
 | `cleanup` | Close the session tab | — |

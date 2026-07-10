@@ -1,24 +1,27 @@
 # DOM Selectors
 
-Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) as of late 2025. These survived multiple sessions and tab opens — prefer them over scanning the full accessibility tree.
+Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) verified July 2026. These survived multiple sessions and tab opens — prefer them over scanning the full accessibility tree.
 
 ## Element reference
 
 | Element | Stable selector | ARIA role | Visible name / value |
 |---|---|---|---|
 | Chat input | `[contenteditable="true"][class*="ProseMirror"]` (preferred) — fall back to `[contenteditable="true"]` | textbox | "Chat with ChatGPT" |
-| Model / thinking pill | `button.__composer-pill` | button | current mode label: `Heavy` / `Extended Pro` / `Thinking` / `Instant` |
-| Popover item | `[role="menuitemradio"]` | menuitemradio | `Instant` / `Thinking • <effort>` / `Pro • <variant>`; current = `aria-checked="true"` |
-| Popover header | `.__menu-label` | — | section header, e.g. `Latest • 5.5` |
+| Model / intelligence pill | `button.__composer-pill` | button | current mode label: `中` / `高` / `极高` / `Pro` / `极速 5.5` (English builds use `Medium` / `High` / `Extra High` / `Pro Extended` / `Instant`) |
+| Intelligence picker content | `[data-testid="composer-intelligence-picker-content"]` (preferred) | — | visible picker root under the model pill |
+| Popover item | `[role="menuitemradio"]` | menuitemradio | `极速 5.5` / `中` / `高` / `极高` / `Pro` (English builds use `Instant` / `Medium` / `High` / `Extra High` / `Pro Extended`); current = `aria-checked="true"` |
+| Popover header | picker text root | — | `智能` / `Intelligence` |
 | Send button | `[data-testid="send-button"]` | button | "Send prompt" |
 | Stop generating | `button[aria-label="Stop generating"]` | button | "Stop generating" |
 | Profile badge | `button[aria-label*="open profile menu"]` | button | `"{username} Pro"` |
 | Assistant message | `[data-message-author-role="assistant"]` | — | last child = most recent reply |
+| Generated file entity | `button.behavior-btn[aria-label]` inside the latest assistant message | button | filename such as `HackathonHunter_G0R_Research_Pack.md`; click triggers `/backend-api/files/...` download flow |
 | Generated images | `img` inside the latest assistant message | img | filtered to visible images at least 128x128 and 65,536 px area |
-| File attachment button | `button.composer-btn[aria-label="Add files and more"]` | button | "Add files and more" |
-| Composer tools menu | `[role="menu"]` opened from `[data-testid="composer-plus-btn"]` | menu | contains `Create image`, `Deep research`, `Web search` |
-| Composer tool option | `[role="menuitemradio"]` inside tools menu | menuitemradio | `Create image` / `Deep research` / `Web search`; current = `aria-checked="true"` |
+| File attachment button | `[data-testid="composer-plus-btn"]` | button | `添加文件等` / `Add files and more` |
+| Composer tools menu | `[role="menu"]` or visible popover opened from `[data-testid="composer-plus-btn"]` | menu / popover | contains `创建图片`, `深度研究`, `网页搜索` (English builds use `Create image`, `Deep research`, `Web search`) |
+| Composer tool option | `[role="menuitemradio"], [role="menuitem"], div.group.__menu-item` inside tools menu | menuitemradio / menuitem / div | `创建图片` / `深度研究` / `网页搜索`; legacy menus expose `aria-checked="true"` |
 | Active tool chip | `button,[role="button"]` with `aria-label*="click to remove"` | button | e.g. `Deep research, click to remove` |
+| Deep Research mode | visible `[role="tablist"]` / `[role="tabpanel"]` containing `深度研究` or `Deep research` | tablist / tabpanel | New UI exposes `推荐` / `报告` tabs and a `发送提示` button instead of a removable chip |
 | General file input | `input#upload-files[type="file"]` | — | hidden input, `multiple=true`, accepts general files |
 | Photo file input | `input#upload-photos[type="file"]` | — | image-only input, `accept="image/*"` |
 | Dictation / Voice | `button[aria-label="Start dictation"]`, `button[aria-label="Start Voice"]` | button | voice I/O |
@@ -35,7 +38,7 @@ for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
 }
 ```
 
-The popover renders inside the page (not a separate portal root in current ChatGPT builds), so `document.querySelectorAll('[role=menu]')` finds it after dispatching.
+The popover renders inside the page (not a separate portal root in current ChatGPT builds). The most stable inner root in the current UI is `[data-testid="composer-intelligence-picker-content"]`; the surrounding Radix container still exposes `[role=menu]`.
 
 ## Composer tools menu
 

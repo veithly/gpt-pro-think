@@ -5,12 +5,12 @@ How `search.js` works internally. Read this when you need to debug, extend, or w
 ## State machine
 
 ```
-[init] → open → login-check → ensure-model → ensure-tool → upload → send → wait → extract → [done]
+[init] → open → login-check → ensure-model → ensure-tool → upload → send → wait → extract → extract-files → [done]
             ↓         ↓             ↓             ↓          ↓       ↓       ↓        ↓
           exit 4   exit 4        exit 4        exit 4     exit 4  exit 4  exit 3   exit 4
 
 image mode:
-[init] → open → login-check → ensure-model → ensure-tool → upload → send → wait(image) → extractImages → [done]
+[init] → open → login-check → ensure-model → ensure-tool → upload → send → wait(image) → extractImages → extract-files → [done]
 ```
 
 Each stage writes a record to the per-session state file when it completes successfully. On `--resume`, stages marked `done` are skipped; stages that fail mid-execution don't get marked done and will be retried.
@@ -33,9 +33,12 @@ Schema (v1):
   "uploadSelector": "input#upload-files[type=\"file\"]",
   "imageDir": "/abs/or/relative/path/to/generated-images",
   "imagePrefix": "optional-file-prefix",
+  "fileDir": "/abs/or/relative/path/to/chatgpt-files",
+  "conversationUrl": "https://chatgpt.com/c/...",
   "model": "auto | pro | extended | thinking | instant",
   "tool": "auto | none | deep-research | web-search | create-image",
   "images": [],
+  "files": [],
   "active": {
     "stage": "wait",
     "status": "waiting",
@@ -63,7 +66,8 @@ Schema (v1):
     "send":        {"done": true,  "at": ..., "data": {"chars": 1500, "assistantBefore": 2, "mode": "replace", "uploadSignature": "[...]"}},
     "wait":        {"done": true,  "at": ..., "data": {"kind": "text", "status": "complete", "elapsed": 650, "length": 4200, "minChars": 240, "stableSec": 60}},
     "extract":     {"done": true,  "at": ..., "data": {"length": 3500, "path": "/abs/path/to/response.md", "assistantIndex": 2}},
-    "extractImages": {"done": true, "at": ..., "data": {"imageCount": 1, "manifestPath": "/abs/path/to/manifest.json", "images": [{"path": "/abs/path/to/image.png"}]}}
+    "extractImages": {"done": true, "at": ..., "data": {"imageCount": 1, "manifestPath": "/abs/path/to/manifest.json", "images": [{"path": "/abs/path/to/image.png"}]}},
+    "extractFiles": {"done": true, "at": ..., "data": {"fileCount": 1, "dir": "/abs/path/to/chatgpt-files", "files": [{"path": "/abs/path/to/chatgpt-files/report.md"}]}}
   }
 }
 ```
@@ -77,6 +81,8 @@ The `prompt` field is what was *actually sent* (or attempted). On `--resume`, th
 `tool` records an explicit ChatGPT composer tool target. `auto` means "do not change whatever ChatGPT currently has selected." `--deep-research` and `--deep-search` normalize to `deep-research`; `--web-search` normalizes to `web-search`; `--tool none` clears an active tool chip. If an explicit tool target changes, `ensureTool`, `send`, `wait`, `extract`, and `extractImages` are cleared so the next run cannot reuse a response produced under the wrong tool.
 
 In image mode, `wait.data.kind` is `image`. A single ChatGPT conversation waits for the requested number of generated images in the current turn, waits until generation controls disappear, and requires the combined image signature to stay unchanged for `--stable` seconds. `extractImages` saves image bytes into `--image-dir` and writes a manifest JSON; `state.output` points to that manifest.
+
+`extractFiles` scans the latest assistant message for ChatGPT file entities, clicks each file button to obtain its authorized download URL in the page context, downloads the bytes in Node, and saves them under `--file-dir` (default `./gpt-pro-files`). `extract-files --conversation-url <url>` opens a historical conversation without sending a new prompt. Pass `--all-files` to scan every loaded assistant message.
 
 For full `image` runs with `--image-count N > 1`, `--image-count` is the number of images to wait for and save from one prompt. The parent process verifies Pro Extended before sending. If Pro Extended is available, the total image cap is 10 per prompt; if it is unavailable, the pipeline fails by default rather than silently using Instant. With `--allow-image-model-fallback`, it falls back to `instant` and caps the run at 1 image. `--image-concurrency` is retained as a legacy flag but is not used by the current Extended single-prompt flow.
 

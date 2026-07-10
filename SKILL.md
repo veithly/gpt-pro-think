@@ -1,7 +1,7 @@
 ---
 name: gpt-pro-think
 description: |
-  Send deep-reasoning prompts to ChatGPT Pro Extended via kimi-webbridge and collect text responses or generated image files. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro Extended", "deep research with GPT".
+  Send deep-reasoning prompts to ChatGPT Pro Extended via kimi-webbridge and collect text responses, generated image files, or files created in the conversation. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro Extended", "deep research with GPT".
 ---
 
 # GPT Pro Think
@@ -61,6 +61,9 @@ node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a s
 # Upload local file(s) into ChatGPT before sending a prompt
 node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --until-complete "Summarize this file and list action items."
 
+# Recover and save files created in an existing conversation
+node ~/.claude/skills/gpt-pro-think/search.js -s g0-files --conversation-url "https://chatgpt.com/c/<conversation-id>" extract-files
+
 # Recover a still-open / saved conversation and save the latest generated image(s)
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --image --until-complete --image-dir ./assets/generated
 
@@ -95,6 +98,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 | `extract` | Pull the last assistant message, save to `--output` | ✓ | skipped if done |
 | `image` | Send a prompt, wait for generated image(s), save them to `--image-dir` | — | — |
 | `extract-images` | Save generated image(s) from the latest assistant message | ✓ | skipped if done |
+| `extract-files` | Save files created in the conversation | ✓ | skipped if done |
 | `latest` | Recover the `--session`, force wait + extract, print latest complete reply | ✓ | always re-checks |
 | `status` | Print the current session state and exit (no side effects) | — | n/a |
 | `cleanup` | Close the session | — | n/a |
