@@ -7,9 +7,9 @@ Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) verified July 2026
 | Element | Stable selector | ARIA role | Visible name / value |
 |---|---|---|---|
 | Chat input | `[contenteditable="true"][class*="ProseMirror"]` (preferred) — fall back to `[contenteditable="true"]` | textbox | "Chat with ChatGPT" |
-| Model / intelligence pill | `button.__composer-pill` | button | current mode label: `中` / `高` / `极高` / `Pro` / `极速 5.5` (English builds use `Medium` / `High` / `Extra High` / `Pro Extended` / `Instant`) |
+| Model / intelligence pill | `button.__composer-pill` | button | current mode label: `中` / `高` / `极高` / `Pro` / `极速 5.5` (English builds use `Medium` / `High` / `Extra High` / `Pro` / `Instant`) |
 | Intelligence picker content | `[data-testid="composer-intelligence-picker-content"]` (preferred) | — | visible picker root under the model pill |
-| Popover item | `[role="menuitemradio"]` | menuitemradio | `极速 5.5` / `中` / `高` / `极高` / `Pro` (English builds use `Instant` / `Medium` / `High` / `Extra High` / `Pro Extended`); current = `aria-checked="true"` |
+| Popover item | `[role="menuitemradio"]` | menuitemradio | `极速 5.5` / `中` / `高` / `极高` / `Pro` (English builds use `Instant` / `Medium` / `High` / `Extra High` / `Pro`); current = `aria-checked="true"` |
 | Popover header | picker text root | — | `智能` / `Intelligence` |
 | Send button | `[data-testid="send-button"]` | button | "Send prompt" |
 | Stop generating | `button[aria-label="Stop generating"]` | button | "Stop generating" |

@@ -1,11 +1,11 @@
 # GPT Pro Think
 
-Drive [ChatGPT Pro](https://chatgpt.com) (or **Pro Extended** with deep reasoning) through your real browser, and bring the response back into any agent or terminal session. Built on top of [Kimi WebBridge](https://kimi.com/features/webbridge), so it uses your existing ChatGPT login — no API key, no separate auth.
+Drive [ChatGPT Pro](https://chatgpt.com) with deep reasoning through your real browser, and bring the response back into any agent or terminal session. Built on top of [Kimi WebBridge](https://kimi.com/features/webbridge), so it uses your existing ChatGPT login — no API key, no separate auth.
 
 ## Why
 
 - **No API key needed.** Uses your real ChatGPT Pro subscription through a local browser daemon.
-- **Extended Pro deep reasoning.** A single `--model extended` flag puts the model in the deepest reasoning tier.
+- **Pro deep reasoning.** A single `--model pro` flag selects the current Pro tier. The old `--model extended` spelling remains a compatibility alias.
 - **Deep research / Web search.** `--deep-research` / `--deep-search` selects ChatGPT's Deep research tool; `--web-search` selects the lighter Web search tool.
 - **Agent-safe research command.** `research "..."` hides the Deep research plan/iframe/export details and returns the final report.
 - **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
@@ -23,7 +23,7 @@ Prerequisites:
 - Node.js ≥ 18 (zero npm dependencies; uses only built-ins)
 - [Kimi WebBridge](https://kimi.com/features/webbridge) installed (the CLI auto-starts the daemon when `status` reports `running:false`)
 - A Chrome/Edge window open with the WebBridge extension connected
-- ChatGPT Pro/Pro Extended account, logged in
+- ChatGPT Pro account, logged in
 
 ```bash
 git clone https://github.com/veithly/gpt-pro-think
@@ -35,7 +35,7 @@ cd gpt-pro-think
 
 ```bash
 # Run a deep prompt
-./search.js --model extended --until-complete "Analyze the tradeoffs of this architecture and recommend next steps."
+./search.js --model pro --until-complete "Analyze the tradeoffs of this architecture and recommend next steps."
 
 # Run ChatGPT Deep research / deep search
 ./search.js doctor --json
@@ -54,8 +54,8 @@ cd gpt-pro-think
 # Health check
 ./search.js --status
 
-# Verify Extended Pro without sending; closes the tab unless --keep-session is passed
-./search.js --dry-run --model extended
+# Verify Pro without sending; closes the tab unless --keep-session is passed
+./search.js --dry-run --model pro
 
 # Verify Deep research selection without sending; closes the tab unless --keep-session is passed
 ./search.js --dry-run --deep-research
@@ -107,7 +107,7 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 
 Before any command talks to ChatGPT, it checks Kimi WebBridge health and auto-starts the daemon when `status` reports `running:false`. If a dead process left `~/.kimi-webbridge/daemon.pid` behind, the CLI removes that stale pid file before starting. Browser/extension connectivity is still verified after startup.
 
-Completion defaults are tuned for Pro Extended: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`, `--refresh 300`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. For agent-driven work, pass `--until-complete` so the process hangs, writes `active` wait progress into `state/<session>.json`, refreshes the same tab every 5 minutes, and only prints after the full answer is extracted. Ten minutes without stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing has printed. Use `--min-chars 0` only when you intentionally expect a terse answer.
+Completion defaults are tuned for Pro: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`, `--refresh 300`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. For agent-driven work, pass `--until-complete` so the process hangs, writes `active` wait progress into `state/<session>.json`, refreshes the same tab every 5 minutes, and only prints after the full answer is extracted. Ten minutes without stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing has printed. Use `--min-chars 0` only when you intentionally expect a terse answer.
 
 Deep research uses a separate completion path: the script prints the generated plan, confirms it through the connector or a narrow Start/Confirm/Continue research button fallback, polls the connector's `get_state` because the visible ChatGPT status can lag behind, and extracts the final report through DOCX export. Agents should use `research "..."` instead of hand-assembling these steps.
 
@@ -129,12 +129,12 @@ node ./search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Comp
 node ./search.js -s file-thread --resume --until-complete
 ```
 
-For image generation, use `image` or `--image`. Full image runs default to strict Pro Extended (`--model extended`); if Pro Extended cannot be selected, the command fails instead of silently using Instant. Add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. With Pro Extended, one prompt can return about 10 separate generated images; pass `--image-count N` so the script waits for and saves up to 10 images from that same response. Include the same count in the prompt text.
+For image generation, use `image` or `--image`. Full image runs default to strict Pro (`--model pro`); if Pro cannot be selected, the command fails instead of silently using Instant. Add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. With Pro, one prompt can return about 10 separate generated images; pass `--image-count N` so the script waits for and saves up to 10 images from that same response. Include the same count in the prompt text.
 
 ```bash
 node ./search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
-node ./search.js image --model extended --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
-node ./search.js --image --model extended --until-complete "Create exactly four sticker-style UI mascots as separate images." --image-count 4 --image-dir ./assets/generated
+node ./search.js image --model pro --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
+node ./search.js --image --model pro --until-complete "Create exactly four sticker-style UI mascots as separate images." --image-count 4 --image-dir ./assets/generated
 node ./search.js -s design-thread latest --image --until-complete --image-dir ./assets/generated
 node ./search.js -s design-thread extract-images --resume --image-dir ./assets/generated
 node ./scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24

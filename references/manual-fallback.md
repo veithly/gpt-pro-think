@@ -50,9 +50,9 @@ curl -s -X POST http://127.0.0.1:10086/command \
 
 Wait 3s for the page to load.
 
-## Step 4 — Verify / switch to Pro Extended
+## Step 4 — Verify / switch to Pro
 
-**Method A — script (preferred):** `node search.js --dry-run --model extended` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js image --dry-run --model extended` before image generation. Image runs default to strict Pro Extended; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable (see SKILL.md).
+**Method A — script (preferred):** `node search.js --dry-run --model pro` for deep text work, `node search.js doctor --json` before ChatGPT Deep research, or `node search.js image --dry-run --model pro` before image generation. Image runs default to strict Pro; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable (see SKILL.md).
 
 **Method B — manual:** Take a `snapshot`, find the composer pill (text contains `Heavy` / `Extended Pro` / `Thinking` / `Instant`). To open its popover, dispatch the pointer-event sequence documented in [dom-selectors.md](dom-selectors.md). Click the menuitemradio with text matching the desired mode (`Pro • Extended` for Extended Pro).
 
@@ -121,7 +121,7 @@ curl -s -X POST http://127.0.0.1:10086/command \
 
 ## Step 7 — Wait for responses
 
-For agent-driven runs, keep a hard patience budget of at least **30 min** for GPT Pro Think / Pro Extended and at least **50 min** for Deep research. Ten minutes with no stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing printed. The CLI refreshes the same tab every 5 minutes by default (`--refresh 300`) while it waits. For parallel Pro Extended tabs, expect the wait to stretch; for Deep research, use fewer parallel sends and wait for the exported report.
+For agent-driven runs, keep a hard patience budget of at least **30 min** for GPT Pro Think / Pro and at least **50 min** for Deep research. Ten minutes with no stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing printed. The CLI refreshes the same tab every 5 minutes by default (`--refresh 300`) while it waits. For parallel Pro tabs, expect the wait to stretch; for Deep research, use fewer parallel sends and wait for the exported report.
 
 Poll every 2-3 min. Treat completion as conservative:
 - `Stop generating` button count = 0

@@ -1,21 +1,21 @@
 ---
 name: gpt-pro-think
 description: |
-  Send deep-reasoning prompts to ChatGPT Pro Extended via kimi-webbridge and collect text responses, generated image files, or files created in the conversation. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro Extended", "deep research with GPT".
+  Send deep-reasoning prompts to ChatGPT Pro via kimi-webbridge and collect text responses, generated image files, or files created in the conversation. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro", "deep research with GPT".
 ---
 
 # GPT Pro Think
 
-Run a prompt on ChatGPT Pro (or Pro Extended) through the user's real browser and bring the response back. The default entry point is `search.js` in this directory. When the script can't proceed on its own, it stops at a well-defined point and tells you exactly what to do next.
+Run a prompt on ChatGPT Pro through the user's real browser and bring the response back. The default entry point is `search.js` in this directory. When the script can't proceed on its own, it stops at a well-defined point and tells you exactly what to do next.
 
 ## Agent contract
 
 When using this skill from an agent, run the CLI in a long-lived shell command and wait for the command to exit with the complete answer. Do not return a "still searching" or "try latest later" response to the user while ChatGPT is still working.
 
-- Use `--until-complete` (aliases: `--wait-forever`, `--hang`) for normal agent calls, especially Pro Extended and Deep research.
+- Use `--until-complete` (aliases: `--wait-forever`, `--hang`) for normal agent calls, especially Pro and Deep research.
 - During `wait`, the CLI refreshes the same ChatGPT tab every 5 minutes by default (`--refresh 300`) to recover from a frozen page. This is a same-tab refresh, not a new page and not a re-send.
 - As soon as wait/extract completes, the CLI writes the answer or image manifest to stdout before tab cleanup, so the watching agent should consume that output immediately.
-- Patience budget is mandatory: allow at least **30 minutes** for a normal GPT Pro Think / Pro Extended response and at least **50 minutes** for ChatGPT Deep research before suspecting the run is stuck.
+- Patience budget is mandatory: allow at least **30 minutes** for a normal GPT Pro Think response and at least **50 minutes** for ChatGPT Deep research before suspecting the run is stuck.
 - Ten minutes with no stdout is normal. Do **not** assume the run is broken, open a new ChatGPT page, start a fresh browser research, or re-send the prompt just because nothing has printed for 10 minutes.
 - For ChatGPT Deep research, prefer `research "..."`; it implies `--deep-research --until-complete` and waits for the exported report.
 - Before delegating research to another agent, run `doctor` once to verify WebBridge, ChatGPT login, and Deep research tool availability.
@@ -33,8 +33,8 @@ When using this skill from an agent, run the CLI in a long-lived shell command a
 # All-in-one: send a prompt, wait, save the response
 node ~/.claude/skills/gpt-pro-think/search.js --until-complete "Your prompt"
 
-# Force Extended Pro (Pro model + Extended reasoning)
-node ~/.claude/skills/gpt-pro-think/search.js --model extended --until-complete "Your prompt"
+# Force Pro (the current deep-reasoning tier)
+node ~/.claude/skills/gpt-pro-think/search.js --model pro --until-complete "Your prompt"
 
 # Use ChatGPT's Deep research tool for searched, cited research
 node ~/.claude/skills/gpt-pro-think/search.js research "Research current competitors and cite sources."
@@ -55,7 +55,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --resume --until-complete
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
 
 # Generate image(s) in ChatGPT and save them into the current project
-# Image mode defaults to strict Pro Extended; add --allow-image-model-fallback only when Instant fallback is acceptable.
+# Image mode defaults to strict Pro; add --allow-image-model-fallback only when Instant fallback is acceptable.
 node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a square watercolor icon of a tiny robot reading." --image-dir ./assets/generated
 
 # Upload local file(s) into ChatGPT before sending a prompt
@@ -77,7 +77,7 @@ node ~/.claude/skills/gpt-pro-think/search.js -s my-thread --continue --until-co
 # Health check / dry-run / all options
 node ~/.claude/skills/gpt-pro-think/search.js --status
 node ~/.claude/skills/gpt-pro-think/search.js doctor --json
-node ~/.claude/skills/gpt-pro-think/search.js --dry-run --model extended
+node ~/.claude/skills/gpt-pro-think/search.js --dry-run --model pro
 node ~/.claude/skills/gpt-pro-think/search.js --dry-run --deep-research
 node ~/.claude/skills/gpt-pro-think/search.js --help
 ```
@@ -110,7 +110,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 
 ### Waiting and completion criteria
 
-Default `wait` is tuned for Pro Extended: `--wait 1200` (20 min), `--interval 15`, `--stable 60`, `--min-chars 240`. Agent-driven runs should use `--until-complete` and keep a patience budget of at least **30 minutes** for GPT Pro Think / Pro Extended and at least **50 minutes** for Deep research. When `--deep-research` / `--deep-search` is used and no explicit `--wait` is passed, the default wait becomes `3600` seconds (60 min). A response counts as complete only when:
+Default `wait` is tuned for Pro: `--wait 1200` (20 min), `--interval 15`, `--stable 60`, `--min-chars 240`. Agent-driven runs should use `--until-complete` and keep a patience budget of at least **30 minutes** for GPT Pro Think / Pro and at least **50 minutes** for Deep research. When `--deep-research` / `--deep-search` is used and no explicit `--wait` is passed, the default wait becomes `3600` seconds (60 min). A response counts as complete only when:
 
 - A new assistant message exists after the current turn was sent
 - The visible assistant text is not a short thinking/placeholder string
@@ -154,9 +154,9 @@ If upload fails with `upload_not_allowed`, the browser/WebBridge extension block
 
 ### Image generation
 
-Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to strict Pro Extended (`--model extended`). If Pro Extended cannot be selected, the command fails instead of silently using Instant; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. You can still pass `--model think` / `--model thinking` or `--model instant` explicitly for a single fallback-style image run.
+Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to strict Pro (`--model pro`). If Pro cannot be selected, the command fails instead of silently using Instant; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. The old `--model extended` spelling remains an alias for `pro`. You can still pass `--model think` / `--model thinking` or `--model instant` explicitly for a single fallback-style image run.
 
-Pro Extended can return about 10 separate generated images from one prompt. For `--image-count N`, the script treats `N` as the number of images to wait for and save from the same ChatGPT response (cap: 10). Always include the same count in the prompt text, for example "Create exactly 6 separate square images...". If `--allow-image-model-fallback` is used and Pro Extended is unavailable, the script falls back to Instant and limits the run to 1 image.
+Pro can return about 10 separate generated images from one prompt. For `--image-count N`, the script treats `N` as the number of images to wait for and save from the same ChatGPT response (cap: 10). Always include the same count in the prompt text, for example "Create exactly 6 separate square images...". If `--allow-image-model-fallback` is used and Pro is unavailable, the script falls back to Instant and limits the run to 1 image.
 
 Generated files are written to `--image-dir` (default `./gpt-pro-images`) using `--image-prefix` or `gpt-image-<createdAt>`. For multi-image runs, saved files use numbered suffixes and the manifest records file paths, dimensions, byte sizes, source session, requested image count, required image count, and any failed downloads.
 
@@ -164,8 +164,8 @@ For transparent illustrations, do not ask the web UI to make transparency direct
 
 ```bash
 node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
-node ~/.claude/skills/gpt-pro-think/search.js image --model extended --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
-node ~/.claude/skills/gpt-pro-think/search.js --image --model extended --until-complete "Create exactly four sticker-style UI mascots as separate images." --image-count 4 --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js image --model pro --until-complete "Create a detailed isometric app icon." --image-dir ./assets/generated
+node ~/.claude/skills/gpt-pro-think/search.js --image --model pro --until-complete "Create exactly four sticker-style UI mascots as separate images." --image-count 4 --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/search.js -s design-thread latest --image --until-complete --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/search.js -s design-thread extract-images --resume --image-dir ./assets/generated
 node ~/.claude/skills/gpt-pro-think/scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./assets/generated/icon-transparent.png --bg 0,255,0 --threshold 42 --padding 24
@@ -191,7 +191,7 @@ Examples:
 ```bash
 # Open a tab and verify Extended Pro, then close it when no later step needs it
 node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread open
-node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread ensure-model extended
+node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread ensure-model pro
 node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread ensure-tool deep-research
 node ~/.claude/skills/gpt-pro-think/search.js -s prep-thread cleanup
 

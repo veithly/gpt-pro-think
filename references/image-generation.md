@@ -4,24 +4,24 @@ Use this reference when generating images through ChatGPT's web UI with `search.
 
 ## Model choice
 
-ChatGPT web image generation should be sent through Pro Extended first. The script defaults image runs to strict `--model extended`; if Pro Extended cannot be selected, it fails instead of silently using Instant. Use `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable.
+ChatGPT web image generation should be sent through Pro first. The script defaults image runs to strict `--model pro`; if Pro cannot be selected, it fails instead of silently using Instant. Use `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable.
 
 ```bash
-node search.js image --model extended --until-complete "Create one square app icon..." --image-dir ./assets/generated
-node search.js image --model extended --until-complete --image-count 4 "Create exactly four distinct app icon concepts as separate images..." --image-dir ./assets/generated
+node search.js image --model pro --until-complete "Create one square app icon..." --image-dir ./assets/generated
+node search.js image --model pro --until-complete --image-count 4 "Create exactly four distinct app icon concepts as separate images..." --image-dir ./assets/generated
 ```
 
-`image` defaults to `--model extended`. `--model think` is still normalized to `thinking`, but explicit `thinking` / `instant` image runs are treated as fallback-style runs and are limited to one image.
+`image` defaults to `--model pro`. `--model extended` remains a compatibility alias for `pro`. `--model think` is still normalized to `thinking`, but explicit `thinking` / `instant` image runs are treated as fallback-style runs and are limited to one image.
 
 ## Multiple images
 
-Pro Extended can produce multiple separate generated images in one response. To generate multiple images, use `--image-count N` and write the same count into the prompt; the script first verifies Pro Extended, sends one prompt, then waits for and saves up to 10 images from that response.
+Pro can produce multiple separate generated images in one response. To generate multiple images, use `--image-count N` and write the same count into the prompt; the script first verifies Pro, sends one prompt, then waits for and saves up to 10 images from that response.
 
 ```bash
 node search.js image --until-complete --image-count 5 "Create exactly five distinct square app icon concepts as separate images..." --image-dir ./assets/generated
 ```
 
-With Pro Extended available, the total image cap is 10 per prompt. If `--allow-image-model-fallback` is used and Pro Extended is unavailable, the script falls back to Instant and limits the run to 1 image. `--image-concurrency` is a legacy no-op for the current Extended flow.
+With Pro available, the total image cap is 10 per prompt. If `--allow-image-model-fallback` is used and Pro is unavailable, the script falls back to Instant and limits the run to 1 image. `--image-concurrency` is a legacy no-op for the current Pro flow.
 
 ## Saving
 

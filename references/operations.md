@@ -78,7 +78,7 @@ pitch/gpt-pro/
 | Open 3 tabs + verify Extended | 2-3 min |
 | Select Deep research / Web search | 30s-1 min |
 | Send prompts | 1-2 min |
-| Wait for GPT Pro Think / Pro Extended | 30+ min patience budget |
+| Wait for GPT Pro Think / Pro | 30+ min patience budget |
 | Wait for Deep research | 50+ min patience budget |
 | Extract + save | 2-3 min |
 | Synthesize + final decision (if ≥3 prompts) | 15-20 min |

@@ -109,7 +109,7 @@ After you fix the issue, re-run with `--resume --until-complete` and the script 
 ## 9. `wait` — `timeout`
 
 **Stage:** wait (exit code `3`, not `4`)
-**Cause:** response didn't complete within `--wait` seconds. Agent runs must allow at least 30 minutes for GPT Pro Think / Pro Extended and at least 50 minutes for Deep research before treating silence as suspicious. Ten minutes without stdout is normal and is not a reason to open a new ChatGPT page, re-send the prompt, or start a fresh browser research. Short "thinking" / "searching" text is not treated as a complete answer.
+**Cause:** response didn't complete within `--wait` seconds. Agent runs must allow at least 30 minutes for GPT Pro Think / Pro and at least 50 minutes for Deep research before treating silence as suspicious. Ten minutes without stdout is normal and is not a reason to open a new ChatGPT page, re-send the prompt, or start a fresh browser research. Short "thinking" / "searching" text is not treated as a complete answer.
 
 **Fix:**
 1. Re-run with `--resume --until-complete`. Timeout does not mark `wait` done, so resume will keep polling.
@@ -176,7 +176,7 @@ After you fix the issue, re-run with `--resume --until-complete` and the script 
 | `upload_not_allowed` | upload | enable Kimi WebBridge file URL access → `search.js --resume --until-complete` |
 | `send_button_not_ready` | send | wait longer or pass `--upload-wait 120` → `search.js --resume --until-complete` |
 | fill / click input error | send | `search.js send --resume` |
-| `login_required` (mid-gen) | wait | user logs in → `search.js --model extended --until-complete "prompt"` (start over) |
+| `login_required` (mid-gen) | wait | user logs in → `search.js --model pro --until-complete "prompt"` (start over) |
 | `rate_limited` | wait | wait 60s → `search.js wait --resume --until-complete` |
 | `wait_timeout` | wait | `search.js -s <session> latest --until-complete` |
 | `no assistant message found` | extract | `search.js extract --resume` |

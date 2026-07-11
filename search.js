@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// search.js - Drive ChatGPT Pro (or Pro Extended) via kimi-webbridge.
+// search.js - Drive ChatGPT Pro via kimi-webbridge.
 //
 // Default entry: `search.js "Your prompt"` runs the full pipeline.
 // Sub-commands: open | login-check | ensure-model | ensure-tool | upload
@@ -44,7 +44,7 @@ const DEFAULT_IMAGE_CONCURRENCY = 3;
 const DEFAULT_IMAGE_EXTENDED_MAX_COUNT = 10;
 const DEFAULT_IMAGE_FALLBACK_COUNT = 1;
 const DEFAULT_MAX_IMAGES = 10;
-const DEFAULT_IMAGE_MODEL = 'extended';
+const DEFAULT_IMAGE_MODEL = 'pro';
 const DEFAULT_IMAGE_FALLBACK_MODEL = 'instant';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 60;
@@ -152,7 +152,9 @@ const log = (...a) => console.error('[search]', ...a);
 
 function normalizeModelName(model) {
   const value = String(model || 'auto').trim().toLowerCase().replace(/[_\s]+/g, '-');
-  if (value === 'extended-pro' || value === 'pro-extended') return 'extended';
+  // ChatGPT renamed the former Pro Extended choice to Pro. Keep old spellings
+  // as CLI aliases so existing state files and scripts continue to work.
+  if (value === 'extended' || value === 'extended-pro' || value === 'pro-extended') return 'pro';
   if (value === 'think') return 'thinking';
   return value || 'auto';
 }
@@ -161,7 +163,7 @@ function modelStateFromLabel(label) {
   const raw = String(label || '').replace(/\s+/g, ' ').trim();
   const value = raw.toLowerCase().replace(/[•·]/g, ' ').replace(/\s+/g, ' ').trim();
   if (!raw) return { model: 'unknown', effort: 'unknown', label: raw };
-  if (/^(pro(?:[- ]extended)?|pro extended)$/.test(value)) return { model: 'extended', effort: 'pro-extended', label: raw };
+  if (/^(pro(?:[- ]extended)?|pro extended)$/.test(value)) return { model: 'pro', effort: 'pro', label: raw };
   if (/^(instant|极速(?: 5\.5)?|fast(?: 5\.5)?)$/.test(value)) return { model: 'instant', effort: 'instant', label: raw };
   if (/^(medium|中|中等)$/.test(value)) return { model: 'thinking', effort: 'medium', label: raw };
   if (/^(high|高)$/.test(value)) return { model: 'thinking', effort: 'high', label: raw };
@@ -172,8 +174,7 @@ function modelStateFromLabel(label) {
 
 function modelMenuLabels(target) {
   const normalized = normalizeModelName(target);
-  if (normalized === 'extended') return ['Pro Extended', 'Pro'];
-  if (normalized === 'pro') return ['Pro', 'Pro Extended'];
+  if (normalized === 'pro') return ['Pro'];
   if (normalized === 'thinking') return ['Thinking', 'High', '高', 'Medium', '中', 'Extra High', '极高'];
   if (normalized === 'instant') return ['Instant', '极速 5.5'];
   return [];
@@ -183,10 +184,9 @@ function modelStateMatchesTarget(state, target) {
   const normalized = normalizeModelName(target);
   const current = normalizeModelName(state && state.model || 'unknown');
   if (normalized === 'auto') return current !== 'unknown';
-  if (normalized === 'extended') return current === 'extended';
   if (normalized === 'instant') return current === 'instant';
   if (normalized === 'thinking') return current === 'thinking';
-  if (normalized === 'pro') return current === 'pro' || current === 'thinking' || current === 'extended';
+  if (normalized === 'pro') return current === 'pro';
   return current === normalized;
 }
 
@@ -752,17 +752,19 @@ async function stageEnsureModel(state, opts = {}) {
     const prior = state.stages.ensureModel.data || {};
     const priorTo = normalizeModelName(prior.to || prior.state && prior.state.model || '');
     const priorTarget = normalizeModelName(prior.target || prior.requested || '');
-    if (target === 'auto' || priorTo === target || (!priorTo && priorTarget === target)) {
+    // Explicit model targets must be re-validated after a resume: ChatGPT can
+    // change the selected intelligence level outside this process.
+    if (target === 'auto') {
       return { skipped: true, data: prior };
     }
-    log(`ensure-model: state says done for ${priorTo || priorTarget || 'unknown'}, target is ${target}; re-checking`);
+    log(`ensure-model: re-checking explicit target=${target} (state was ${priorTo || priorTarget || 'unknown'})`);
     clearStage(state, 'ensureModel');
   }
   const result = await ensureModel(state.session, target);
   if (target !== 'auto' && !result.ok) {
     if (opts.imageMode && target === DEFAULT_IMAGE_MODEL && opts.imageModelFallback === true) {
       const reason = result.error || `current=${result.state && result.state.model || 'unknown'}`;
-      log(`Pro Extended unavailable for image generation (${reason}); falling back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and limiting this run to ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
+      log(`Pro unavailable for image generation (${reason}); falling back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and limiting this run to ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
       const fallbackResult = await ensureModel(state.session, DEFAULT_IMAGE_FALLBACK_MODEL);
       if (fallbackResult.ok) {
         const fallbackData = {
@@ -1963,8 +1965,7 @@ async function runDoctor(state, opts, daemonStatus) {
 // --- Model detection & switching --------------------------------------------
 
 async function detectModel(session) {
-  const popover = await probePopover(session);
-  const v = await evaluate(
+  const readModelDom = () => evaluate(
     session,
     `(() => {
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
@@ -1985,13 +1986,15 @@ async function detectModel(session) {
       });
     })()`
   );
-  const pills = (v && Array.isArray(v.pills) ? v.pills : []).map((item) => item.text);
-  let parsed = null;
-  if (popover && v && v.selected) {
-    parsed = modelStateFromLabel(v.selected.text);
-  }
-  if ((!parsed || parsed.model === 'unknown') && v && Array.isArray(v.pills) && v.pills[0]) {
-    parsed = modelStateFromLabel(v.pills[0].text);
+  let v = await readModelDom();
+  let pills = (v && Array.isArray(v.pills) ? v.pills : []).map((item) => item.text);
+  let parsed = pills[0] ? modelStateFromLabel(pills[0]) : null;
+  if (!parsed || parsed.model === 'unknown') {
+    const popover = await probePopover(session);
+    v = await readModelDom();
+    pills = (v && Array.isArray(v.pills) ? v.pills : []).map((item) => item.text);
+    if (popover && v && v.selected) parsed = modelStateFromLabel(v.selected.text);
+    if ((!parsed || parsed.model === 'unknown') && pills[0]) parsed = modelStateFromLabel(pills[0]);
   }
   return {
     model: parsed && parsed.model || 'unknown',
@@ -2053,9 +2056,11 @@ async function ensureModel(session, target) {
     `(() => { const pill = [...document.querySelectorAll('button.__composer-pill')][0]; if (!pill) return false; const r = pill.getBoundingClientRect(); for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) { pill.dispatchEvent(new PointerEvent(t, {bubbles:true, cancelable:true, clientX:r.x+5, clientY:r.y+5, button:0})); } return true; })()`
   );
   await sleep(800);
-  const picked = await evaluate(
-    session,
-    `(() => {
+  let picked = null;
+  for (let attempt = 0; attempt < 5 && !picked; attempt++) {
+    picked = await evaluate(
+      session,
+      `(() => {
       const labels = ${JSON.stringify(labels)};
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -2081,8 +2086,25 @@ async function ensureModel(session, target) {
         };
       }
       return null;
-    })()`
-  );
+      })()`
+    );
+    if (picked || attempt === 4) break;
+    await sleep(300);
+    await evaluate(
+      session,
+      `(() => {
+        const menu = [...document.querySelectorAll('[role=menu]')].find((el) => el.getAttribute('data-state') === 'open');
+        if (menu) return true;
+        const pill = [...document.querySelectorAll('button.__composer-pill')][0];
+        if (!pill) return false;
+        const r = pill.getBoundingClientRect();
+        for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+          pill.dispatchEvent(new PointerEvent(t, {bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0}));
+        }
+        return true;
+      })()`
+    );
+  }
   await sleep(700);
   await evaluate(session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); document.body.click(); })()`);
   await sleep(300);
@@ -3686,12 +3708,12 @@ async function prepareImageGenerationPlan(state, opts) {
       model: targetModel,
       requested,
       planned: imageCountFromOpts(opts),
-      extendedAvailable: targetModel === DEFAULT_IMAGE_MODEL,
+      proAvailable: targetModel === DEFAULT_IMAGE_MODEL,
       fallback: targetModel !== DEFAULT_IMAGE_MODEL,
     };
   }
 
-  log(`preflight: verifying Pro Extended before starting ${imageCountFromOpts(opts)} image sessions`);
+  log(`preflight: verifying Pro before starting ${imageCountFromOpts(opts)} image sessions`);
   const preflightOpts = { ...opts, imageMode: true, cleanupState: false };
   await stageOpen(state, preflightOpts);
   await stageLoginCheck(state, preflightOpts);
@@ -3700,12 +3722,12 @@ async function prepareImageGenerationPlan(state, opts) {
   if (ensureData.fallback) {
     opts.imageCount = DEFAULT_IMAGE_FALLBACK_COUNT;
     opts.maxImages = Math.min(Number.isFinite(opts.maxImages) ? opts.maxImages : DEFAULT_MAX_IMAGES, DEFAULT_IMAGE_FALLBACK_COUNT);
-    log(`preflight: Pro Extended unavailable; continuing in ${DEFAULT_IMAGE_FALLBACK_MODEL} with ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
+    log(`preflight: Pro unavailable; continuing in ${DEFAULT_IMAGE_FALLBACK_MODEL} with ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
     return {
       model: DEFAULT_IMAGE_FALLBACK_MODEL,
       requested,
       planned: opts.imageCount,
-      extendedAvailable: false,
+      proAvailable: false,
       fallback: true,
       reason: ensureData.fallback.reason || '',
     };
@@ -3715,7 +3737,7 @@ async function prepareImageGenerationPlan(state, opts) {
     model: DEFAULT_IMAGE_MODEL,
     requested,
     planned: imageCountFromOpts(opts),
-    extendedAvailable: true,
+    proAvailable: true,
     fallback: false,
   };
 }
@@ -3802,7 +3824,7 @@ Sub-commands:
   image [prompt...]    Generate image(s) in ChatGPT and save them locally
   open                 Open a ChatGPT tab (or reuse an existing one)
   login-check          Detect whether ChatGPT is logged in
-  ensure-model [tgt]   Verify / switch model. tgt: auto|pro|extended|thinking|think|instant
+  ensure-model [tgt]   Verify / switch model. tgt: auto|pro|thinking|think|instant
   ensure-tool [tgt]    Verify / switch ChatGPT tool. tgt: auto|none|deep-research|web-search|create-image
   upload               Upload --upload file(s) into the composer
   send [prompt...]     Fill the input and click send
@@ -3820,8 +3842,9 @@ Sub-commands:
 Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
-  -m, --model NAME     Target model: auto|pro|extended|extended-pro|thinking|think|instant
-                       (default: auto; image defaults to strict Pro Extended)
+  -m, --model NAME     Target model: auto|pro|thinking|think|instant
+                       (default: auto; image defaults to strict Pro)
+                       legacy aliases extended/extended-pro also map to pro
       --tool NAME      Target ChatGPT tool: auto|none|deep-research|deep-search|web-search|create-image
       --deep-research  Select ChatGPT's Deep research tool before sending
       --deep-search    Alias for --deep-research
@@ -3849,13 +3872,13 @@ Global flags (can appear before or after the subcommand):
                        Conversation URL to recover before extract-files
       --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
       --image-count N  Total images to wait for/save from one prompt. Pro
-                       Extended allows up to ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}; fallback/non-Extended
+                       allows up to ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}; fallback/non-Pro
                        models allow ${DEFAULT_IMAGE_FALLBACK_COUNT}. Include the same count in
                        the prompt text; default: ${DEFAULT_IMAGE_COUNT}
       --image-concurrency N
-                       Legacy no-op; Pro Extended multi-image runs stay in one prompt
+                       Legacy no-op; Pro multi-image runs stay in one prompt
       --allow-image-model-fallback
-                       If Pro Extended cannot be selected in image mode, fall
+                       If Pro cannot be selected in image mode, fall
                        back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and one image
       --max-images N   Max image candidates to extract/save (default: ${DEFAULT_MAX_IMAGES})
       --resume         Skip stages already marked done in state file
@@ -3893,15 +3916,15 @@ State file: <script dir>/state/<session>.json
 Examples:
   search.js research "Research current competitors and cite sources."
   search.js --until-complete "What is 2+2? Reply with just the number." --min-chars 0
-  search.js --model extended --until-complete "Reason about X in deep mode."
+  search.js --model pro --until-complete "Reason about X in deep mode."
   search.js --deep-research --until-complete "Research current competitors and cite sources."
   search.js --deep-search --until-complete "Do a deep market scan."
   search.js --web-search --until-complete "Find the latest release notes."
   search.js -f ./prompt.md -o ./answer.md --json
   search.js --status
-  search.js --dry-run --model extended
+  search.js --dry-run --model pro
   search.js open
-  search.js ensure-model extended
+  search.js ensure-model pro
   search.js ensure-tool deep-research
   search.js --upload ./brief.pdf --until-complete "Summarize this file."
   search.js --upload ./a.pdf --upload ./b.csv --until-complete "Compare these files."
@@ -3911,9 +3934,9 @@ Examples:
   search.js -s my-thread latest --until-complete # wait for and print latest complete reply
   search.js -s my-thread latest --wait 0 --stable 0 --json  # check current readiness only
   search.js image --until-complete "Create a square watercolor icon of a tiny robot reading."
-  search.js image --model extended --until-complete "Create a detailed isometric app icon."
+  search.js image --model pro --until-complete "Create a detailed isometric app icon."
   search.js image --until-complete --image-count 5 "Create exactly five distinct app icon concepts as separate images."
-  search.js --image --model extended --until-complete "Create a product hero image." --image-dir ./assets/generated
+  search.js --image --model pro --until-complete "Create a product hero image." --image-dir ./assets/generated
   search.js -s my-thread latest --image --until-complete --image-dir ./assets/generated
 
   # Multi-turn conversation (keeps context between prompts)
@@ -4176,6 +4199,7 @@ async function main() {
       tool: opts.tool,
     });
   }
+  if (state.model) state.model = normalizeModelName(state.model);
   if (!state.tool) state.tool = DEFAULT_TOOL;
   if (!Array.isArray(state.files)) state.files = [];
   if (opts.output) state.output = opts.output;

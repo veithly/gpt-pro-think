@@ -35,7 +35,7 @@ Schema (v1):
   "imagePrefix": "optional-file-prefix",
   "fileDir": "/abs/or/relative/path/to/chatgpt-files",
   "conversationUrl": "https://chatgpt.com/c/...",
-  "model": "auto | pro | extended | thinking | instant",
+  "model": "auto | pro | thinking | instant",
   "tool": "auto | none | deep-research | web-search | create-image",
   "images": [],
   "files": [],
@@ -60,7 +60,7 @@ Schema (v1):
   "stages": {
     "open":        {"done": true,  "at": ..., "data": {"tabId": 123, "url": "https://chatgpt.com/"}},
     "loginCheck":  {"done": true,  "at": ..., "data": {"state": "logged_in"}},
-    "ensureModel": {"done": true,  "at": ..., "data": {"from": "thinking", "to": "extended", "changed": true}},
+    "ensureModel": {"done": true,  "at": ..., "data": {"from": "instant", "to": "pro", "changed": true}},
     "ensureTool":  {"done": true,  "at": ..., "data": {"target": "deep-research", "selected": "deep-research", "changed": true}},
     "upload":      {"done": true,  "at": ..., "data": {"files": ["/abs/path/to/brief.pdf"], "selector": "input#upload-files[type=\"file\"]"}},
     "send":        {"done": true,  "at": ..., "data": {"chars": 1500, "assistantBefore": 2, "mode": "replace", "uploadSignature": "[...]"}},
@@ -84,11 +84,11 @@ In image mode, `wait.data.kind` is `image`. A single ChatGPT conversation waits 
 
 `extractFiles` scans the latest assistant message for ChatGPT file entities, clicks each file button to obtain its authorized download URL in the page context, downloads the bytes in Node, and saves them under `--file-dir` (default `./gpt-pro-files`). `extract-files --conversation-url <url>` opens a historical conversation without sending a new prompt. Pass `--all-files` to scan every loaded assistant message.
 
-For full `image` runs with `--image-count N > 1`, `--image-count` is the number of images to wait for and save from one prompt. The parent process verifies Pro Extended before sending. If Pro Extended is available, the total image cap is 10 per prompt; if it is unavailable, the pipeline fails by default rather than silently using Instant. With `--allow-image-model-fallback`, it falls back to `instant` and caps the run at 1 image. `--image-concurrency` is retained as a legacy flag but is not used by the current Extended single-prompt flow.
+For full `image` runs with `--image-count N > 1`, `--image-count` is the number of images to wait for and save from one prompt. The parent process verifies Pro before sending. If Pro is available, the total image cap is 10 per prompt; if it is unavailable, the pipeline fails by default rather than silently using Instant. With `--allow-image-model-fallback`, it falls back to `instant` and caps the run at 1 image. `--image-concurrency` is retained as a legacy flag but is not used by the current single-prompt flow.
 
-Full image runs default to `model: "extended"` unless `--model` is passed. If Pro Extended cannot be selected, the image pipeline fails unless `--allow-image-model-fallback` is passed. `--model think` is normalized to `thinking`; explicit `thinking` and `instant` targets are valid for single-image fallback-style generation.
+Full image runs default to `model: "pro"` unless `--model` is passed. If Pro cannot be selected, the image pipeline fails unless `--allow-image-model-fallback` is passed. `--model extended` remains an alias for `pro`; `--model think` is normalized to `thinking`; explicit `thinking` and `instant` targets are valid for single-image fallback-style generation.
 
-Deep research runs default to `--wait 3600` unless `--wait` is passed, because ChatGPT's Deep research tool can run much longer than Pro Extended text replies.
+Deep research runs default to `--wait 3600` unless `--wait` is passed, because ChatGPT's Deep research tool can run much longer than Pro text replies.
 
 Passing `--until-complete` (aliases: `--wait-forever`, `--hang`) disables the wait timeout for text, image, and Deep research waits. During an active wait, the script rewrites `active` in the state file with progress fields such as `elapsed`, `need`, status-specific counts, `last`, and `lastRefresh`. It refreshes the same ChatGPT tab every `--refresh` seconds (default `300`; `0` disables) so a frozen page can recover without opening a new tab or re-sending the prompt. On completion, `active` is removed and the `wait` stage is marked done.
 
