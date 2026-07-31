@@ -16,7 +16,7 @@ Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) verified July 2026
 | Profile badge | `button[aria-label*="open profile menu"]` | button | `"{username} Pro"` |
 | Assistant message | `[data-message-author-role="assistant"]` | — | last child = most recent reply |
 | Generated file entity | `button.behavior-btn[aria-label]` inside the latest assistant message | button | filename such as `HackathonHunter_G0R_Research_Pack.md`; click triggers `/backend-api/files/...` download flow |
-| Generated images | `img` inside the latest assistant message | img | filtered to visible images at least 128x128 and 65,536 px area |
+| Generated images | `img` inside the latest assistant message and sibling `[class*="group/imagegen-image"]` roots after the latest user turn | img | ordinary images require at least 128x128 and 65,536 px area; imagegen thumbnails are accepted above the 32 px visibility floor and deduplicated by source URL |
 | File attachment button | `[data-testid="composer-plus-btn"]` | button | `添加文件等` / `Add files and more` |
 | Composer tools menu | `[role="menu"]` or visible popover opened from `[data-testid="composer-plus-btn"]` | menu / popover | contains `创建图片`, `深度研究`, `网页搜索` (English builds use `Create image`, `Deep research`, `Web search`) |
 | Composer tool option | `[role="menuitemradio"], [role="menuitem"], div.group.__menu-item` inside tools menu | menuitemradio / menuitem / div | `创建图片` / `深度研究` / `网页搜索`; legacy menus expose `aria-checked="true"` |
@@ -52,12 +52,16 @@ Use the same pointer-event sequence as the model popover for both the plus butto
 
 ## Generated image extraction
 
-Image mode only scans the latest `[data-message-author-role="assistant"]` node. It collects `img` elements and filters out small or hidden assets so avatars, icons, emoji, and logos are not saved accidentally. The current threshold is:
+Image mode scans the latest `[data-message-author-role="assistant"]` node plus every sibling `[class*="group/imagegen-image"]` root after the latest user turn. ChatGPT can expose one generated result as the large active image and the remaining results only as 48 px thumbnail roots, so all roots must be included and deduplicated by source URL.
+
+It filters out small or hidden ordinary assets so avatars, icons, emoji, and logos are not saved accidentally. The current threshold is:
 
 - visible element (`display` and `visibility` are active, rendered box > 32 px)
 - natural/rendered size at least 128x128
 - area at least 65,536 px
 - descriptor does not look like avatar/profile/user/icon/emoji/logo unless the largest edge is at least 512 px
+
+Images inside an `imagegen` root are exempt from the 128x128 and area thresholds, but still need a visible rendered box above 32 px. This preserves the 48 px alternate-result thumbnails while keeping unrelated small UI assets out.
 
 For saving, the script first tries `fetch(src, { credentials: 'include' })` in the page context so authenticated ChatGPT image URLs and `blob:` URLs can be read. If that fails and the source is `http(s)`, Node tries a public download fallback.
 

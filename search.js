@@ -94,6 +94,9 @@ const IMAGE_COLLECTOR_JS = `
       const height = img.naturalHeight || Math.round(rect.height) || 0;
       const descriptor = [alt, className, src].join(' ');
       const chatgptGenerated = /Generated image|imagegen|backend-api\\/estuary\\/content/i.test(descriptor);
+      const inImagegen =
+        (typeof img.closest === 'function' && !!img.closest('[class*="group/imagegen-image"]')) ||
+        (typeof root.matches === 'function' && root.matches('[class*="group/imagegen-image"]'));
       const ready = !!img.complete || (chatgptGenerated && /^https?:\\/\\/chatgpt\\.com\\/backend-api\\/estuary\\/content/i.test(src));
       return {
         index,
@@ -106,18 +109,19 @@ const IMAGE_COLLECTOR_JS = `
         rectHeight: Math.round(rect.height) || 0,
         complete: !!img.complete,
         ready,
+        inImagegen,
         visible: rect.width > 32 && rect.height > 32 && style.display !== 'none' && style.visibility !== 'hidden'
       };
     }).filter((img) => {
       if (!img.src || seen.has(img.src)) return false;
-      seen.add(img.src);
       const w = img.width || img.rectWidth || 0;
       const h = img.height || img.rectHeight || 0;
       if (!img.visible) return false;
-      if (w < 128 || h < 128) return false;
-      if (w * h < 65536) return false;
+      if (!img.inImagegen && (w < 128 || h < 128)) return false;
+      if (!img.inImagegen && w * h < 65536) return false;
       const filterDescriptor = [img.alt, img.className, img.src].join(' ');
       if (/avatar|profile|user|icon|emoji|logo/i.test(filterDescriptor) && Math.max(w, h) < 512) return false;
+      seen.add(img.src);
       return true;
     });
   };
@@ -144,6 +148,27 @@ const IMAGE_COLLECTOR_JS = `
       }
     }
     return entries;
+  };
+  const collectImageScopesForLatestTurn = (assistants, users, imageRoots, minAssistantIndex = null) => {
+    const assistantList = Array.isArray(assistants) ? assistants : [];
+    const userList = Array.isArray(users) ? users : [];
+    const rootList = Array.isArray(imageRoots) ? imageRoots : [];
+    const scopes = [];
+    if (minAssistantIndex !== null && assistantList.length) {
+      scopes.push(...assistantList.slice(Math.min(minAssistantIndex, assistantList.length)));
+    } else if (assistantList.length) {
+      scopes.push(assistantList[assistantList.length - 1]);
+    }
+
+    // ChatGPT may render each generated image as a sibling imagegen root rather
+    // than nesting every image inside one assistant message. Keep every root
+    // after the latest user turn so one extraction saves the full response.
+    const latestUser = userList[userList.length - 1] || null;
+    const latestRoots = latestUser && typeof latestUser.compareDocumentPosition === 'function'
+      ? rootList.filter((root) => !!(latestUser.compareDocumentPosition(root) & 4))
+      : rootList;
+    scopes.push(...latestRoots);
+    return [...new Set(scopes.filter(Boolean))];
   };
 `;
 
@@ -656,11 +681,7 @@ async function getConversationProgress(session, imageMinAssistantIndex = null) {
       const last = assistants[assistants.length - 1] || imageRoots[imageRoots.length - 1] || null;
       const lastText = textOf(last);
       const imageMinIndex = ${imageMinIndexExpr};
-      let imageScopes = last ? [last] : [];
-      if (imageMinIndex !== null) {
-        if (assistants.length) imageScopes = assistants.slice(Math.min(imageMinIndex, assistants.length));
-        else imageScopes = imageRoots.slice(Math.min(imageMinIndex, imageRoots.length));
-      }
+      const imageScopes = collectImageScopesForLatestTurn(assistants, users, imageRoots, imageMinIndex);
       const lastImages = collectImagesFromRoots(imageScopes).map(({ node, ...image }) => image);
       const imageSignature = lastImages.map((img) => {
         const src = String(img.src || '');
@@ -3234,14 +3255,7 @@ async function extractLastAssistantImages(session, criteria = {}, maxImages = DE
     if (minIndex !== null && effectiveCount <= minIndex) {
       return JSON.stringify({ error: 'no_new_assistant', assistantCount: effectiveCount, minIndex, images: [] });
     }
-    let scopes = [];
-    if (minIndex !== null) {
-      if (msgs.length) scopes = msgs.slice(Math.min(minIndex, msgs.length));
-      else scopes = imageRoots.slice(Math.min(minIndex, imageRoots.length));
-    } else {
-      const last = msgs[msgs.length - 1] || imageRoots[imageRoots.length - 1];
-      if (last) scopes = [last];
-    }
+    const scopes = collectImageScopesForLatestTurn(msgs, users, imageRoots, minIndex);
     if (!scopes.length) {
       return JSON.stringify({ error: 'no_new_assistant', assistantCount: effectiveCount, minIndex, images: [] });
     }
