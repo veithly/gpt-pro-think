@@ -1,7 +1,7 @@
 ---
 name: gpt-pro-think
 description: |
-  Send deep-reasoning prompts to ChatGPT Pro via kimi-webbridge and collect text responses, generated image files, or files created in the conversation. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro", "deep research with GPT".
+  Send deep-reasoning prompts to ChatGPT through OpenCLI's real browser session and collect text responses, generated image files, or files created in the conversation. Kimi WebBridge remains available as an explicit compatibility backend. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro", "deep research with GPT".
 ---
 
 # GPT Pro Think
@@ -18,8 +18,8 @@ When using this skill from an agent, run the CLI in a long-lived shell command a
 - Patience budget is mandatory: allow at least **30 minutes** for a normal GPT Pro Think response and at least **50 minutes** for ChatGPT Deep research before suspecting the run is stuck.
 - Ten minutes with no stdout is normal. Do **not** assume the run is broken, open a new ChatGPT page, start a fresh browser research, or re-send the prompt just because nothing has printed for 10 minutes.
 - For ChatGPT Deep research, prefer `research "..."`; it implies `--deep-research --until-complete` and waits for the exported report.
-- Before delegating research to another agent, run `doctor` once to verify WebBridge, ChatGPT login, and Deep research tool availability.
-- The CLI auto-starts the Kimi WebBridge daemon when `status` reports `running:false`, including removing a stale `~/.kimi-webbridge/daemon.pid` left by a dead daemon process. If startup still fails, follow the printed hint.
+- Before delegating research to another agent, run `doctor` once to verify OpenCLI, ChatGPT login, and Deep research tool availability.
+- The CLI verifies the OpenCLI Browser Bridge before opening ChatGPT. Do not switch to Kimi WebBridge unless `--browser-backend webbridge` was explicitly requested.
 - If the shell tool yields while the process is still running, keep the process/session alive and poll it again. The CLI writes wait progress to the session state file.
 - Use `node ... search.js -s <session> status` from another shell to inspect `active.stage`, `active.status`, `active.elapsed`, and `active.need` while a wait is in progress.
 - If a non-hanging run exits `3`, immediately re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; do not ask the user to manually re-run.
@@ -30,11 +30,14 @@ When using this skill from an agent, run the CLI in a long-lived shell command a
 ## Quick start
 
 ```bash
-# All-in-one: send a prompt, wait, save the response
+# All-in-one: send a prompt, wait, save the response (defaults to 极高)
 node ~/.claude/skills/gpt-pro-think/search.js --until-complete "Your prompt"
 
-# Force Pro (the current deep-reasoning tier)
+# Use the separate Pro tier; it is never silently downgraded
 node ~/.claude/skills/gpt-pro-think/search.js --model pro --until-complete "Your prompt"
+
+# Select a different thinking slider position explicitly
+node ~/.claude/skills/gpt-pro-think/search.js --model high --until-complete "Your prompt"
 
 # Use ChatGPT's Deep research tool for searched, cited research
 node ~/.claude/skills/gpt-pro-think/search.js research "Research current competitors and cite sources."
@@ -90,7 +93,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 |---|---|---|---|
 | `open` | Open a ChatGPT tab in a session; reuse if one already exists | ✓ | skipped if done |
 | `login-check` | Detect whether ChatGPT is logged in | ✓ | skipped if done |
-| `ensure-model` | Verify / switch the model pill (default target: `auto` = whatever's selected) | ✓ | skipped if done |
+| `ensure-model` | Verify / switch the thinking slider (default: `极高`; `pro` is independent) | ✓ | skipped if done |
 | `ensure-tool` | Verify / switch the ChatGPT composer tool (`deep-research`, `web-search`, `create-image`, or `none`) | ✓ | skipped if same tool is active |
 | `upload` | Attach `--upload` file(s) to the composer before sending | ✓ | skipped if same files + same prompt |
 | `send` | Fill the input with the prompt and click send | ✓ | re-sent if prompt changed |
@@ -136,11 +139,11 @@ node ~/.claude/skills/gpt-pro-think/search.js ensure-tool deep-research
 node ~/.claude/skills/gpt-pro-think/search.js ensure-tool none
 ```
 
-The tool stage runs after `ensure-model` and before `upload` / `send`. It opens ChatGPT's **Add files and more** menu, selects `Deep research` / `Web search`, and records `ensureTool` in the state file. `--tool none` or `ensure-tool none` clears the active tool chip if one is selected. For a normal run without an explicit tool flag, the script leaves ChatGPT's current tool state alone.
+The tool stage runs after `ensure-model` and before `upload` / `send`. It opens ChatGPT's **Add files and more** menu, selects `Deep research` / `Web search`, and records `ensureTool` in the state file. `--tool none` or `ensure-tool none` clears the active tool chip if one is selected. Normal runs also use `none`, so an old Deep research or Web search selection cannot turn a chat request into a work-mode request. Use `--tool auto` only to deliberately preserve the current selection.
 
 ### File upload
 
-Use `--upload <path>` one or more times to attach local files before sending the prompt. The stage runs after `ensure-tool` and before `send`, targets ChatGPT's hidden `input#upload-files[type="file"]`, and waits up to `--upload-wait` seconds for attachment chips.
+Use `--upload <path>` one or more times to attach local files before sending the prompt. The stage runs after `ensure-tool` and before `send`, discovers ChatGPT's general file input, and waits up to `--upload-wait` seconds for every attachment chip. A missing confirmation fails the stage and prevents send.
 
 ```bash
 node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --until-complete "Summarize this file."
@@ -150,7 +153,7 @@ node ~/.claude/skills/gpt-pro-think/search.js -s file-thread --resume --until-co
 
 For a failed upload run, re-run with `--resume`; the state file retains the normalized absolute upload paths. For a new non-resume prompt, uploads are not carried over unless `--upload` is passed again.
 
-If upload fails with `upload_not_allowed`, the browser/WebBridge extension blocked local file injection. Open the Kimi WebBridge extension details page in Chrome/Edge and enable **Allow access to file URLs** / **允许访问文件网址**, then re-run with `--resume`. Do not treat daemon `v1.9.16` + extension `1.9.13` as a mismatch by itself; `1.9.13` is the current browser extension build seen in Edge.
+If upload fails with `upload_not_allowed` or `upload_unverified`, check `opencli doctor`, keep the ChatGPT tab open, then re-run with `--resume`. The OpenCLI Browser Bridge must be connected and able to attach the supplied local paths.
 
 ### Image generation
 

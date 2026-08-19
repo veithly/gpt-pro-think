@@ -35,7 +35,9 @@ Schema (v1):
   "imagePrefix": "optional-file-prefix",
   "fileDir": "/abs/or/relative/path/to/chatgpt-files",
   "conversationUrl": "https://chatgpt.com/c/...",
-  "model": "auto | pro | thinking | instant",
+  "model": "pro | thinking | instant",
+  "effort": "medium | high | extra-high",
+  "browserBackend": "opencli | webbridge",
   "tool": "auto | none | deep-research | web-search | create-image",
   "images": [],
   "files": [],
@@ -78,7 +80,7 @@ The `prompt` field is what was *actually sent* (or attempted). On `--resume`, th
 
 `uploads` records normalized absolute paths for `--upload` files. The `upload` stage runs after `ensureTool` and before `send`; if upload files change, downstream `send` / `wait` / `extract` state is cleared. Non-resume new prompts do not inherit old uploads unless `--upload` is passed again.
 
-`tool` records an explicit ChatGPT composer tool target. `auto` means "do not change whatever ChatGPT currently has selected." `--deep-research` and `--deep-search` normalize to `deep-research`; `--web-search` normalizes to `web-search`; `--tool none` clears an active tool chip. If an explicit tool target changes, `ensureTool`, `send`, `wait`, `extract`, and `extractImages` are cleared so the next run cannot reuse a response produced under the wrong tool.
+`tool` records an explicit ChatGPT composer tool target. Normal runs default to `none`, which clears an active work-mode tool before sending. `auto` means "do not change whatever ChatGPT currently has selected" and is only used when passed explicitly. `--deep-research` and `--deep-search` normalize to `deep-research`; `--web-search` normalizes to `web-search`. If an explicit tool target changes, `ensureTool`, `send`, `wait`, `extract`, and `extractImages` are cleared so the next run cannot reuse a response produced under the wrong tool.
 
 In image mode, `wait.data.kind` is `image`. A single ChatGPT conversation waits for the requested number of generated images in the current turn, waits until generation controls disappear, and requires the combined image signature to stay unchanged for `--stable` seconds. `extractImages` saves image bytes into `--image-dir` and writes a manifest JSON; `state.output` points to that manifest.
 
@@ -122,7 +124,7 @@ Stages that take a prompt (`send`, `run`, `image`) also accept `-f` and `-` (std
 - **Auto-retry on transient errors**: each `cmd()` call retries up to 3 times with exponential backoff (200ms, 600ms, 1800ms) for network / daemon / `extension_error: No current window` cases.
 - **Auto-reuse tabs**: `open` calls `find_tab` first; if a ChatGPT tab already exists in the session, it reuses it instead of opening a new one.
 - **Auto-cleanup**: one-shot `run`, `research` / `deep-search`, `image`, `latest`, `doctor`, and `--dry-run` commands close their ChatGPT tab on success. The state file is kept (default) so the Agent can inspect what happened or recover the saved conversation URL. Pass `--cleanup-state` to delete it. To keep the browser tab open, use `--keep-session` or `--continue` (state still records the run).
-- **Idempotent model switch**: `ensure-model` probes the popover, and only clicks the target option if the current selection is different.
+- **Idempotent model switch**: `ensure-model` uses OpenCLI's ChatGPT model adapter by default, which drives the real intelligence slider and verifies the final selection. `pro` is a separate target and failures are fail-closed; use `--browser-backend webbridge` for the legacy path.
 - **Idempotent tool switch**: `ensure-tool` checks the active tool chip and the `Add files and more` menu before clicking `Deep research`, `Web search`, `Create image`, or clearing the current selection.
 
 ## Adding a new sub-command

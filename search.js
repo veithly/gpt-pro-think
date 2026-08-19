@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// search.js - Drive ChatGPT Pro via kimi-webbridge.
+// search.js - Drive ChatGPT Pro through OpenCLI.
 //
 // Default entry: `search.js "Your prompt"` runs the full pipeline.
 // Sub-commands: open | login-check | ensure-model | ensure-tool | upload
@@ -48,7 +48,22 @@ const DEFAULT_IMAGE_MODEL = 'pro';
 const DEFAULT_IMAGE_FALLBACK_MODEL = 'instant';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 60;
-const DEFAULT_TOOL = 'auto';
+// A normal run must start in the ChatGPT chat composer. `auto` remains an
+// explicit opt-in to preserving a tool the user selected themselves.
+const DEFAULT_TOOL = 'none';
+const DEFAULT_MODEL = 'thinking';
+const DEFAULT_EFFORT = 'extra-high';
+const DEFAULT_BROWSER_BACKEND = 'opencli';
+const OPENCLI_BIN_CANDIDATES = [
+  process.env.OPENCLI_BIN || '',
+  '/opt/homebrew/bin/opencli',
+  '/usr/local/bin/opencli',
+];
+const OPENCLI_NODE_ENTRY = '/opt/homebrew/lib/node_modules/@jackwener/opencli/dist/src/main.js';
+// Image extraction serializes browser-fetched data as base64 so authenticated
+// ChatGPT image URLs can be saved locally. The Node default is only 1 MiB.
+const OPENCLI_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+let ACTIVE_BROWSER_BACKEND = DEFAULT_BROWSER_BACKEND;
 const DEEP_RESEARCH_APP_URI = 'connectors://connector_openai_deep_research';
 const DEEP_RESEARCH_IFRAME_TITLE = 'internal://deep-research';
 const DEEP_RESEARCH_TERMINAL_STATUSES = new Set([
@@ -181,7 +196,34 @@ function normalizeModelName(model) {
   // as CLI aliases so existing state files and scripts continue to work.
   if (value === 'extended' || value === 'extended-pro' || value === 'pro-extended') return 'pro';
   if (value === 'think') return 'thinking';
+  if (value === 'extreme' || value === 'extra-high' || value === 'extra-high-thinking' || value === '极高') return 'thinking';
   return value || 'auto';
+}
+
+function normalizeEffort(effort) {
+  const value = String(effort || DEFAULT_EFFORT).trim().toLowerCase().replace(/[_\s]+/g, '-');
+  if (value === 'extreme' || value === 'extra-high' || value === '极高') return 'extra-high';
+  if (value === 'high' || value === '高') return 'high';
+  if (value === 'medium' || value === '中' || value === '中等') return 'medium';
+  if (value === 'low' || value === '低') return 'low';
+  return value || DEFAULT_EFFORT;
+}
+
+function normalizeBrowserBackend(backend) {
+  const value = String(backend || DEFAULT_BROWSER_BACKEND).trim().toLowerCase();
+  return value === 'webbridge' || value === 'kimi' ? 'webbridge' : 'opencli';
+}
+
+function modelTargetFromInput(value, effort = DEFAULT_EFFORT) {
+  const raw = String(value || DEFAULT_MODEL).trim();
+  const normalized = normalizeModelName(raw);
+  const rawValue = raw.toLowerCase().replace(/[•·]/g, ' ').replace(/[_\s]+/g, '-');
+  if (rawValue === '极高' || rawValue === 'extra-high' || rawValue === 'extreme' || rawValue === 'very-high' || rawValue === 'ultra' || rawValue === 'xhigh' || rawValue === 'x-high' || rawValue === '超高') {
+    return { model: 'thinking', effort: 'extra-high' };
+  }
+  if (rawValue === '高' || rawValue === 'high') return { model: 'thinking', effort: 'high' };
+  if (rawValue === '中' || rawValue === '中等' || rawValue === 'medium') return { model: 'thinking', effort: 'medium' };
+  return { model: normalized, effort: normalizeEffort(effort) };
 }
 
 function modelStateFromLabel(label) {
@@ -192,7 +234,7 @@ function modelStateFromLabel(label) {
   if (/^(instant|极速(?: 5\.5)?|fast(?: 5\.5)?)$/.test(value)) return { model: 'instant', effort: 'instant', label: raw };
   if (/^(medium|中|中等)$/.test(value)) return { model: 'thinking', effort: 'medium', label: raw };
   if (/^(high|高)$/.test(value)) return { model: 'thinking', effort: 'high', label: raw };
-  if (/^(extra[- ]high|极高)$/.test(value)) return { model: 'thinking', effort: 'extra-high', label: raw };
+  if (/^(extra[- ]high|very[- ]high|ultra|xhigh|x[- ]high|极高|超高)$/.test(value)) return { model: 'thinking', effort: 'extra-high', label: raw };
   if (/^(thinking|reasoning|heavy|深度思考)$/.test(value)) return { model: 'thinking', effort: 'unknown', label: raw };
   return { model: 'unknown', effort: 'unknown', label: raw };
 }
@@ -205,12 +247,12 @@ function modelMenuLabels(target) {
   return [];
 }
 
-function modelStateMatchesTarget(state, target) {
+function modelStateMatchesTarget(state, target, effort = DEFAULT_EFFORT) {
   const normalized = normalizeModelName(target);
   const current = normalizeModelName(state && state.model || 'unknown');
   if (normalized === 'auto') return current !== 'unknown';
   if (normalized === 'instant') return current === 'instant';
-  if (normalized === 'thinking') return current === 'thinking';
+  if (normalized === 'thinking') return current === 'thinking' && normalizeEffort(state && state.effort || effort) === normalizeEffort(effort);
   if (normalized === 'pro') return current === 'pro';
   return current === normalized;
 }
@@ -225,11 +267,14 @@ function imageCountLimitForModel(model) {
     : DEFAULT_IMAGE_FALLBACK_COUNT;
 }
 
-function applyModelTarget(state, nextModel) {
-  const model = normalizeModelName(nextModel);
+function applyModelTarget(state, nextModel, nextEffort = DEFAULT_EFFORT) {
+  const target = modelTargetFromInput(nextModel, nextEffort);
+  const model = target.model;
   if (!model || model === 'auto') return false;
-  if (normalizeModelName(state.model) === model) return false;
+  const effort = model === 'thinking' ? target.effort : model === 'pro' ? 'pro' : model;
+  if (normalizeModelName(state.model) === model && normalizeEffort(state.effort || effort) === normalizeEffort(effort)) return false;
   state.model = model;
+  state.effort = effort;
   delete state.imageModelFallback;
   clearStage(state, 'ensureModel');
   clearStage(state, 'send');
@@ -268,6 +313,7 @@ function uploadSignature(files) {
 // --- Daemon RPC --------------------------------------------------------------
 
 async function cmd(action, args = {}, session = 'default', opts = {}) {
+  if (ACTIVE_BROWSER_BACKEND === 'opencli') return opencliBrowserCommand(session, action, args);
   const body = JSON.stringify({ action, args, session });
   const maxAttempts = opts.retries !== undefined ? opts.retries : 3;
   const baseDelay = opts.baseDelay || 250;
@@ -488,7 +534,9 @@ function newState(session, opts) {
     imageDir: opts.imageDir || '',
     imagePrefix: opts.imagePrefix || '',
     fileDir: opts.fileDir || DEFAULT_FILE_DIR,
-    model: opts.model || 'auto',
+    model: opts.model || DEFAULT_MODEL,
+    effort: normalizeEffort(opts.effort || DEFAULT_EFFORT),
+    browserBackend: normalizeBrowserBackend(opts.browserBackend),
     tool: normalizeToolName(opts.tool || DEFAULT_TOOL),
     conversationUrl: opts.conversationUrl || '',
     conversationTitle: '',
@@ -497,6 +545,149 @@ function newState(session, opts) {
     turns: 0,
     active: null,
     stages: {},
+  };
+}
+
+function resolveOpencliBin() {
+  const bin = OPENCLI_BIN_CANDIDATES.find((candidate) => candidate && fs.existsSync(candidate));
+  if (bin) return { command: bin, prefix: [] };
+  if (fs.existsSync(OPENCLI_NODE_ENTRY)) return { command: process.execPath, prefix: [OPENCLI_NODE_ENTRY] };
+  return null;
+}
+
+function runOpencli(args, label = 'opencli', { allowPlain = false } = {}) {
+  const executable = resolveOpencliBin();
+  if (!executable) {
+    const e = new Error('OpenCLI is not installed; set OPENCLI_BIN or install opencli');
+    e.code = 'opencli_not_found';
+    throw e;
+  }
+  return new Promise((resolve, reject) => {
+    execFile(executable.command, [...executable.prefix, ...args], {
+      timeout: 30000,
+      maxBuffer: OPENCLI_MAX_BUFFER_BYTES,
+    }, (err, stdout = '', stderr = '') => {
+      if (err) {
+        const e = new Error(`opencli ${label} failed: ${err.message}${stderr ? `: ${stderr.trim()}` : ''}`);
+        e.code = 'opencli_failed';
+        e.stdout = stdout;
+        e.stderr = stderr;
+        reject(e);
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        if (allowPlain) {
+          resolve(stdout.trim());
+          return;
+        }
+        const e = new Error(`opencli ${label} returned invalid JSON: ${stdout.slice(0, 240)}`);
+        e.code = 'opencli_invalid_json';
+        reject(e);
+      }
+    });
+  });
+}
+
+async function verifyOpencliConnection(session) {
+  const tabs = await runOpencli(['browser', session, 'tab', 'list'], 'browser connectivity');
+  return { backend: 'opencli', tabs: Array.isArray(tabs) ? tabs.length : 0 };
+}
+
+async function opencliBrowserCommand(session, action, args = {}) {
+  const base = ['browser', session];
+  let commandArgs;
+  switch (action) {
+    case 'snapshot': commandArgs = [...base, 'state']; break;
+    case 'evaluate': commandArgs = [...base, 'eval', args.code]; break;
+    case 'navigate': commandArgs = [...base, 'open', args.url, '--window', 'background']; break;
+    case 'list_tabs': commandArgs = [...base, 'tab', 'list']; break;
+    case 'click': commandArgs = [...base, 'click', args.selector]; break;
+    case 'focus': commandArgs = [...base, 'focus', args.selector]; break;
+    case 'keys': commandArgs = [...base, 'keys', args.key]; break;
+    case 'get_attributes': commandArgs = [...base, 'get', 'attributes', args.selector]; break;
+    case 'get_text': commandArgs = [...base, 'get', 'text', args.selector]; break;
+    case 'fill': commandArgs = [...base, 'fill', args.selector, args.value]; break;
+    case 'upload': {
+      commandArgs = [...base, 'upload'];
+      if (Number.isInteger(args.nth)) commandArgs.push('--nth', String(args.nth));
+      commandArgs.push(args.selector, ...(args.files || []));
+      break;
+    }
+    case 'close_tab': commandArgs = [...base, 'tab', 'close', args.tabId]; break;
+    case 'close_session': commandArgs = [...base, 'close']; break;
+    default: {
+      const e = new Error(`OpenCLI backend does not support daemon action ${action}`);
+      e.code = 'opencli_action_unsupported';
+      throw e;
+    }
+  }
+  const result = await runOpencli(commandArgs, `browser ${action}`, { allowPlain: action === 'close_tab' || action === 'close_session' });
+  if (action === 'list_tabs') return { ok: true, data: { tabs: Array.isArray(result) ? result : result && result.tabs || [] } };
+  if (action === 'navigate' && result && result.page) return { ok: true, data: { ...result, tabId: result.page, url: result.url || args.url } };
+  return { ok: true, data: result };
+}
+
+async function ensureModelOpencli(session, target, effort = DEFAULT_EFFORT) {
+  const targetState = modelTargetFromInput(target, effort);
+  if (targetState.model === 'auto') return { ok: true, state: { model: 'unknown', effort: 'unknown' }, changed: false };
+  let result;
+  try {
+    const pill = await runOpencli(['browser', session, 'find', '--css', 'button.__composer-pill', '--limit', '3'], 'find composer pill');
+    if (!pill || Number(pill.matches_n) !== 1) {
+      return { ok: false, changed: false, error: 'ChatGPT composer pill was not uniquely found', code: 'model_switch_failed' };
+    }
+    await runOpencli(['browser', session, 'click', String(pill.entries[0].ref)], 'open model picker');
+    let advanced = null;
+    try {
+      advanced = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Show advanced options', '--limit', '3'], 'find advanced model options');
+    } catch (e) {
+      if (!/semantic_not_found|matched 0/i.test(`${e.message} ${e.stderr || ''}`)) throw e;
+    }
+    if (advanced && Number(advanced.matches_n) === 1 && advanced.entries[0].ref) {
+      await runOpencli(['browser', session, 'click', String(advanced.entries[0].ref)], 'open advanced model options');
+      await sleep(500);
+    }
+    const effortMenu = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--text', 'Effort', '--limit', '3'], 'find effort menu');
+    if (!effortMenu || Number(effortMenu.matches_n) !== 1 || !effortMenu.entries[0].ref) {
+      return { ok: false, changed: false, error: 'ChatGPT Effort menu was not uniquely found', code: 'model_switch_failed' };
+    }
+    await runOpencli(['browser', session, 'click', String(effortMenu.entries[0].ref)], 'open effort menu');
+    await sleep(900);
+    const choices = await runOpencli(['browser', session, 'find', '--role', 'menuitemradio', '--limit', '10'], 'find effort choices');
+    const labels = targetState.model === 'pro' ? [/^pro$/i] : targetState.effort === 'extra-high' ? [/extra\s+high/i, /very\s+high/i, /极高|超高/i] : [new RegExp(targetState.effort, 'i')];
+    const choice = (choices.entries || []).find((entry) => labels.some((pattern) => pattern.test(String(entry.text || ''))));
+    if (!choice || !choice.ref) {
+      return { ok: false, changed: false, error: `ChatGPT effort option not found for ${targetState.effort}`, code: 'model_switch_failed', choices };
+    }
+    await runOpencli(['browser', session, 'click', String(choice.ref)], 'select effort choice');
+    await sleep(900);
+    const pillAfter = await runOpencli(['browser', session, 'get', 'text', 'button.__composer-pill'], 'verify model pill');
+    const pillLabel = String(pillAfter && pillAfter.value || '');
+    const selectedText = String(choice.text || '');
+    const expectedLabel = targetState.model === 'pro' ? /\bpro\b/i : targetState.effort === 'extra-high' ? /(extra\s+high|very\s+high|极高|超高)/i : new RegExp(targetState.effort, 'i');
+    const verified = expectedLabel.test(pillLabel) || (targetState.model === 'pro' && /\bpro\b/i.test(selectedText) && /\bpro\b/i.test(pillLabel));
+    await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
+    result = { Status: verified ? 'Success' : 'Failed', Model: pillLabel, selected: selectedText };
+    if (!verified) return { ok: false, state: { model: 'unknown', effort: targetState.effort, label: pillLabel, backend: 'opencli', raw: result }, changed: true, error: `ChatGPT effort did not verify target ${targetState.effort}`, code: 'model_switch_failed', result };
+  } catch (e) {
+    return { ok: false, changed: false, error: e.message, code: e.code || 'opencli_failed' };
+  }
+  const row = result || {};
+  const returnedModel = targetState.model === 'pro' ? { model: 'pro', effort: 'pro' } : { model: 'thinking', effort: targetState.effort };
+  const state = {
+    model: returnedModel.model,
+    effort: targetState.model === 'pro' ? 'pro' : targetState.effort,
+    label: row.Model || row.model || '',
+    backend: 'opencli',
+    raw: result,
+  };
+  return {
+    ok: modelStateMatchesTarget(state, targetState.model, targetState.effort),
+    state,
+    changed: Number(row.slider && row.slider.before) !== Number(row.slider && row.slider.after),
+    result,
   };
 }
 
@@ -769,6 +960,7 @@ async function stageLoginCheck(state) {
 
 async function stageEnsureModel(state, opts = {}) {
   const target = normalizeModelName(state.model);
+  const effort = normalizeEffort(state.effort || DEFAULT_EFFORT);
   if (state.stages.ensureModel && state.stages.ensureModel.done) {
     const prior = state.stages.ensureModel.data || {};
     const priorTo = normalizeModelName(prior.to || prior.state && prior.state.model || '');
@@ -781,12 +973,12 @@ async function stageEnsureModel(state, opts = {}) {
     log(`ensure-model: re-checking explicit target=${target} (state was ${priorTo || priorTarget || 'unknown'})`);
     clearStage(state, 'ensureModel');
   }
-  const result = await ensureModel(state.session, target);
+  const result = await ensureModel(state.session, target, effort, state.browserBackend);
   if (target !== 'auto' && !result.ok) {
     if (opts.imageMode && target === DEFAULT_IMAGE_MODEL && opts.imageModelFallback === true) {
       const reason = result.error || `current=${result.state && result.state.model || 'unknown'}`;
       log(`Pro unavailable for image generation (${reason}); falling back to ${DEFAULT_IMAGE_FALLBACK_MODEL} and limiting this run to ${DEFAULT_IMAGE_FALLBACK_COUNT} image`);
-      const fallbackResult = await ensureModel(state.session, DEFAULT_IMAGE_FALLBACK_MODEL);
+      const fallbackResult = await ensureModel(state.session, DEFAULT_IMAGE_FALLBACK_MODEL, DEFAULT_IMAGE_FALLBACK_MODEL, state.browserBackend);
       if (fallbackResult.ok) {
         const fallbackData = {
           target,
@@ -818,7 +1010,12 @@ async function stageEnsureModel(state, opts = {}) {
     e.stageData = { ...result, target };
     throw e;
   }
-  const data = { target, requested: target, from: 'unknown', to: result.state.model, effort: result.state.effort, changed: result.changed };
+  if (result.ok && result.state && result.state.model && result.state.model !== 'unknown') {
+    state.model = normalizeModelName(result.state.model);
+    state.effort = normalizeEffort(result.state.effort || effort);
+    saveState(state);
+  }
+  const data = { target, requested: target, from: 'unknown', to: result.state.model, effort: result.state.effort || effort, changed: result.changed, backend: state.browserBackend };
   markStage(state, 'ensureModel', data);
   saveState(state);
   return { skipped: false, data };
@@ -826,7 +1023,7 @@ async function stageEnsureModel(state, opts = {}) {
 
 async function stageEnsureTool(state, opts) {
   const target = normalizeToolName(state.tool || DEFAULT_TOOL);
-  if (target === DEFAULT_TOOL) {
+  if (target === 'auto') {
     return { skipped: true, data: { target, state: await detectToolState(state.session) } };
   }
   const prior = state.stages.ensureTool;
@@ -1268,6 +1465,7 @@ async function waitForUploadInput(session, selector, maxSeconds = 8) {
       session,
       `(() => {
         const selector = ${JSON.stringify(selector)};
+        const inputs = [...document.querySelectorAll('input[type="file"]')];
         let input = document.querySelector(selector);
         let selectorUsed = selector;
         if (!input && selector !== ${JSON.stringify(DEFAULT_UPLOAD_SELECTOR)}) {
@@ -1275,13 +1473,20 @@ async function waitForUploadInput(session, selector, maxSeconds = 8) {
           selectorUsed = ${JSON.stringify(DEFAULT_UPLOAD_SELECTOR)};
         }
         if (!input) {
-          input = document.querySelector('input[type="file"][multiple], input[type="file"]');
-          selectorUsed = 'input[type="file"][multiple], input[type="file"]';
+          input = inputs.find((candidate) => candidate.id === 'upload-files') ||
+            inputs.find((candidate) => candidate.multiple && !/^image\\//i.test(candidate.accept || '')) ||
+            inputs.find((candidate) => !candidate.accept) ||
+            inputs.find((candidate) => candidate.multiple) ||
+            inputs[0] || null;
+          if (input && input.id) selectorUsed = 'input#' + CSS.escape(input.id) + '[type="file"]';
+          else selectorUsed = 'input[type="file"]';
         }
+        const nth = input && selectorUsed === 'input[type="file"]' ? inputs.indexOf(input) : null;
         return JSON.stringify({
           found: !!input,
           id: input ? input.id : '',
           selectorUsed,
+          nth,
           accept: input ? input.accept : '',
           multiple: input ? !!input.multiple : false
         });
@@ -1414,17 +1619,17 @@ async function stageUpload(state, opts) {
   let uploadResult;
   try {
     uploadResult = unwrap(
-      await cmd('upload', { selector, files }, state.session, { retries: 1 }),
+      await cmd('upload', { selector, nth: input.nth, files }, state.session, { retries: 1 }),
       'upload'
     );
   } catch (e) {
     if (/Not allowed/i.test(e.message)) {
-      const err = new Error('upload was blocked by the browser/WebBridge extension (Not allowed)');
+      const err = new Error('upload was blocked by the OpenCLI Browser Bridge (Not allowed)');
       err.code = 'upload_not_allowed';
       err.stageData = {
         selector,
         files,
-        hint: 'Enable "Allow access to file URLs" / "允许访问文件网址" for the Kimi WebBridge extension, then retry with --resume.',
+        hint: 'Confirm the OpenCLI Browser Bridge extension is connected and permitted to access local files, then retry with --resume.',
       };
       throw err;
     }
@@ -1433,7 +1638,10 @@ async function stageUpload(state, opts) {
   const waitSeconds = Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS;
   const attachmentState = await waitForUploadedFileNames(state.session, files, waitSeconds).catch((e) => ({ ok: false, error: e.message }));
   if (!attachmentState.ok) {
-    log(`upload warning: could not confirm attachment chip(s) within ${waitSeconds}s`);
+    const e = new Error(`upload did not verify attachment chip(s) within ${waitSeconds}s`);
+    e.code = 'upload_unverified';
+    e.stageData = { selector, nth: input.nth, files, uploadResult, attachmentState };
+    throw e;
   }
   const data = {
     files,
@@ -1860,6 +2068,10 @@ async function stageStatus(state) {
 
 async function stageCleanup(state, opts) {
   if (!opts.keepSession) {
+    const tabId = state.stages && state.stages.open && state.stages.open.data && state.stages.open.data.tabId;
+    if (ACTIVE_BROWSER_BACKEND === 'opencli' && tabId) {
+      try { await cmd('close_tab', { tabId }, state.session); } catch (e) { log(`tab close warning: ${e.message}`); }
+    }
     try { await cmd('close_session', {}, state.session); } catch (e) { log(`close warning: ${e.message}`); }
   }
   if (opts.cleanupState) {
@@ -1899,15 +2111,20 @@ async function runExtractFiles(state, opts) {
   return results;
 }
 
+function doctorBackendCheck(state, opts, daemonStatus) {
+  const backend = normalizeBrowserBackend(state.browserBackend || opts.browserBackend || ACTIVE_BROWSER_BACKEND);
+  const backendCheck = { name: backend, ok: true, backend };
+  if (backend === 'webbridge') {
+    backendCheck.daemonVersion = daemonStatus && daemonStatus.version || '';
+    backendCheck.extensionVersion = daemonStatus && daemonStatus.extension_version || '';
+  } else {
+    backendCheck.tabs = Number.isFinite(daemonStatus && daemonStatus.tabs) ? daemonStatus.tabs : 0;
+  }
+  return backendCheck;
+}
+
 async function runDoctor(state, opts, daemonStatus) {
-  const checks = [
-    {
-      name: 'webbridge',
-      ok: true,
-      daemonVersion: daemonStatus && daemonStatus.version || '',
-      extensionVersion: daemonStatus && daemonStatus.extension_version || '',
-    },
-  ];
+  const checks = [doctorBackendCheck(state, opts, daemonStatus)];
   const doctorOpts = { ...opts, keepSession: true };
   let openResult = null;
   let loginResult = null;
@@ -2066,10 +2283,10 @@ async function probePopover(session) {
   return html;
 }
 
-async function ensureModel(session, target) {
+async function ensureModelWebbridge(session, target, effort = DEFAULT_EFFORT) {
   if (target === 'auto') return { ok: true, state: await detectModelReady(session, 4), changed: false };
   const state = await detectModelReady(session, 12);
-  if (modelStateMatchesTarget(state, target)) return { ok: true, state, changed: false };
+  if (modelStateMatchesTarget(state, target, effort)) return { ok: true, state, changed: false };
   const labels = modelMenuLabels(target);
   if (!labels.length) return { ok: false, state, changed: false, error: `unknown target: ${target}` };
   await evaluate(
@@ -2131,7 +2348,15 @@ async function ensureModel(session, target) {
   await sleep(300);
   if (!picked) return { ok: false, state, changed: false, error: `could not find "${labels[0]}" option in popover` };
   const after = await detectModel(session);
-  return { ok: modelStateMatchesTarget(after, target), state: after, changed: true, picked };
+  return { ok: modelStateMatchesTarget(after, target, effort), state: after, changed: true, picked };
+}
+
+async function ensureModel(session, target, effort = DEFAULT_EFFORT, backend = DEFAULT_BROWSER_BACKEND) {
+  const normalizedBackend = normalizeBrowserBackend(backend);
+  if (normalizedBackend === 'opencli') {
+    return ensureModelOpencli(session, target, effort);
+  }
+  return ensureModelWebbridge(session, target, effort);
 }
 
 // --- Wait & extract ----------------------------------------------------------
@@ -2532,12 +2757,43 @@ async function getDeepResearchProgress(session) {
         .map((el) => attrText(el).replace(/\\s+/g, ' ').trim())
         .filter((label) => /start|confirm|continue|stop|cancel|edit|copy|download|开始|确认|继续|停止|取消|编辑|复制|下载/i.test(label))
         .slice(0, 40);
-      const sections = [...document.querySelectorAll('section[data-turn="assistant"]')];
+      const messagesFromFiber = (element) => {
+        const root = fiberOf(element);
+        if (!root) return [];
+        const fibers = [root];
+        const seenFibers = new Set();
+        const findMessages = (value, depth, seenValues) => {
+          if (!value || depth > 5 || seenValues.has(value)) return null;
+          if (Array.isArray(value)) {
+            if (value.some((item) => item && item.author && typeof item === 'object')) return value;
+            for (const item of value) {
+              const found = findMessages(item, depth + 1, seenValues);
+              if (found) return found;
+            }
+            return null;
+          }
+          if (typeof value !== 'object') return null;
+          seenValues.add(value);
+          for (const key of Object.keys(value).slice(0, 100)) {
+            const found = findMessages(value[key], depth + 1, seenValues);
+            if (found) return found;
+          }
+          return null;
+        };
+        while (fibers.length && seenFibers.size < 400) {
+          const current = fibers.shift();
+          if (!current || seenFibers.has(current)) continue;
+          seenFibers.add(current);
+          const messages = findMessages(current.memoizedProps || {}, 0, new Set());
+          if (messages) return messages;
+          fibers.push(current.child, current.sibling);
+        }
+        return [];
+      };
+      const sections = [...document.querySelectorAll('section[data-turn="assistant"], section[data-testid^="conversation-turn-"]')];
       out.assistantSectionCount = sections.length;
       for (const section of sections) {
-        const fiber = fiberOf(section);
-        let messages = [];
-        try { messages = fiber && fiber.memoizedProps && fiber.memoizedProps.children.props.turn.messages || []; } catch {}
+        const messages = messagesFromFiber(section);
         out.messageCount += messages.length;
         for (const message of messages) {
           const metadata = message && message.metadata || {};
@@ -3824,7 +4080,7 @@ const RESEARCH_SUBCOMMANDS = new Set(['research', 'deep-research', 'deep-search'
 const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'extract-files', 'latest', 'doctor', 'status', 'cleanup'];
 
 function printHelp() {
-  process.stdout.write(`search.js - drive ChatGPT Pro via kimi-webbridge (stateful, resumable)
+  process.stdout.write(`search.js - drive ChatGPT Pro via OpenCLI (stateful, resumable)
 
 Usage:
   search.js [global-flags] [SUBCOMMAND] [args...]
@@ -3838,7 +4094,7 @@ Sub-commands:
   image [prompt...]    Generate image(s) in ChatGPT and save them locally
   open                 Open a ChatGPT tab (or reuse an existing one)
   login-check          Detect whether ChatGPT is logged in
-  ensure-model [tgt]   Verify / switch model. tgt: auto|pro|thinking|think|instant
+  ensure-model [tgt]   Verify / switch model. tgt: 极高|pro|high|medium|instant
   ensure-tool [tgt]    Verify / switch ChatGPT tool. tgt: auto|none|deep-research|web-search|create-image
   upload               Upload --upload file(s) into the composer
   send [prompt...]     Fill the input and click send
@@ -3856,9 +4112,12 @@ Sub-commands:
 Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
-  -m, --model NAME     Target model: auto|pro|thinking|think|instant
-                       (default: auto; image defaults to strict Pro)
+  -m, --model NAME     Target model: 极高|pro|high|medium|instant
+                       (default: 极高; image defaults to strict Pro)
                        legacy aliases extended/extended-pro also map to pro
+      --effort NAME    Thinking slider: medium|high|extra-high (default: extra-high)
+      --browser-backend NAME
+                       Model driver: opencli (default) or webbridge (compatibility)
       --tool NAME      Target ChatGPT tool: auto|none|deep-research|deep-search|web-search|create-image
       --deep-research  Select ChatGPT's Deep research tool before sending
       --deep-search    Alias for --deep-research
@@ -3969,7 +4228,9 @@ function parseArgs(argv) {
     uploads: [],
     uploadSelector: DEFAULT_UPLOAD_SELECTOR,
     uploadWait: DEFAULT_UPLOAD_WAIT_SECONDS,
-    model: 'auto',
+    model: DEFAULT_MODEL,
+    effort: DEFAULT_EFFORT,
+    browserBackend: DEFAULT_BROWSER_BACKEND,
     modelExplicit: false,
     tool: DEFAULT_TOOL,
     toolExplicit: false,
@@ -4030,7 +4291,9 @@ function parseArgs(argv) {
     else if (a === '-f' || a === '--file') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); }
     else if (a === '-s' || a === '--session') { opts.session = argv[++i] || opts.session; }
     else if (a === '-o' || a === '--output') { opts.output = argv[++i] || ''; }
-    else if (a === '-m' || a === '--model') { opts.model = argv[++i] || 'auto'; opts.modelExplicit = true; }
+    else if (a === '-m' || a === '--model') { opts.model = argv[++i] || DEFAULT_MODEL; opts.modelExplicit = true; }
+    else if (a === '--effort' || a === '--thinking-effort') { opts.effort = normalizeEffort(argv[++i] || DEFAULT_EFFORT); opts.effortExplicit = true; }
+    else if (a === '--browser-backend') { opts.browserBackend = normalizeBrowserBackend(argv[++i]); opts.browserBackendExplicit = true; }
     else if (a === '-w' || a === '--wait') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
     else if (a === '-i' || a === '--interval') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.interval = n; }
     else if (a === '--refresh' || a === '--refresh-seconds') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.refreshSec = n; }
@@ -4063,6 +4326,8 @@ function parseArgs(argv) {
         else if (k === 'web-search') { opts.tool = /^(0|false|no)$/i.test(v) ? DEFAULT_TOOL : 'web-search'; opts.toolExplicit = !/^(0|false|no)$/i.test(v); }
         else if (k === 'until-complete' || k === 'wait-forever' || k === 'hang') opts.waitForever = !/^(0|false|no)$/i.test(v);
         else if (k === 'model') { opts.model = v; opts.modelExplicit = true; }
+        else if (k === 'effort' || k === 'thinking-effort') { opts.effort = normalizeEffort(v || DEFAULT_EFFORT); opts.effortExplicit = true; }
+        else if (k === 'browser-backend') { opts.browserBackend = normalizeBrowserBackend(v); opts.browserBackendExplicit = true; }
         else if (k === 'wait') { const n = parseInt(v, 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } }
         else if (k === 'interval') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.interval = n; }
         else if (k === 'refresh' || k === 'refresh-seconds') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.refreshSec = n; }
@@ -4094,7 +4359,7 @@ function parseArgs(argv) {
         else if (ch === 'f') { opts.promptFile = argv[++i] || ''; opts.subcommandArgs.push('-f', opts.promptFile); consumed = true; break; }
         else if (ch === 's') { opts.session = argv[++i] || opts.session; consumed = true; break; }
         else if (ch === 'o') { opts.output = argv[++i] || ''; consumed = true; break; }
-        else if (ch === 'm') { opts.model = argv[++i] || 'auto'; opts.modelExplicit = true; consumed = true; break; }
+        else if (ch === 'm') { opts.model = argv[++i] || DEFAULT_MODEL; opts.modelExplicit = true; consumed = true; break; }
         else if (ch === 'w') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) { opts.wait = n; opts.waitExplicit = true; } consumed = true; break; }
         else if (ch === 'i') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.interval = n; consumed = true; break; }
         else die(2, `unknown short flag: -${ch}`);
@@ -4164,6 +4429,7 @@ function exitRunError(e, opts, state, startTime) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  ACTIVE_BROWSER_BACKEND = normalizeBrowserBackend(opts.browserBackend);
   if (RESEARCH_SUBCOMMANDS.has(opts.subcommand)) {
     opts.researchMode = true;
     opts.subcommand = 'run';
@@ -4174,21 +4440,35 @@ async function main() {
   if (opts.subcommand === 'image' || opts.subcommand === 'extract-images') opts.imageMode = true;
   if (opts.imageMode && opts.subcommand === 'run') opts.subcommand = 'image';
   if (opts.subcommand === 'image' && !opts.modelExplicit) opts.model = DEFAULT_IMAGE_MODEL;
+  if (opts.model === 'auto' && !opts.modelExplicit) opts.model = DEFAULT_MODEL;
+  if (!opts.effort) opts.effort = DEFAULT_EFFORT;
   if (opts.imageMode) opts.originalImageCount = imageCountFromOpts(opts);
   opts.tool = normalizeToolName(opts.tool);
   if (opts.tool === 'deep-research' && !opts.waitExplicit) opts.wait = DEFAULT_DEEP_RESEARCH_WAIT_SECONDS;
   if (opts.help) { printHelp(); return; }
   if (opts.verbose) log('opts:', JSON.stringify({ ...opts, subcommandArgs: '[redacted]' }));
 
-  log('health check...');
-  let daemonStatus;
-  try {
-    daemonStatus = await healthCheck();
-  } catch (e) {
-    die(1, `health check failed: ${e.message}`, { hint: e.hint || 'try: ~/.kimi-webbridge/bin/kimi-webbridge restart' });
+  log(`${ACTIVE_BROWSER_BACKEND} health check...`);
+  let daemonStatus = { backend: ACTIVE_BROWSER_BACKEND };
+  if (ACTIVE_BROWSER_BACKEND === 'webbridge') {
+    try {
+      daemonStatus = await healthCheck();
+    } catch (e) {
+      die(1, `health check failed: ${e.message}`, { hint: e.hint || 'try: ~/.kimi-webbridge/bin/kimi-webbridge restart' });
+    }
+    if (daemonStatus.autoStarted) log('daemon auto-started');
+    log(`daemon ${formatVersionForLog(daemonStatus.version)} | extension ${formatVersionForLog(daemonStatus.extension_version)}`);
+  } else {
+    try {
+      const executable = resolveOpencliBin();
+      if (!executable) throw new Error('OpenCLI is not installed; set OPENCLI_BIN or install opencli');
+      const connection = await verifyOpencliConnection(opts.session);
+      daemonStatus = { ...daemonStatus, ...connection };
+      log(`opencli backend ready (${executable.command})`);
+    } catch (e) {
+      die(1, `opencli health check failed: ${e.message}`);
+    }
   }
-  if (daemonStatus.autoStarted) log('daemon auto-started');
-  log(`daemon ${formatVersionForLog(daemonStatus.version)} | extension ${formatVersionForLog(daemonStatus.extension_version)}`);
 
   if (opts.statusOnly) {
     console.log(JSON.stringify({ status: 'ok', ...daemonStatus }, null, 2));
@@ -4210,10 +4490,29 @@ async function main() {
       fileDir: opts.fileDir,
       conversationUrl: opts.conversationUrl,
       model: normalizeModelName(opts.model),
+      effort: normalizeEffort(opts.effort),
+      browserBackend: normalizeBrowserBackend(opts.browserBackend),
       tool: opts.tool,
     });
   }
   if (state.model) state.model = normalizeModelName(state.model);
+  if (!state.model || state.model === 'auto') {
+    state.model = DEFAULT_MODEL;
+    clearStage(state, 'ensureModel');
+  }
+  if (!state.effort) state.effort = state.model === 'pro' ? 'pro' : DEFAULT_EFFORT;
+  state.effort = normalizeEffort(state.effort);
+  const requestedBrowserBackend = opts.browserBackendExplicit
+    ? normalizeBrowserBackend(opts.browserBackend)
+    : DEFAULT_BROWSER_BACKEND;
+  if (normalizeBrowserBackend(state.browserBackend) !== requestedBrowserBackend) {
+    state.browserBackend = requestedBrowserBackend;
+    for (const stageName of STAGE_NAMES) clearStage(state, stageName);
+    log(`migrated session browser backend to ${requestedBrowserBackend}; cleared browser stages for a fresh OpenCLI session`);
+  } else {
+    state.browserBackend = requestedBrowserBackend;
+  }
+  ACTIVE_BROWSER_BACKEND = state.browserBackend;
   if (!state.tool) state.tool = DEFAULT_TOOL;
   if (!Array.isArray(state.files)) state.files = [];
   if (opts.output) state.output = opts.output;
@@ -4242,8 +4541,15 @@ async function main() {
   if (opts.uploadSelector && opts.uploadSelector !== DEFAULT_UPLOAD_SELECTOR) state.uploadSelector = opts.uploadSelector;
   if (opts.imageDir) state.imageDir = opts.imageDir;
   if (opts.imagePrefix) state.imagePrefix = opts.imagePrefix;
-  if (opts.model && opts.model !== 'auto' && (opts.modelExplicit || !opts.resume || !state.model)) {
-    applyModelTarget(state, opts.model);
+  const shouldApplyModelTarget = opts.model && opts.model !== 'auto' && (
+    opts.modelExplicit ||
+    (!opts.resume && ['run', 'image'].includes(opts.subcommand)) ||
+    !state.model
+  );
+  if (shouldApplyModelTarget) {
+    applyModelTarget(state, opts.model, opts.effort);
+  } else if (opts.effortExplicit) {
+    applyModelTarget(state, state.model, opts.effort);
   }
   if (!opts.resume && ['run', 'image'].includes(opts.subcommand) && !opts.toolExplicit && state.tool && state.tool !== DEFAULT_TOOL) {
     state.tool = DEFAULT_TOOL;
@@ -4292,13 +4598,15 @@ async function main() {
 
   // For ensure-model subcommand, override the target if first arg given
   if (opts.subcommand === 'ensure-model' && opts.subcommandArgs.length) {
-    const nextModel = normalizeModelName(opts.subcommandArgs[0]);
-    if (nextModel === 'auto') {
+    const nextModel = opts.subcommandArgs[0];
+    const nextTarget = modelTargetFromInput(nextModel, opts.effort);
+    if (nextTarget.model === 'auto') {
       state.model = 'auto';
+      state.effort = DEFAULT_EFFORT;
       delete state.imageModelFallback;
       clearStage(state, 'ensureModel');
     } else {
-      applyModelTarget(state, nextModel);
+      applyModelTarget(state, nextModel, nextTarget.effort);
     }
     saveState(state);
   }
@@ -4396,6 +4704,7 @@ async function main() {
     elapsed: Math.floor((Date.now() - startTime) / 1000),
     stages: Object.keys(state.stages),
     model: state.model,
+    effort: state.effort,
     tool: state.tool || DEFAULT_TOOL,
     output: imageData.manifestPath || extractData.path || state.output || null,
     length: extractData.length || 0,
