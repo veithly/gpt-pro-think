@@ -131,7 +131,7 @@ node ./search.js ensure-tool deep-research
 node ./search.js ensure-tool none
 ```
 
-To attach files, pass `--upload <path>` one or more times before the prompt. The upload stage runs after tool selection and before send, discovers ChatGPT's general file input, and requires every attachment chip to be visible before sending. A failed attachment confirmation stops the run instead of sending an incomplete prompt.
+To attach files, pass `--upload <path>` one or more times before the prompt. The upload stage runs after tool selection and before send, discovers ChatGPT's general file input, and requires every attachment to be present with no pending or failed upload state before sending. The default 10-minute upload wait supports multiple large files. The send stage also verifies that ChatGPT created a user turn or started generation; a no-op click is retried instead of being recorded as sent.
 
 ```bash
 node ./search.js --upload ./brief.pdf --until-complete "Summarize this file."

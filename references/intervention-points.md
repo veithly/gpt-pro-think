@@ -69,7 +69,7 @@ After you fix the issue, re-run with `--resume --until-complete` and the script 
 
 ---
 
-## 6. `upload` / `send` — `upload_file_invalid`, `upload_input_not_found`, `upload_not_allowed`, or `send_button_not_ready`
+## 6. `upload` / `send` — `upload_file_invalid`, `upload_input_not_found`, `upload_not_allowed`, `upload_failed`, `send_button_not_ready`, or `send_not_confirmed`
 
 **Stage:** upload / send
 **Cause:** an upload path is missing/not a file, ChatGPT's file input selector changed, the browser/WebBridge extension blocked file injection, or ChatGPT did not finish processing the attachment before the send timeout.
@@ -79,8 +79,9 @@ After you fix the issue, re-run with `--resume --until-complete` and the script 
 2. If paths are correct, inspect the current DOM for `input[type="file"]`.
 3. Re-run with a selector override if needed: `--upload-selector 'input#upload-files[type="file"]'`.
 4. If the error is `upload_not_allowed`, enable **Allow access to file URLs** / **允许访问文件网址** in the Kimi WebBridge extension details page, then verify `~/.kimi-webbridge/bin/kimi-webbridge status` is connected.
-5. If the error is `send_button_not_ready`, wait for the attachment preview to finish in ChatGPT or increase `--upload-wait`, then re-run with `--resume --until-complete`.
-6. Re-run with `--resume --until-complete`; upload paths are retained in state.
+5. If the error is `send_button_not_ready`, wait for the attachment preview to finish in ChatGPT or increase `--upload-wait`, then re-run with `--resume --until-complete`. The default is 600 seconds for multiple large files.
+6. If the error is `send_not_confirmed`, the button accepted click events but ChatGPT did not create a user turn. Inspect the composer for a pending/failed upload or transient page error, then resume; the prompt is retained and will be retried.
+7. Re-run with `--resume --until-complete`; upload paths are retained in state.
 
 ---
 

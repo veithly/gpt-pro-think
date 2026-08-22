@@ -47,7 +47,9 @@ const DEFAULT_MAX_IMAGES = 10;
 const DEFAULT_IMAGE_MODEL = 'pro';
 const DEFAULT_IMAGE_FALLBACK_MODEL = 'instant';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
-const DEFAULT_UPLOAD_WAIT_SECONDS = 60;
+const DEFAULT_UPLOAD_WAIT_SECONDS = 600;
+const DEFAULT_SEND_CONFIRM_SECONDS = 15;
+const DEFAULT_SEND_ATTEMPTS = 3;
 // A normal run must start in the ChatGPT chat composer. `auto` remains an
 // explicit opt-in to preserving a tool the user selected themselves.
 const DEFAULT_TOOL = 'none';
@@ -901,7 +903,7 @@ async function getConversationProgress(session, imageMinAssistantIndex = null) {
         copyCount,
         busy,
         hasInput: !!input,
-        sendDisabled: sendButton ? !!sendButton.disabled : null,
+        sendDisabled: sendButton ? (!!sendButton.disabled || sendButton.getAttribute('aria-disabled') === 'true') : null,
         looksLikeLogin: /Log in|Sign in|Continue with|登录|登入/.test(bodyText),
         looksRateLimited: /too many requests|please wait a moment|slow down|rate limit|请稍候|请求过多/i.test(bodyText),
         url: location.href,
@@ -1504,69 +1506,156 @@ async function waitForUploadInput(session, selector, maxSeconds = 8) {
   return last || { found: false };
 }
 
-async function waitForUploadedFileNames(session, files, maxSeconds) {
-  const names = files.map((file) => path.basename(file));
-  const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
-  let last = null;
-  while (Date.now() < deadline) {
-    const result = await evaluate(
-      session,
-      `(() => {
-        const names = ${JSON.stringify(names)};
-        const bodyText = (document.body.innerText || document.body.textContent || '');
-        const visible = names.filter((name) => bodyText.includes(name));
-        const fileInputs = [...document.querySelectorAll('input[type="file"]')].map((input) => ({
-          id: input.id || '',
-          count: input.files ? input.files.length : 0,
-          names: input.files ? [...input.files].map((file) => file.name) : []
-        }));
-        const elementText = [...document.querySelectorAll('[aria-label], [title], img[alt]')]
-          .map((el) => [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('alt')].filter(Boolean).join(' '))
-          .join('\\n');
-        const searchableText = bodyText + '\\n' + elementText;
-        const attributeVisible = names.filter((name) => searchableText.includes(name));
-        const inputVisible = names.filter((name) => fileInputs.some((input) => input.names.includes(name)));
-        return JSON.stringify({ visible, attributeVisible, inputVisible, fileInputs });
-      })()`
-    );
-    last = result;
-    const seen = new Set([...(result && result.visible || []), ...(result && result.attributeVisible || []), ...(result && result.inputVisible || [])]);
-    if (names.every((name) => seen.has(name))) return { ok: true, names, ...result };
-    await sleep(1000);
+function expectedFileNameCounts(files) {
+  const counts = {};
+  for (const file of files) {
+    const name = path.basename(file);
+    counts[name] = (counts[name] || 0) + 1;
   }
-  return { ok: false, names, ...(last || {}) };
+  return counts;
 }
 
-async function waitForSendButtonReady(session, maxSeconds) {
+function attachmentsAreReady(state, expectedCounts) {
+  if (!state || state.uploadFailed || state.uploadPending) return false;
+  const observed = state.observedNameCounts || {};
+  return Object.entries(expectedCounts).every(([name, count]) => Number(observed[name] || 0) >= count);
+}
+
+function sendButtonIsReady(state) {
+  return !!(
+    state &&
+    state.buttonFound &&
+    state.buttonVisible &&
+    state.buttonDisabled === false &&
+    state.buttonAriaDisabled !== 'true' &&
+    !state.uploadPending &&
+    !state.uploadFailed
+  );
+}
+
+function promptSendWasAccepted(before, after, composerState) {
+  const beforeUsers = Number(before && before.userCount);
+  const afterUsers = Number(after && after.userCount);
+  const beforeMessages = Number(before && before.messageCount);
+  const afterMessages = Number(after && after.messageCount);
+  const userAdvanced = Number.isFinite(beforeUsers) && Number.isFinite(afterUsers) && afterUsers > beforeUsers;
+  const messagesAdvanced = Number.isFinite(beforeMessages) && Number.isFinite(afterMessages) && afterMessages > beforeMessages;
+  const composerCleared = !String(composerState && composerState.composerText || '').trim();
+  return userAdvanced || (composerCleared && (messagesAdvanced || !!(after && after.busy)));
+}
+
+async function inspectComposerUploadState(session, files) {
+  const names = files.map((file) => path.basename(file));
+  return evaluate(
+    session,
+    `(() => {
+      const names = ${JSON.stringify(names)};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      };
+      const fileInputs = [...document.querySelectorAll('input[type="file"]')].map((input) => ({
+        id: input.id || '',
+        count: input.files ? input.files.length : 0,
+        names: input.files ? [...input.files].map((file) => file.name) : []
+      }));
+      const attachmentGroups = [...document.querySelectorAll('[role="group"][aria-label]')]
+        .filter(visible)
+        .map((group) => group.getAttribute('aria-label') || '')
+        .filter(Boolean);
+      const countNames = (values) => values.reduce((counts, name) => {
+        counts[name] = (counts[name] || 0) + 1;
+        return counts;
+      }, {});
+      const inputNameCounts = countNames(fileInputs.flatMap((input) => input.names));
+      const groupNameCounts = countNames(attachmentGroups);
+      const observedNameCounts = {};
+      for (const name of names) {
+        observedNameCounts[name] = Math.max(inputNameCounts[name] || 0, groupNameCounts[name] || 0);
+      }
+      const form = document.querySelector('form') || document.body;
+      const formText = textOf(form);
+      const uploadPendingMatch = formText.match(/file upload pending|upload(?:ing| in progress)|processing (?:the )?(?:file|attachment)|文件(?:正在)?上传|上传中|正在处理(?:文件|附件)|附件处理中/i);
+      const uploadFailureMatch = formText.match(/failed to upload|upload failed|could(?: not|n't) upload|unable to upload|文件上传失败|上传文件失败|无法上传/i);
+      const pendingElements = [...form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="loading"]')]
+        .filter(visible)
+        .map((el) => ({ tag: el.tagName, aria: el.getAttribute('aria-label') || '', text: textOf(el).slice(0, 160) }));
+      const button = document.querySelector('[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label*="Send"], button[aria-label*="发送"]');
+      const composer = document.querySelector('#prompt-textarea[contenteditable="true"], [contenteditable="true"]');
+      return JSON.stringify({
+        names,
+        fileInputs,
+        attachmentGroups,
+        observedNameCounts,
+        uploadPending: !!uploadPendingMatch || pendingElements.length > 0,
+        uploadPendingText: uploadPendingMatch ? uploadPendingMatch[0] : '',
+        uploadFailed: !!uploadFailureMatch,
+        uploadFailureText: uploadFailureMatch ? uploadFailureMatch[0] : '',
+        pendingElements,
+        buttonFound: !!button,
+        buttonVisible: visible(button),
+        buttonDisabled: button ? !!button.disabled : null,
+        buttonAriaDisabled: button ? (button.getAttribute('aria-disabled') || '') : '',
+        buttonAria: button ? (button.getAttribute('aria-label') || '') : '',
+        composerText: composer ? textOf(composer).slice(0, 1000) : '',
+        formText: formText.slice(-1200)
+      });
+    })()`
+  );
+}
+
+async function waitForUploadedFileNames(session, files, maxSeconds) {
+  const names = files.map((file) => path.basename(file));
+  const expectedCounts = expectedFileNameCounts(files);
   const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
   let last = null;
-  while (Date.now() < deadline) {
-    const result = await evaluate(
-      session,
-      `(() => {
-        const button = document.querySelector('[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label*="Send"], button[aria-label*="发送"]');
-        const composer = document.querySelector('#prompt-textarea, [contenteditable="true"]');
-        const attachments = [...document.querySelectorAll('[aria-label*="Remove file"], [aria-label*="Open image"], [aria-label*="移除"], [aria-label*="打开图片"], [class*="file-tile"]')]
-          .map((el) => ({
-            tag: el.tagName,
-            aria: el.getAttribute('aria-label') || '',
-            text: (el.innerText || '').slice(0, 160)
-          }));
-        return JSON.stringify({
-          found: !!button,
-          disabled: button ? !!button.disabled : null,
-          aria: button ? (button.getAttribute('aria-label') || '') : '',
-          text: button ? (button.innerText || '') : '',
-          composerText: composer ? ((composer.innerText || composer.textContent || '').slice(0, 240)) : '',
-          attachments
-        });
-      })()`
-    );
+  let readySince = 0;
+  do {
+    const result = await inspectComposerUploadState(session, files);
     last = result;
-    if (result && result.found && result.disabled === false) return { ok: true, ...result };
+    if (result && result.uploadFailed) return { ok: false, names, expectedCounts, ...result };
+    if (attachmentsAreReady(result, expectedCounts)) {
+      if (!readySince) readySince = Date.now();
+      if (Date.now() - readySince >= 1500) return { ok: true, names, expectedCounts, ...result };
+    } else {
+      readySince = 0;
+    }
     await sleep(1000);
-  }
+  } while (Date.now() < deadline);
+  return { ok: false, names, expectedCounts, ...(last || {}) };
+}
+
+async function waitForSendButtonReady(session, files, maxSeconds) {
+  const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
+  let last = null;
+  do {
+    const result = await inspectComposerUploadState(session, files);
+    last = result;
+    if (result && result.uploadFailed) return { ok: false, ...result };
+    if (sendButtonIsReady(result)) return { ok: true, ...result };
+    await sleep(1000);
+  } while (Date.now() < deadline);
   return { ok: false, ...(last || {}) };
+}
+
+async function waitForPromptAccepted(session, before, prompt, maxSeconds = DEFAULT_SEND_CONFIRM_SECONDS) {
+  const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
+  let last = null;
+  do {
+    const [progress, composerState] = await Promise.all([
+      getConversationProgress(session).catch(() => ({})),
+      inspectComposerUploadState(session, []).catch(() => ({})),
+    ]);
+    last = { progress, composerState };
+    if (promptSendWasAccepted(before, progress, composerState)) {
+      return { ok: true, promptLength: prompt.length, ...last };
+    }
+    await sleep(500);
+  } while (Date.now() < deadline);
+  return { ok: false, promptLength: prompt.length, ...(last || {}) };
 }
 
 async function fillComposerPreservingInlineTools(session, prompt) {
@@ -1603,6 +1692,26 @@ async function stageUpload(state, opts) {
   const prompt = state.prompt || '';
   const prior = state.stages.upload;
   if (!opts.continueMode && prior && prior.done && prior.data && prior.data.signature === signature && prior.data.prompt === prompt) {
+    const priorSend = state.stages.send;
+    const priorSendMatches = priorSend && priorSend.done && priorSend.data &&
+      priorSend.data.prompt === prompt && priorSend.data.uploadSignature === signature;
+    const downstreamConfirmed = priorSendMatches && (
+      priorSend.data.confirmed ||
+      (state.stages.wait && state.stages.wait.done) ||
+      (state.stages.extract && state.stages.extract.done)
+    );
+    if (downstreamConfirmed) return { skipped: true, data: prior.data };
+    const waitSeconds = Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS;
+    const attachmentState = await waitForUploadedFileNames(state.session, files, waitSeconds).catch((e) => ({ ok: false, error: e.message }));
+    if (!attachmentState.ok) {
+      const e = new Error(`prior upload is not ready after ${waitSeconds}s`);
+      e.code = attachmentState.uploadFailed ? 'upload_failed' : 'upload_unverified';
+      e.stageData = { files, attachmentState, prior: prior.data };
+      throw e;
+    }
+    prior.data.attachmentState = attachmentState;
+    prior.data.ready = true;
+    saveState(state);
     return { skipped: true, data: prior.data };
   }
   validateUploadFiles(files);
@@ -1638,8 +1747,9 @@ async function stageUpload(state, opts) {
   const waitSeconds = Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS;
   const attachmentState = await waitForUploadedFileNames(state.session, files, waitSeconds).catch((e) => ({ ok: false, error: e.message }));
   if (!attachmentState.ok) {
-    const e = new Error(`upload did not verify attachment chip(s) within ${waitSeconds}s`);
-    e.code = 'upload_unverified';
+    const detail = attachmentState.uploadFailureText ? `: ${attachmentState.uploadFailureText}` : '';
+    const e = new Error(`upload did not become ready within ${waitSeconds}s${detail}`);
+    e.code = attachmentState.uploadFailed ? 'upload_failed' : 'upload_unverified';
     e.stageData = { selector, nth: input.nth, files, uploadResult, attachmentState };
     throw e;
   }
@@ -1652,6 +1762,7 @@ async function stageUpload(state, opts) {
     input,
     uploadResult,
     attachmentState,
+    ready: true,
   };
   clearStage(state, 'send');
   clearStage(state, 'wait');
@@ -1671,8 +1782,21 @@ async function stageSend(state, opts) {
   // (the user is explicitly asking to push another turn into the conversation).
   const uploadFiles = uploadFilesForState(state);
   const uploadSig = uploadSignature(uploadFiles);
+  let retryingUnconfirmedPrior = false;
   if (!opts.continueMode && prior && prior.done && prior.data && prior.data.prompt === prompt && prior.data.uploadSignature === uploadSig) {
-    return { skipped: true, data: prior.data };
+    if (prior.data.confirmed || (state.stages.wait && state.stages.wait.done) || (state.stages.extract && state.stages.extract.done)) {
+      return { skipped: true, data: prior.data };
+    }
+    const current = await getConversationProgress(state.session).catch(() => ({}));
+    const beforeUsers = Number(prior.data.userBefore);
+    if (Number.isFinite(beforeUsers) && Number(current.userCount) > beforeUsers) {
+      prior.data.confirmed = true;
+      prior.data.confirmation = { recovered: true, progress: current };
+      saveState(state);
+      return { skipped: true, data: prior.data };
+    }
+    log('prior send was not confirmed in the conversation; retrying it safely');
+    retryingUnconfirmedPrior = true;
   }
   const before = await getConversationProgress(state.session).catch(() => ({}));
   log(`clicking input...`);
@@ -1699,26 +1823,48 @@ async function stageSend(state, opts) {
   }
   await sleep(300);
   const readyWait = uploadFiles.length ? Math.max(10, Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS) : 10;
-  const sendReady = await waitForSendButtonReady(state.session, readyWait);
-  if (!sendReady.ok) {
-    const e = new Error(`send button did not become ready within ${readyWait}s`);
-    e.code = 'send_button_not_ready';
-    e.stageData = sendReady;
+  const attempts = [];
+  let confirmation = null;
+  for (let attempt = 1; attempt <= DEFAULT_SEND_ATTEMPTS; attempt++) {
+    const sendReady = await waitForSendButtonReady(state.session, uploadFiles, readyWait);
+    if (!sendReady.ok) {
+      const e = new Error(sendReady.uploadFailed
+        ? `attachment upload failed${sendReady.uploadFailureText ? `: ${sendReady.uploadFailureText}` : ''}`
+        : `send button did not become ready within ${readyWait}s`);
+      e.code = sendReady.uploadFailed ? 'upload_failed' : 'send_button_not_ready';
+      e.stageData = sendReady;
+      throw e;
+    }
+    log(`clicking send (attempt ${attempt}/${DEFAULT_SEND_ATTEMPTS})...`);
+    const clickResult = unwrap(await cmd('click', { selector: '[data-testid="send-button"]' }, state.session), 'click send');
+    const accepted = await waitForPromptAccepted(state.session, before, prompt);
+    attempts.push({ attempt, clickResult, sendReady, accepted });
+    if (accepted.ok) {
+      confirmation = accepted;
+      break;
+    }
+    log('send click was not accepted by ChatGPT; waiting for readiness and retrying');
+  }
+  if (!confirmation) {
+    const e = new Error(`ChatGPT did not accept the prompt after ${DEFAULT_SEND_ATTEMPTS} send attempts`);
+    e.code = 'send_not_confirmed';
+    e.stageData = { attempts };
     throw e;
   }
-  log('clicking send...');
-  unwrap(await cmd('click', { selector: '[data-testid="send-button"]' }, state.session), 'click send');
   const data = {
     chars: prompt.length,
     mode: opts.continueMode ? 'continue-insert' : 'replace',
     prompt,
-    turn: (state.turns || 0) + 1,
+    turn: retryingUnconfirmedPrior && Number.isFinite(prior.data.turn) ? prior.data.turn : (state.turns || 0) + 1,
     sentAt: Date.now(),
     assistantBefore: Number.isFinite(before.assistantCount) ? before.assistantCount : null,
     userBefore: Number.isFinite(before.userCount) ? before.userCount : null,
     messageBefore: Number.isFinite(before.messageCount) ? before.messageCount : null,
     uploadSignature: uploadSig,
     uploads: uploadFiles,
+    confirmed: true,
+    confirmation,
+    attempts,
   };
   clearStage(state, 'wait');
   clearStage(state, 'extract');
@@ -4135,7 +4281,8 @@ Global flags (can appear before or after the subcommand):
       --upload-selector CSS
                        File input selector (default: ${DEFAULT_UPLOAD_SELECTOR})
       --upload-wait SEC
-                       Seconds to wait for attachment chips (default: ${DEFAULT_UPLOAD_WAIT_SECONDS})
+                       Seconds to wait for attachments to finish processing
+                       (default: ${DEFAULT_UPLOAD_WAIT_SECONDS})
       --image          Image mode for run/latest/wait (alias for the image flow)
       --image-dir DIR  Directory for saved generated images (default: ./${DEFAULT_IMAGE_DIR})
       --file-dir DIR   Directory for files created in ChatGPT (default: ./${DEFAULT_FILE_DIR})
@@ -4496,7 +4643,10 @@ async function main() {
     });
   }
   if (state.model) state.model = normalizeModelName(state.model);
-  if (!state.model || state.model === 'auto') {
+  // Preserve an explicitly requested `--model auto`. This is essential for
+  // single-image editing on UI variants whose advanced model picker is not
+  // exposed to OpenCLI. Unspecified auto still receives the normal default.
+  if (!state.model || (state.model === 'auto' && !opts.modelExplicit)) {
     state.model = DEFAULT_MODEL;
     clearStage(state, 'ensureModel');
   }

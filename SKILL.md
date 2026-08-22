@@ -143,7 +143,7 @@ The tool stage runs after `ensure-model` and before `upload` / `send`. It opens 
 
 ### File upload
 
-Use `--upload <path>` one or more times to attach local files before sending the prompt. The stage runs after `ensure-tool` and before `send`, discovers ChatGPT's general file input, and waits up to `--upload-wait` seconds for every attachment chip. A missing confirmation fails the stage and prevents send.
+Use `--upload <path>` one or more times to attach local files before sending the prompt. The stage runs after `ensure-tool` and before `send`, discovers ChatGPT's general file input, and waits up to `--upload-wait` seconds for every attachment to appear and finish processing. The default is 600 seconds so multiple large files can complete. Pending or failed uploads prevent send, and the send stage requires a new user turn or active generation before it records success.
 
 ```bash
 node ~/.claude/skills/gpt-pro-think/search.js --upload ./brief.pdf --until-complete "Summarize this file."
