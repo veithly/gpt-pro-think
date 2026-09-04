@@ -28,16 +28,17 @@ function loadModelRouting() {
   context.globalThis = context;
   vm.runInNewContext(
     `${withoutMain}\n` +
-      'globalThis.__modelRoutingTest = { DEFAULT_BROWSER_BACKEND, DEFAULT_TOOL, doctorBackendCheck, modelTargetFromInput, modelStateFromLabel, modelStateMatchesTarget, normalizeBrowserBackend, normalizeModelName, normalizeEffort, normalizeToolName };',
+      'globalThis.__modelRoutingTest = { DEFAULT_BROWSER_BACKEND, DEFAULT_MODEL, DEFAULT_TOOL, doctorBackendCheck, modelTargetFromInput, modelStateFromLabel, modelStateMatchesTarget, normalizeBrowserBackend, normalizeModelName, normalizeEffort, normalizeToolName };',
     context,
     { filename: searchPath }
   );
   return context.__modelRoutingTest;
 }
 
-test('defaults thinking targets to the extra-high slider', () => {
+test('defaults normal runs to Pro while 极高 stays extra-high thinking', () => {
   const routing = loadModelRouting();
-  assert.equal(JSON.stringify(routing.modelTargetFromInput(undefined)), JSON.stringify({ model: 'thinking', effort: 'extra-high' }));
+  assert.equal(routing.DEFAULT_MODEL, 'pro');
+  assert.equal(routing.modelTargetFromInput(undefined).model, 'pro');
   assert.equal(JSON.stringify(routing.modelTargetFromInput('极高')), JSON.stringify({ model: 'thinking', effort: 'extra-high' }));
   assert.equal(routing.modelStateMatchesTarget({ model: 'thinking', effort: 'extra-high' }, 'thinking'), true);
   assert.equal(routing.modelStateMatchesTarget({ model: 'thinking', effort: 'high' }, 'thinking'), false);

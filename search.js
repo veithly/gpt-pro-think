@@ -50,10 +50,47 @@ const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 600;
 const DEFAULT_SEND_CONFIRM_SECONDS = 15;
 const DEFAULT_SEND_ATTEMPTS = 3;
+// ChatGPT's send button has shipped builds where [data-testid="send-button"]
+// is gone but the aria-labels remain. Readiness probes and the actual click
+// must therefore resolve the SAME element from this priority list.
+const SEND_BUTTON_SELECTORS = [
+  '[data-testid="send-button"]',
+  'button[aria-label="Send prompt"]',
+  'button[aria-label*="Send"]',
+  'button[aria-label*="发送"]',
+];
+const SEND_BUTTON_SELECTOR_CSS = SEND_BUTTON_SELECTORS.join(', ');
+// The composer input is ProseMirror-based; prefer the stable id/testid anchor
+// over a bare contenteditable so auxiliary hidden editors never win.
+const COMPOSER_INPUT_SELECTORS = [
+  '#prompt-textarea[contenteditable="true"]',
+  '[contenteditable="true"][class*="ProseMirror"]',
+  '[contenteditable="true"]',
+];
+const COMPOSER_INPUT_SELECTOR_CSS = COMPOSER_INPUT_SELECTORS.join(', ');
+const SEND_PICK_JS = `
+  const pickSendButton = () => {
+    for (const sel of ${JSON.stringify(SEND_BUTTON_SELECTORS)}) {
+      const el = document.querySelector(sel);
+      if (el) return { el, selector: sel };
+    }
+    return { el: null, selector: '' };
+  };
+`;
+const COMPOSER_PICK_JS = `
+  const pickComposer = () => {
+    for (const sel of ${JSON.stringify(COMPOSER_INPUT_SELECTORS)}) {
+      const el = document.querySelector(sel);
+      if (el) return { el, selector: sel };
+    }
+    return { el: null, selector: '' };
+  };
+`;
 // A normal run must start in the ChatGPT chat composer. `auto` remains an
 // explicit opt-in to preserving a tool the user selected themselves.
 const DEFAULT_TOOL = 'none';
-const DEFAULT_MODEL = 'thinking';
+// Normal runs target the Pro tier by default; it is never silently downgraded.
+const DEFAULT_MODEL = 'pro';
 const DEFAULT_EFFORT = 'extra-high';
 const DEFAULT_BROWSER_BACKEND = 'opencli';
 const OPENCLI_BIN_CANDIDATES = [
@@ -631,66 +668,95 @@ async function opencliBrowserCommand(session, action, args = {}) {
   return { ok: true, data: result };
 }
 
+function pillLabelMatchesTarget(label, targetState) {
+  const text = String(label || '');
+  if (targetState.model === 'pro') return /\bpro\b/i.test(text);
+  if (targetState.model === 'instant') return /\binstant\b|极速/i.test(text);
+  if (targetState.effort === 'extra-high') return /(extra\s+high|very\s+high|极高|超高)/i.test(text);
+  return new RegExp(targetState.effort, 'i').test(text);
+}
+
+function pillStateForTarget(label, targetState) {
+  if (targetState.model === 'pro') return { model: 'pro', effort: 'pro', label, backend: 'opencli' };
+  if (targetState.model === 'instant') return { model: 'instant', effort: 'instant', label, backend: 'opencli' };
+  return { model: 'thinking', effort: targetState.effort, label, backend: 'opencli' };
+}
+
 async function ensureModelOpencli(session, target, effort = DEFAULT_EFFORT) {
   const targetState = modelTargetFromInput(target, effort);
   if (targetState.model === 'auto') return { ok: true, state: { model: 'unknown', effort: 'unknown' }, changed: false };
-  let result;
   try {
+    // Verify-first: with the picker closed the pill reports the selected tier
+    // ("Pro"), and every switching step below is fragile popover navigation.
+    // Skip it entirely when the composer already agrees with the target.
+    const pillBefore = await runOpencli(['browser', session, 'get', 'text', 'button.__composer-pill'], 'read composer pill').catch(() => null);
+    const pillLabelBefore = String(pillBefore && pillBefore.value || '');
+    if (pillLabelMatchesTarget(pillLabelBefore, targetState)) {
+      return { ok: true, state: pillStateForTarget(pillLabelBefore, targetState), changed: false };
+    }
     const pill = await runOpencli(['browser', session, 'find', '--css', 'button.__composer-pill', '--limit', '3'], 'find composer pill');
     if (!pill || Number(pill.matches_n) !== 1) {
       return { ok: false, changed: false, error: 'ChatGPT composer pill was not uniquely found', code: 'model_switch_failed' };
     }
     await runOpencli(['browser', session, 'click', String(pill.entries[0].ref)], 'open model picker');
-    let advanced = null;
+    // The advanced-options entry is optional, and opencli exits non-zero when
+    // it is absent — any failure here just means the advanced view is shown.
     try {
-      advanced = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Show advanced options', '--limit', '3'], 'find advanced model options');
+      const advanced = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Show advanced options', '--limit', '3'], 'find advanced model options');
+      if (advanced && Number(advanced.matches_n) === 1 && advanced.entries[0].ref) {
+        await runOpencli(['browser', session, 'click', String(advanced.entries[0].ref)], 'open advanced model options');
+        await sleep(500);
+      }
     } catch (e) {
-      if (!/semantic_not_found|matched 0/i.test(`${e.message} ${e.stderr || ''}`)) throw e;
+      log(`ensure-model: advanced options probe skipped (${String(e.message || e).slice(0, 120)})`);
     }
-    if (advanced && Number(advanced.matches_n) === 1 && advanced.entries[0].ref) {
-      await runOpencli(['browser', session, 'click', String(advanced.entries[0].ref)], 'open advanced model options');
-      await sleep(500);
-    }
-    const effortMenu = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--text', 'Effort', '--limit', '3'], 'find effort menu');
+    // The Sept 2026 picker labels the effort control "Power" (tooltip
+    // "Thinking effort") instead of "Effort"; try both spellings.
+    let effortMenu = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--text', 'Effort', '--limit', '3'], 'find effort menu').catch(() => null);
     if (!effortMenu || Number(effortMenu.matches_n) !== 1 || !effortMenu.entries[0].ref) {
-      return { ok: false, changed: false, error: 'ChatGPT Effort menu was not uniquely found', code: 'model_switch_failed' };
+      effortMenu = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Power', '--limit', '3'], 'find power menu').catch(() => null);
     }
-    await runOpencli(['browser', session, 'click', String(effortMenu.entries[0].ref)], 'open effort menu');
-    await sleep(900);
+    if (effortMenu && Number(effortMenu.matches_n) === 1 && effortMenu.entries[0].ref) {
+      await runOpencli(['browser', session, 'click', String(effortMenu.entries[0].ref)], 'open effort menu');
+      await sleep(900);
+    }
     const choices = await runOpencli(['browser', session, 'find', '--role', 'menuitemradio', '--limit', '10'], 'find effort choices');
     const labels = targetState.model === 'pro' ? [/^pro$/i] : targetState.effort === 'extra-high' ? [/extra\s+high/i, /very\s+high/i, /极高|超高/i] : [new RegExp(targetState.effort, 'i')];
-    const choice = (choices.entries || []).find((entry) => labels.some((pattern) => pattern.test(String(entry.text || ''))));
+    let choice = (choices.entries || []).find((entry) => labels.some((pattern) => pattern.test(String(entry.text || ''))));
+    if ((!choice || !choice.ref) && targetState.model === 'pro') {
+      // Sept 2026 picker: tiers live behind the "Select model" entry.
+      const selectModel = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Select model', '--limit', '3'], 'find select model').catch(() => null);
+      if (selectModel && Number(selectModel.matches_n) === 1 && selectModel.entries[0].ref) {
+        await runOpencli(['browser', session, 'click', String(selectModel.entries[0].ref)], 'open select model');
+        await sleep(900);
+        const tierChoices = await runOpencli(['browser', session, 'find', '--role', 'menuitemradio', '--limit', '10'], 'find tier choices').catch(() => null);
+        choice = (tierChoices && tierChoices.entries || []).find((entry) => /\bpro\b/i.test(String(entry.text || '')));
+      }
+    }
     if (!choice || !choice.ref) {
+      await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
       return { ok: false, changed: false, error: `ChatGPT effort option not found for ${targetState.effort}`, code: 'model_switch_failed', choices };
     }
     await runOpencli(['browser', session, 'click', String(choice.ref)], 'select effort choice');
-    await sleep(900);
+    await sleep(600);
+    // Close the picker before verifying: while it is open the pill reads the
+    // "Thinking effort" tooltip instead of the selected tier name.
+    await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
+    await sleep(400);
     const pillAfter = await runOpencli(['browser', session, 'get', 'text', 'button.__composer-pill'], 'verify model pill');
     const pillLabel = String(pillAfter && pillAfter.value || '');
     const selectedText = String(choice.text || '');
-    const expectedLabel = targetState.model === 'pro' ? /\bpro\b/i : targetState.effort === 'extra-high' ? /(extra\s+high|very\s+high|极高|超高)/i : new RegExp(targetState.effort, 'i');
-    const verified = expectedLabel.test(pillLabel) || (targetState.model === 'pro' && /\bpro\b/i.test(selectedText) && /\bpro\b/i.test(pillLabel));
-    await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
-    result = { Status: verified ? 'Success' : 'Failed', Model: pillLabel, selected: selectedText };
+    const verified = targetState.model === 'pro'
+      ? /\bpro\b/i.test(pillLabel)
+      : pillLabelMatchesTarget(pillLabel, targetState) ||
+        (targetState.model === 'pro' && /\bpro\b/i.test(selectedText) && /\bpro\b/i.test(pillLabel));
+    const result = { Status: verified ? 'Success' : 'Failed', Model: pillLabel, selected: selectedText };
     if (!verified) return { ok: false, state: { model: 'unknown', effort: targetState.effort, label: pillLabel, backend: 'opencli', raw: result }, changed: true, error: `ChatGPT effort did not verify target ${targetState.effort}`, code: 'model_switch_failed', result };
+    return { ok: true, state: pillStateForTarget(pillLabel, targetState), changed: true, result };
   } catch (e) {
+    await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
     return { ok: false, changed: false, error: e.message, code: e.code || 'opencli_failed' };
   }
-  const row = result || {};
-  const returnedModel = targetState.model === 'pro' ? { model: 'pro', effort: 'pro' } : { model: 'thinking', effort: targetState.effort };
-  const state = {
-    model: returnedModel.model,
-    effort: targetState.model === 'pro' ? 'pro' : targetState.effort,
-    label: row.Model || row.model || '',
-    backend: 'opencli',
-    raw: result,
-  };
-  return {
-    ok: modelStateMatchesTarget(state, targetState.model, targetState.effort),
-    state,
-    changed: Number(row.slider && row.slider.before) !== Number(row.slider && row.slider.after),
-    result,
-  };
 }
 
 function markStage(state, name, data) {
@@ -882,8 +948,10 @@ async function getConversationProgress(session, imageMinAssistantIndex = null) {
       }).join('|');
       const stopCount = buttons.filter((b) => /stop generating|stop responding|停止生成|停止回答/i.test(attrText(b))).length;
       const copyCount = buttons.filter((b) => /copy|复制/i.test(attrText(b))).length;
-      const sendButton = document.querySelector('[data-testid="send-button"]');
-      const input = document.querySelector('[contenteditable="true"]');
+      ${SEND_PICK_JS}
+      ${COMPOSER_PICK_JS}
+      const sendButton = pickSendButton().el;
+      const input = pickComposer().el;
       const busy =
         stopCount > 0 ||
         !!document.querySelector('[data-testid*="stop"], [aria-label*="Stop generating"], [aria-label*="停止生成"]') ||
@@ -942,7 +1010,7 @@ async function stageLoginCheck(state) {
   }
   const v = await evaluate(
     state.session,
-    `(() => { const ce = document.querySelector('[contenteditable="true"]'); const login = /Log in|Sign in|Continue with/.test(document.body.innerText); return JSON.stringify({ hasInput: !!ce, looksLikeLogin: login }); })()`
+    `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; const login = /Log in|Sign in|Continue with/.test(document.body.innerText); return JSON.stringify({ hasInput: !!ce, looksLikeLogin: login }); })()`
   );
   if (!v) throw new Error('login-check: no evaluation result');
   const data = { state: v.looksLikeLogin && !v.hasInput ? 'login_required' : v.hasInput ? 'logged_in' : 'unknown' };
@@ -1533,6 +1601,12 @@ function sendButtonIsReady(state) {
   );
 }
 
+// Click the exact element that the readiness probe verified, falling back to
+// the combined CSS chain when older state has no precise selector recorded.
+function sendClickSelector(state) {
+  return (state && state.buttonSelector) || SEND_BUTTON_SELECTOR_CSS;
+}
+
 function promptSendWasAccepted(before, after, composerState) {
   const beforeUsers = Number(before && before.userCount);
   const afterUsers = Number(after && after.userCount);
@@ -1583,7 +1657,9 @@ async function inspectComposerUploadState(session, files) {
       const pendingElements = [...form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="loading"]')]
         .filter(visible)
         .map((el) => ({ tag: el.tagName, aria: el.getAttribute('aria-label') || '', text: textOf(el).slice(0, 160) }));
-      const button = document.querySelector('[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label*="Send"], button[aria-label*="发送"]');
+      ${SEND_PICK_JS}
+      const pickedSend = pickSendButton();
+      const button = pickedSend.el;
       const composer = document.querySelector('#prompt-textarea[contenteditable="true"], [contenteditable="true"]');
       return JSON.stringify({
         names,
@@ -1600,6 +1676,7 @@ async function inspectComposerUploadState(session, files) {
         buttonDisabled: button ? !!button.disabled : null,
         buttonAriaDisabled: button ? (button.getAttribute('aria-disabled') || '') : '',
         buttonAria: button ? (button.getAttribute('aria-label') || '') : '',
+        buttonSelector: pickedSend.selector,
         composerText: composer ? textOf(composer).slice(0, 1000) : '',
         formText: formText.slice(-1200)
       });
@@ -1662,7 +1739,8 @@ async function fillComposerPreservingInlineTools(session, prompt) {
   return evaluate(
     session,
     `(() => {
-      const ce = document.querySelector('#prompt-textarea, [contenteditable="true"]');
+      ${COMPOSER_PICK_JS}
+      const ce = pickComposer().el;
       const root = ce && ce.querySelector('p');
       const pills = root ? [...root.querySelectorAll('[data-inline-selection-pill]')] : [];
       if (!ce || !root || !pills.length) return JSON.stringify({ preserved: false, reason: 'inline_tool_pill_not_found' });
@@ -1799,8 +1877,13 @@ async function stageSend(state, opts) {
     retryingUnconfirmedPrior = true;
   }
   const before = await getConversationProgress(state.session).catch(() => ({}));
-  log(`clicking input...`);
-  unwrap(await cmd('click', { selector: '[contenteditable="true"]' }, state.session), 'click input');
+  const composerLoc = await evaluate(
+    state.session,
+    `(() => { ${COMPOSER_PICK_JS} return JSON.stringify({ selector: pickComposer().selector }); })()`
+  ).catch(() => null);
+  const inputSelector = (composerLoc && composerLoc.selector) || COMPOSER_INPUT_SELECTOR_CSS;
+  log(`clicking input (${inputSelector})...`);
+  unwrap(await cmd('click', { selector: inputSelector }, state.session), 'click input');
   await sleep(300);
   if (opts.continueMode) {
     // In continue mode, the input should be empty (previous turn was sent), but
@@ -1808,7 +1891,7 @@ async function stageSend(state, opts) {
     log(`appending ${prompt.length} chars (continue mode)...`);
     const inserted = await evaluate(
       state.session,
-      `(() => { const ce = document.querySelector('[contenteditable="true"]'); if (!ce) return JSON.stringify({err:'no input'}); ce.focus(); const sel = window.getSelection(); const range = document.createRange(); range.selectNodeContents(ce); range.collapse(false); sel.removeAllRanges(); sel.addRange(range); const ok = document.execCommand('insertText', false, ${JSON.stringify(prompt)}); return JSON.stringify({ok, len: ce.innerText.length}); })()`
+      `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return JSON.stringify({err:'no input'}); ce.focus(); const sel = window.getSelection(); const range = document.createRange(); range.selectNodeContents(ce); range.collapse(false); sel.removeAllRanges(); sel.addRange(range); const ok = document.execCommand('insertText', false, ${JSON.stringify(prompt)}); return JSON.stringify({ok, len: ce.innerText.length}); })()`
     );
     if (!inserted || !inserted.ok) throw new Error('send: failed to insert text into contenteditable');
   } else {
@@ -1817,7 +1900,7 @@ async function stageSend(state, opts) {
       log(`filling ${prompt.length} chars while preserving ${preserved.pills} inline tool pill(s)`);
     } else {
       log(`filling ${prompt.length} chars...`);
-      const fillRes = unwrap(await cmd('fill', { selector: '[contenteditable="true"]', value: prompt }, state.session), 'fill');
+      const fillRes = unwrap(await cmd('fill', { selector: inputSelector, value: prompt }, state.session), 'fill');
       if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
     }
   }
@@ -1835,8 +1918,9 @@ async function stageSend(state, opts) {
       e.stageData = sendReady;
       throw e;
     }
-    log(`clicking send (attempt ${attempt}/${DEFAULT_SEND_ATTEMPTS})...`);
-    const clickResult = unwrap(await cmd('click', { selector: '[data-testid="send-button"]' }, state.session), 'click send');
+    const clickSelector = sendClickSelector(sendReady);
+    log(`clicking send (attempt ${attempt}/${DEFAULT_SEND_ATTEMPTS}, ${clickSelector})...`);
+    const clickResult = unwrap(await cmd('click', { selector: clickSelector }, state.session), 'click send');
     const accepted = await waitForPromptAccepted(state.session, before, prompt);
     attempts.push({ attempt, clickResult, sendReady, accepted });
     if (accepted.ok) {
@@ -4240,7 +4324,7 @@ Sub-commands:
   image [prompt...]    Generate image(s) in ChatGPT and save them locally
   open                 Open a ChatGPT tab (or reuse an existing one)
   login-check          Detect whether ChatGPT is logged in
-  ensure-model [tgt]   Verify / switch model. tgt: 极高|pro|high|medium|instant
+  ensure-model [tgt]   Verify / switch model. tgt: pro|极高|high|medium|instant
   ensure-tool [tgt]    Verify / switch ChatGPT tool. tgt: auto|none|deep-research|web-search|create-image
   upload               Upload --upload file(s) into the composer
   send [prompt...]     Fill the input and click send
@@ -4250,7 +4334,7 @@ Sub-commands:
   extract-files        Save files created in the conversation
   latest               Recover this --session, wait for the latest complete reply,
                        save it, print it, and close the tab unless --keep-session
-  doctor               Verify WebBridge, ChatGPT login, and research tool selectors
+  doctor               Verify OpenCLI, ChatGPT login, and research tool selectors
                        (closes the tab on success unless --keep-session)
   status               Print session state and exit
   cleanup              Close the session tab
@@ -4258,8 +4342,8 @@ Sub-commands:
 Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
-  -m, --model NAME     Target model: 极高|pro|high|medium|instant
-                       (default: 极高; image defaults to strict Pro)
+  -m, --model NAME     Target model: pro|极高|high|medium|instant
+                       (default: pro; image defaults to strict Pro)
                        legacy aliases extended/extended-pro also map to pro
       --effort NAME    Thinking slider: medium|high|extra-high (default: extra-high)
       --browser-backend NAME

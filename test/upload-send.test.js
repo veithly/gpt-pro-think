@@ -29,7 +29,7 @@ function loadUploadSendLogic() {
   context.exports = context.module.exports;
   context.globalThis = context;
   vm.runInNewContext(
-    `${source}\nglobalThis.__uploadSendTest = { attachmentsAreReady, expectedFileNameCounts, promptSendWasAccepted, sendButtonIsReady };`,
+    `${source}\nglobalThis.__uploadSendTest = { attachmentsAreReady, expectedFileNameCounts, promptSendWasAccepted, sendButtonIsReady, sendClickSelector };`,
     context,
     { filename: searchPath }
   );
@@ -83,4 +83,16 @@ test('marks send complete only after a user turn appears or generation starts wi
   assert.equal(logic.promptSendWasAccepted(before, { userCount: 2, messageCount: 4, busy: false }, { composerText: 'still here' }), false);
   assert.equal(logic.promptSendWasAccepted(before, { userCount: 3, messageCount: 5, busy: false }, { composerText: '' }), true);
   assert.equal(logic.promptSendWasAccepted(before, { userCount: 2, messageCount: 4, busy: true }, { composerText: '' }), true);
+});
+
+test('clicks the exact send element verified by readiness and keeps an aria fallback chain', () => {
+  const logic = loadUploadSendLogic();
+  assert.equal(
+    logic.sendClickSelector({ buttonFound: true, buttonSelector: 'button[aria-label="Send prompt"]' }),
+    'button[aria-label="Send prompt"]'
+  );
+  const fallback = logic.sendClickSelector({});
+  assert.equal(fallback.split(',')[0].trim(), '[data-testid="send-button"]');
+  assert.ok(fallback.includes('button[aria-label*="Send"]'));
+  assert.ok(fallback.includes('button[aria-label*="发送"]'));
 });

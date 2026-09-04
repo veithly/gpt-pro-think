@@ -6,7 +6,7 @@ Drive [ChatGPT Pro](https://chatgpt.com) with deep reasoning through your real b
 
 - **No API key needed.** Uses your real ChatGPT Pro subscription through a local browser daemon.
 - **OpenCLI browser control.** Browser actions use OpenCLI by default, with the existing WebBridge path available through `--browser-backend webbridge`.
-- **High-effort by default.** Normal runs select the `极高` / `very-high` thinking slider by default. Use `--model pro` for the separate Pro tier; Pro selection is verified and never silently downgraded.
+- **Pro by default.** Normal runs select the Pro tier by default; Pro selection is verified and never silently downgraded. Use `--model 极高` (or `--model thinking --effort extra-high`) for the high thinking slider instead.
 - **Deep research / Web search.** `--deep-research` / `--deep-search` selects ChatGPT's Deep research tool; `--web-search` selects the lighter Web search tool.
 - **Agent-safe research command.** `research "..."` hides the Deep research plan/iframe/export details and returns the final report.
 - **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
@@ -35,7 +35,7 @@ cd gpt-pro-think
 ## Quick start
 
 ```bash
-# Run a deep prompt
+# Run a deep prompt (defaults to the Pro tier)
 ./search.js --until-complete "Analyze the tradeoffs of this architecture and recommend next steps."
 ./search.js --model pro --until-complete "Use the Pro tier for this analysis."
 ./search.js --model 极高 --until-complete "Use the highest thinking slider setting."
@@ -118,9 +118,8 @@ To use ChatGPT's composer tools, pass `--deep-research`, `--deep-search`, `--web
 
 Model routing:
 
-- Default: `thinking + extra-high` (`极高` / `very-high`).
-- `--model pro`: the independent Pro tier. A failed or ambiguous selection stops the run with `model_switch_failed`.
-- `--effort medium|high|extra-high`: selects the thinking slider when `--model thinking` or a Chinese effort label is used.
+- Default: `pro` (the independent Pro tier; a failed or ambiguous selection stops the run with `model_switch_failed` and is never silently downgraded).
+- `--model 极高` / `--model thinking`: the thinking slider path; `--effort medium|high|extra-high` selects the slider position.
 - `--browser-backend webbridge`: compatibility path for installations that still require Kimi WebBridge.
 
 ```bash

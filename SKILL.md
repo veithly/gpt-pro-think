@@ -30,10 +30,10 @@ When using this skill from an agent, run the CLI in a long-lived shell command a
 ## Quick start
 
 ```bash
-# All-in-one: send a prompt, wait, save the response (defaults to 极高)
+# All-in-one: send a prompt, wait, save the response (defaults to Pro)
 node ~/.claude/skills/gpt-pro-think/search.js --until-complete "Your prompt"
 
-# Use the separate Pro tier; it is never silently downgraded
+# Use the separate Pro tier explicitly; it is never silently downgraded
 node ~/.claude/skills/gpt-pro-think/search.js --model pro --until-complete "Your prompt"
 
 # Select a different thinking slider position explicitly
@@ -93,7 +93,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 |---|---|---|---|
 | `open` | Open a ChatGPT tab in a session; reuse if one already exists | ✓ | skipped if done |
 | `login-check` | Detect whether ChatGPT is logged in | ✓ | skipped if done |
-| `ensure-model` | Verify / switch the thinking slider (default: `极高`; `pro` is independent) | ✓ | skipped if done |
+| `ensure-model` | Verify / switch the model (default: `pro`; use `极高` for the thinking slider) | ✓ | skipped if done |
 | `ensure-tool` | Verify / switch the ChatGPT composer tool (`deep-research`, `web-search`, `create-image`, or `none`) | ✓ | skipped if same tool is active |
 | `upload` | Attach `--upload` file(s) to the composer before sending | ✓ | skipped if same files + same prompt |
 | `send` | Fill the input with the prompt and click send | ✓ | re-sent if prompt changed |

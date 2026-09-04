@@ -7,11 +7,11 @@ Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) verified July 2026
 | Element | Stable selector | ARIA role | Visible name / value |
 |---|---|---|---|
 | Chat input | `[contenteditable="true"][class*="ProseMirror"]` (preferred) — fall back to `[contenteditable="true"]` | textbox | "Chat with ChatGPT" |
-| Model / intelligence pill | `button.__composer-pill` | button | current mode label: `中` / `高` / `极高` / `Pro` / `极速 5.5` (English builds use `Medium` / `High` / `Very High` / `Pro` / `Instant`) |
+| Model / intelligence pill | `button.__composer-pill` | button | With the picker CLOSED this reads the selected tier: `Pro` / `极速 5.5` / `极高` …; while the picker is OPEN it reads the `Thinking effort` tooltip instead — always verify the pill with the popover closed |
 | Intelligence picker content | `[data-testid="composer-intelligence-picker-content"]` (preferred) | — | visible picker root under the model pill |
 | Popover item | `[role="menuitemradio"]` | menuitemradio | `极速 5.5` / `中` / `高` / `极高` / `Pro` (English builds use `Instant` / `Medium` / `High` / `Very High` / `Pro`); current = `aria-checked="true"` |
 | Popover header | picker text root | — | `智能` / `Intelligence` |
-| Send button | `[data-testid="send-button"]` | button | "Send prompt" |
+| Send button | `[data-testid="send-button"]` — readiness and click resolve the same element from the priority chain `[data-testid="send-button"]`, `button[aria-label="Send prompt"]`, `button[aria-label*="Send"]`, `button[aria-label*="发送"]` (some builds drop the testid) | button | "Send prompt" |
 | Stop generating | `button[aria-label="Stop generating"]` | button | "Stop generating" |
 | Profile badge | `button[aria-label*="open profile menu"]` | button | `"{username} Pro"` |
 | Assistant message | `[data-message-author-role="assistant"]` | — | last child = most recent reply |
@@ -39,6 +39,16 @@ for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
 ```
 
 The popover renders inside the page (not a separate portal root in current ChatGPT builds). The most stable inner root in the current UI is `[data-testid="composer-intelligence-picker-content"]`; the surrounding Radix container still exposes `[role=menu]`.
+
+### Sept 2026 picker structure
+
+Clicking the pill opens a popover containing:
+
+- a `menuitem` with `aria-label="Select model"` whose visible text is the current tier (e.g. `Pro`)
+- a `menuitem` with `aria-label="Power"` (class `__menu-item`, tooltip `Thinking effort`) — the effort slider, replacing the old `Effort` entry
+- `menuitemradio` entries for the chat models (e.g. `GPT-5.6 Sol`, `GPT-5.5`), current one `aria-checked="true"`
+
+`ensure-model` therefore verifies the closed-state pill first and only walks this popover when a switch is actually needed. Note that `opencli find ... --name "Show advanced options"` exits non-zero with an empty stderr when the entry is absent — optional probes must tolerate any error, not just `semantic_not_found` envelopes.
 
 ## Composer tools menu
 
