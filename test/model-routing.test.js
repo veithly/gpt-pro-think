@@ -28,44 +28,69 @@ function loadModelRouting() {
   context.globalThis = context;
   vm.runInNewContext(
     `${withoutMain}\n` +
-      'globalThis.__modelRoutingTest = { DEFAULT_BROWSER_BACKEND, DEFAULT_MODEL, DEFAULT_TOOL, doctorBackendCheck, modelTargetFromInput, modelStateFromLabel, modelStateMatchesTarget, normalizeBrowserBackend, normalizeModelName, normalizeEffort, normalizeToolName };',
+      'globalThis.__modelRoutingTest = { DEFAULT_BROWSER_BACKEND, DEFAULT_MODEL, DEFAULT_TOOL, doctorBackendCheck, imageCountFromOpts, labelShowsPro, modelTargetFromInput, modelStateFromLabel, modelStateMatchesTarget, normalizeBrowserBackend, normalizeModelName, normalizeEffort, normalizeToolName };',
     context,
     { filename: searchPath }
   );
   return context.__modelRoutingTest;
 }
 
-test('defaults normal runs to Pro while 极高 stays extra-high thinking', () => {
+test('defaults normal runs to GPT-6 Pro while 极高 stays extra-high thinking', () => {
   const routing = loadModelRouting();
-  assert.equal(routing.DEFAULT_MODEL, 'pro');
-  assert.equal(routing.modelTargetFromInput(undefined).model, 'pro');
+  assert.equal(routing.DEFAULT_MODEL, 'gpt-6-pro');
+  assert.equal(routing.modelTargetFromInput(undefined).model, 'gpt-6-pro');
   assert.equal(JSON.stringify(routing.modelTargetFromInput('极高')), JSON.stringify({ model: 'thinking', effort: 'extra-high' }));
   assert.equal(routing.modelStateMatchesTarget({ model: 'thinking', effort: 'extra-high' }, 'thinking'), true);
   assert.equal(routing.modelStateMatchesTarget({ model: 'thinking', effort: 'high' }, 'thinking'), false);
 });
 
-test('keeps Pro independent from thinking effort', () => {
+test('maps Pro aliases onto the GPT-6 Pro canonical target', () => {
   const routing = loadModelRouting();
-  assert.equal(JSON.stringify(routing.modelTargetFromInput('pro')), JSON.stringify({ model: 'pro', effort: 'extra-high' }));
-  assert.equal(JSON.stringify(routing.modelStateFromLabel('Pro')), JSON.stringify({ model: 'pro', effort: 'pro', label: 'Pro' }));
-  assert.equal(routing.modelStateMatchesTarget({ model: 'pro', effort: 'pro' }, 'pro'), true);
+  assert.equal(JSON.stringify(routing.modelTargetFromInput('pro')), JSON.stringify({ model: 'gpt-6-pro', effort: 'extra-high' }));
+  assert.equal(routing.normalizeModelName('6pro'), 'gpt-6-pro');
+  assert.equal(routing.normalizeModelName('gpt-6-pro'), 'gpt-6-pro');
+  assert.equal(JSON.stringify(routing.modelStateFromLabel('6Pro')), JSON.stringify({ model: 'gpt-6-pro', effort: 'pro', label: '6Pro' }));
+  assert.equal(routing.modelStateMatchesTarget({ model: 'gpt-6-pro', effort: 'pro' }, 'pro'), true);
   assert.equal(routing.modelStateMatchesTarget({ model: 'thinking', effort: 'extra-high' }, 'pro'), false);
 });
 
-test('recognizes current ChatGPT very-high and Chinese labels', () => {
+test('accepts the 6Pro pill without matching arbitrary pro-suffixed labels', () => {
+  const routing = loadModelRouting();
+  assert.equal(routing.labelShowsPro('6Pro'), true);
+  assert.equal(routing.labelShowsPro('Pro'), true);
+  assert.equal(routing.labelShowsPro('GPT-6 Pro'), true);
+  assert.equal(routing.labelShowsPro('notpro'), false);
+  assert.equal(routing.labelShowsPro('apro'), false);
+});
+
+test('clamps image counts to the hard 1-10 batch range', () => {
+  const routing = loadModelRouting();
+  assert.equal(routing.imageCountFromOpts({ imageCount: 3 }), 3);
+  assert.equal(routing.imageCountFromOpts({ imageCount: 10 }), 10);
+  assert.equal(routing.imageCountFromOpts({ imageCount: 99 }), 10);
+  assert.equal(routing.imageCountFromOpts({ imageCount: 0 }), 1);
+  assert.equal(routing.imageCountFromOpts({ imageCount: -5 }), 1);
+  assert.equal(routing.imageCountFromOpts({}), 1);
+  assert.equal(routing.imageCountFromOpts({ imageCount: Number.NaN }), 1);
+});
+
+test('recognizes current ChatGPT very-high, xhigh, and Chinese labels', () => {
   const routing = loadModelRouting();
   assert.equal(routing.modelStateFromLabel('Very High').effort, 'extra-high');
   assert.equal(routing.modelStateFromLabel('超高').effort, 'extra-high');
-  assert.equal(routing.normalizeModelName('extended-pro'), 'pro');
+  assert.equal(routing.normalizeModelName('extended-pro'), 'gpt-6-pro');
   assert.equal(routing.normalizeEffort('极高'), 'extra-high');
+  assert.equal(routing.normalizeEffort('xhigh'), 'extra-high');
+  assert.equal(routing.normalizeEffort('x-high'), 'extra-high');
 });
 
-test('defaults to OpenCLI and clears work modes for normal runs', () => {
+test('defaults to auto backend resolution and clears work modes for normal runs', () => {
   const routing = loadModelRouting();
-  assert.equal(routing.DEFAULT_BROWSER_BACKEND, 'opencli');
+  assert.equal(routing.DEFAULT_BROWSER_BACKEND, 'auto');
   assert.equal(routing.DEFAULT_TOOL, 'none');
   assert.equal(routing.normalizeBrowserBackend('kimi'), 'webbridge');
-  assert.equal(routing.normalizeBrowserBackend(), 'opencli');
+  assert.equal(routing.normalizeBrowserBackend(), 'auto');
+  assert.equal(routing.normalizeBrowserBackend('ego'), 'ego');
   assert.equal(routing.normalizeToolName(), 'none');
   assert.equal(routing.normalizeToolName('auto'), 'auto');
 });

@@ -1,12 +1,22 @@
 ---
 name: gpt-pro-think
 description: |
-  Send deep-reasoning prompts to ChatGPT through OpenCLI's real browser session and collect text responses, generated image files, or files created in the conversation. Kimi WebBridge remains available as an explicit compatibility backend. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro", "deep research with GPT".
+  Send deep-reasoning prompts to ChatGPT through the user's real browser session and collect text responses, generated image files, or files created in the conversation. Browser backends resolve automatically per environment: ego-browser (ego lite) first, then OpenCLI, then Kimi WebBridge. Use when you need external LLM brainstorming, expert analysis, cross-model validation, ChatGPT Deep research / Web search, image generation through ChatGPT's web UI, or deep research that benefits from GPT Pro's extended reasoning. Triggers: "ask GPT Pro", "use ChatGPT Pro", "GPT Pro think", "让 GPT Pro 想想", "问下 GPT", "consult GPT Pro", "deep research with GPT".
 ---
 
 # GPT Pro Think
 
 Run a prompt on ChatGPT Pro through the user's real browser and bring the response back. The default entry point is `search.js` in this directory. When the script can't proceed on its own, it stops at a well-defined point and tells you exactly what to do next.
+
+## Browser backends
+
+`--browser-backend auto` is the default and resolves to the first backend present in the environment, in this order:
+
+1. **ego** — ego-browser (ego lite). Each session maps to an ego task space named `gpt-pro-think <session>`, so runs reuse the user's ChatGPT login in an isolated space. Actions run as one-shot `ego-browser nodejs` programs; the tools menu, model picker, and Power slider are driven with real clicks. If the user takes over the task space, actions fail with `user_controlling` (exit 4) — surface it and wait, like an OpenCLI exit 4.
+2. **opencli** — the previous default; unchanged behavior.
+3. **webbridge** — Kimi WebBridge daemon, compatibility only.
+
+An explicit `--browser-backend ego|opencli|webbridge` overrides resolution and migrates the session (clearing browser stages). An existing session keeps the backend stored in its state file unless you pass the flag, so `--resume` is stable. `EGO_BROWSER_BIN` overrides the ego binary path.
 
 ## Agent contract
 
@@ -18,23 +28,24 @@ When using this skill from an agent, run the CLI in a long-lived shell command a
 - Patience budget is mandatory: allow at least **30 minutes** for a normal GPT Pro Think response and at least **50 minutes** for ChatGPT Deep research before suspecting the run is stuck.
 - Ten minutes with no stdout is normal. Do **not** assume the run is broken, open a new ChatGPT page, start a fresh browser research, or re-send the prompt just because nothing has printed for 10 minutes.
 - For ChatGPT Deep research, prefer `research "..."`; it implies `--deep-research --until-complete` and waits for the exported report.
-- Before delegating research to another agent, run `doctor` once to verify OpenCLI, ChatGPT login, and Deep research tool availability.
-- The CLI verifies the OpenCLI Browser Bridge before opening ChatGPT. Do not switch to Kimi WebBridge unless `--browser-backend webbridge` was explicitly requested.
+- Before delegating research to another agent, run `doctor` once to verify the resolved backend, ChatGPT login, and Deep research tool availability.
+- The CLI verifies the active backend before opening ChatGPT. Do not switch backends unless `--browser-backend` was explicitly requested.
 - If the shell tool yields while the process is still running, keep the process/session alive and poll it again. The CLI writes wait progress to the session state file.
 - Use `node ... search.js -s <session> status` from another shell to inspect `active.stage`, `active.status`, `active.elapsed`, and `active.need` while a wait is in progress.
 - If a non-hanging run exits `3`, immediately re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; do not ask the user to manually re-run.
 - Only answer the user after exit `0` with extracted text/image paths, or exit `4` when the browser genuinely needs human intervention.
 - Treat ChatGPT tabs as disposable. Full `run` / `research` / `image`, `latest`, `doctor`, and `--dry-run` close their tab on success by default. Use `--keep-session` only when another immediate step needs the same open tab.
-- If you opened a tab with staged sub-commands (`open`, `send`, `wait`, `extract`, etc.) or decide to abandon a named session, run `node ... search.js -s <session> cleanup` as soon as no later turn needs that tab. This closes the browser tab but keeps the state file for recovery unless `--cleanup-state` is passed.
+- If you opened a tab with staged sub-commands (`open`, `send`, `wait`, `extract`, etc.) or decide to abandon a named session, run `node ... search.js -s <session> cleanup` as soon as no later turn needs that tab. This closes the browser tab (and the ego task space, on the ego backend) but keeps the state file for recovery unless `--cleanup-state` is passed.
+- Staged sub-commands that need a page (`ensure-model`, `send`, `upload`, `wait`, `extract`) require a prior `open` (or a full `run`) in the same session — `open` creates the session tab or ego task space.
 
 ## Quick start
 
 ```bash
-# All-in-one: send a prompt, wait, save the response (defaults to Pro)
+# All-in-one: send a prompt, wait, save the response (defaults to GPT-6 Pro)
 node ~/.claude/skills/gpt-pro-think/search.js --until-complete "Your prompt"
 
-# Use the separate Pro tier explicitly; it is never silently downgraded
-node ~/.claude/skills/gpt-pro-think/search.js --model pro --until-complete "Your prompt"
+# Use the GPT-6 Pro tier explicitly; it is never silently downgraded
+node ~/.claude/skills/gpt-pro-think/search.js --model gpt-6-pro --until-complete "Your prompt"
 
 # Select a different thinking slider position explicitly
 node ~/.claude/skills/gpt-pro-think/search.js --model high --until-complete "Your prompt"
@@ -58,7 +69,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --resume --until-complete
 node ~/.claude/skills/gpt-pro-think/search.js -s my-thread latest --until-complete
 
 # Generate image(s) in ChatGPT and save them into the current project
-# Image mode defaults to strict Pro; add --allow-image-model-fallback only when Instant fallback is acceptable.
+# Image mode defaults to strict GPT-6 Pro with Power=xhigh; add --allow-image-model-fallback only when Instant fallback is acceptable.
 node ~/.claude/skills/gpt-pro-think/search.js image --until-complete "Create a square watercolor icon of a tiny robot reading." --image-dir ./assets/generated
 
 # Upload local file(s) into ChatGPT before sending a prompt
@@ -93,7 +104,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 |---|---|---|---|
 | `open` | Open a ChatGPT tab in a session; reuse if one already exists | ✓ | skipped if done |
 | `login-check` | Detect whether ChatGPT is logged in | ✓ | skipped if done |
-| `ensure-model` | Verify / switch the model (default: `pro`; use `极高` for the thinking slider) | ✓ | skipped if done |
+| `ensure-model` | Verify / switch the model (default: `gpt-6-pro`; use `极高` for the thinking slider) | ✓ | skipped if done |
 | `ensure-tool` | Verify / switch the ChatGPT composer tool (`deep-research`, `web-search`, `create-image`, or `none`) | ✓ | skipped if same tool is active |
 | `upload` | Attach `--upload` file(s) to the composer before sending | ✓ | skipped if same files + same prompt |
 | `send` | Fill the input with the prompt and click send | ✓ | re-sent if prompt changed |
@@ -107,7 +118,7 @@ node ~/.claude/skills/gpt-pro-think/search.js --help
 | `cleanup` | Close the session | — | n/a |
 | `run` (default) | All of the above in order | — | — |
 | `research` | Agent-safe Deep research run: tool select, plan confirm, wait, export, extract | — | — |
-| `doctor` | Verify browser/WebBridge/login/tool selectors before a research run | — | n/a |
+| `doctor` | Verify the resolved backend (ego/opencli/webbridge), ChatGPT login, and research tool selectors | — | n/a |
 
 `--resume` reads the per-session state file and skips stages already marked `done`; stages with an unmet precondition are re-run. See [references/script-architecture.md](references/script-architecture.md) for the state schema.
 
@@ -153,13 +164,13 @@ node ~/.claude/skills/gpt-pro-think/search.js -s file-thread --resume --until-co
 
 For a failed upload run, re-run with `--resume`; the state file retains the normalized absolute upload paths. For a new non-resume prompt, uploads are not carried over unless `--upload` is passed again.
 
-If upload fails with `upload_not_allowed` or `upload_unverified`, check `opencli doctor`, keep the ChatGPT tab open, then re-run with `--resume`. The OpenCLI Browser Bridge must be connected and able to attach the supplied local paths.
+If upload fails with `upload_not_allowed` or `upload_unverified`, check the active backend's connectivity (`node search.js --status`), keep the ChatGPT tab open, then re-run with `--resume`. On the ego backend the native file transport has no eval size limit; on OpenCLI the Browser Bridge must be connected and able to attach the supplied local paths.
 
 ### Image generation
 
-Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to strict Pro (`--model pro`). If Pro cannot be selected, the command fails instead of silently using Instant; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. The old `--model extended` spelling remains an alias for `pro`. You can still pass `--model think` / `--model thinking` or `--model instant` explicitly for a single fallback-style image run.
+Use `image` (or `--image` with `run` / `latest`) when the prompt asks ChatGPT's web UI to create images. A full image run defaults to strict GPT-6 Pro (`--model gpt-6-pro`) with the Power slider set to Extra High (`xhigh`) and the Create image tool selected automatically. If GPT-6 Pro cannot be selected, the command fails instead of silently using Instant; add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. The old `--model extended` / `--model pro` spellings remain aliases for `gpt-6-pro`. You can still pass `--model think` / `--model thinking` or `--model instant` explicitly for a single fallback-style image run.
 
-Pro can return about 10 separate generated images from one prompt. For `--image-count N`, the script treats `N` as the number of images to wait for and save from the same ChatGPT response (cap: 10). Always include the same count in the prompt text, for example "Create exactly 6 separate square images...". If `--allow-image-model-fallback` is used and Pro is unavailable, the script falls back to Instant and limits the run to 1 image.
+As the agent, YOU adjust the prompt to control how many images come back — one GPT-6 Pro prompt can return up to 10 separate images. Put the count in the prompt text yourself, e.g. "Create exactly 6 separate square sticker designs as individual images, not a collage." The run completes when generation stops and the script downloads EVERY generated image from that response. `--image-count N` (optional, up to 10) only makes the wait stage hold out for exactly N images. If `--allow-image-model-fallback` is used and Pro is unavailable, the script falls back to Instant and limits the run to 1 image.
 
 Generated files are written to `--image-dir` (default `./gpt-pro-images`) using `--image-prefix` or `gpt-image-<createdAt>`. For multi-image runs, saved files use numbered suffixes and the manifest records file paths, dimensions, byte sizes, source session, requested image count, required image count, and any failed downloads.
 
@@ -224,7 +235,7 @@ node ~/.claude/skills/gpt-pro-think/search.js -s my-thread status
 | `3` | Timeout during `wait` | Re-run with `--resume --until-complete` or `-s <session> latest --until-complete`; `wait` is not marked done on timeout |
 | `4` | **Human intervention required** | Read the message + see [references/intervention-points.md](references/intervention-points.md) |
 
-Exit `4` is the key contract: the script stops at a well-defined point, prints exactly which stage failed and why, and waits for the Agent (or user) to fix it in the browser before resuming.
+Exit `4` is the key contract: the script stops at a well-defined point, prints exactly which stage failed and why, and waits for the Agent (or user) to fix it in the browser before resuming. On the ego backend a `user_controlling` error (the user took over the task space) also exits `4`: ask the user, and resume only after they hand control back or say continue.
 
 ## When to use
 
@@ -241,6 +252,7 @@ Exit `4` is the key contract: the script stops at a well-defined point, prints e
 ## References
 
 - [references/intervention-points.md](references/intervention-points.md) — **read this when exit code is 4** (login, captcha, model switch, rate limit, lost focus)
+- [references/ego-backend.md](references/ego-backend.md) — ego-browser backend architecture, runtime quirks, and troubleshooting
 - [references/script-architecture.md](references/script-architecture.md) — state file schema, sub-command lifecycle, resume semantics
 - [references/dom-selectors.md](references/dom-selectors.md) — stable CSS / ARIA selectors, popover pointer-event sequence, quoting gotchas
 - [references/image-generation.md](references/image-generation.md) — image generation, transparent cutout workflow, and local post-processing

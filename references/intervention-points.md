@@ -78,7 +78,7 @@ After you fix the issue, re-run with `--resume --until-complete` and the script 
 1. Confirm every `--upload` path exists and is a regular file.
 2. If paths are correct, inspect the current DOM for `input[type="file"]`.
 3. Re-run with a selector override if needed: `--upload-selector 'input#upload-files[type="file"]'`.
-4. If the error is `upload_not_allowed`, enable **Allow access to file URLs** / **允许访问文件网址** in the Kimi WebBridge extension details page, then verify `~/.kimi-webbridge/bin/kimi-webbridge status` is connected.
+4. If the error is `upload_not_allowed`, enable **Allow access to file URLs** / **允许访问文件网址** in the Kimi WebBridge extension details page, then verify `~/.kimi-webbridge/bin/kimi-webbridge status` is connected. On the ego backend, confirm the ego lite browser service is running (`ego-browser --version`); its native file transport has no eval size limit, so `upload_not_allowed` there means the runtime could not attach the file.
 5. If the error is `send_button_not_ready`, wait for the attachment preview to finish in ChatGPT or increase `--upload-wait`, then re-run with `--resume --until-complete`. The default is 600 seconds for multiple large files.
 6. If the error is `send_not_confirmed`, the button accepted click events but ChatGPT did not create a user turn. Inspect the composer for a pending/failed upload or transient page error, then resume; the prompt is retained and will be retried.
 7. Re-run with `--resume --until-complete`; upload paths are retained in state.
@@ -164,11 +164,21 @@ After you fix the issue, re-run with `--resume --until-complete` and the script 
 
 ---
 
+## 14. ego backend — `user_controlling` (task space taken over)
+
+**Stage:** any
+**Cause:** on the ego-browser backend, the user took over the session's task space from the ego lite GUI (equivalent to `handOffTaskSpace`).
+
+**Fix:** Treat it like any other exit 4: tell the user what the run was doing and wait. Resume only after the user hands the space back or explicitly says continue, then `search.js -s <session> --resume --until-complete`. Never retry actions while the user holds control — every browser operation fails until they release it.
+
+---
+
 ## Quick reference table
 
 | Exit 4 reason | Stage | Re-run command |
 |---|---|---|
 | `No current window` | open | `search.js open --resume` |
+| `user_controlling` (ego) | any | user releases the task space → `search.js --resume --until-complete` |
 | `login_required` (initial) | login-check | user logs in → `search.js --resume --until-complete` |
 | `could not switch to <model>` | ensure-model | user switches manually → `search.js --resume --until-complete` |
 | `tool_switch_failed` | ensure-tool | user selects tool manually → `search.js --resume --until-complete` |

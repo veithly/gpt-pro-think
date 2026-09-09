@@ -96,3 +96,41 @@ test('clicks the exact send element verified by readiness and keeps an aria fall
   assert.ok(fallback.includes('button[aria-label*="Send"]'));
   assert.ok(fallback.includes('button[aria-label*="发送"]'));
 });
+
+test('send gate requires removable attachment chips when files are expected', () => {
+  const logic = loadUploadSendLogic();
+  const base = {
+    buttonFound: true,
+    buttonVisible: true,
+    buttonDisabled: false,
+    buttonAriaDisabled: '',
+    uploadPending: false,
+    uploadFailed: false,
+  };
+  const expected = { 'report.pdf': 1 };
+  // input.files alone (observedNameCounts empty) must NOT unlock sending.
+  assert.equal(logic.sendButtonIsReady({ ...base, inputNameCounts: { 'report.pdf': 1 } }, expected), false);
+  assert.equal(logic.sendButtonIsReady({ ...base, observedNameCounts: { 'report.pdf': 1 } }, expected), true);
+  // Without uploads the button state alone decides.
+  assert.equal(logic.sendButtonIsReady(base, {}), true);
+});
+
+test('a turn with expected files only counts as sent when the user turn carries them', () => {
+  const logic = loadUploadSendLogic();
+  const before = { userCount: 2, messageCount: 4 };
+  const after = { userCount: 3, messageCount: 5, busy: false, lastUserAttachments: ['Remove file 1: brief.pdf', 'brief.pdf'] };
+  const composer = { composerText: '' };
+  assert.equal(logic.promptSendWasAccepted(before, after, composer, ['brief.pdf']), true);
+  // The turn advanced but carries no attachment evidence: NOT accepted.
+  assert.equal(
+    logic.promptSendWasAccepted(
+      before,
+      { userCount: 3, messageCount: 5, busy: false, lastUserAttachments: ['How can I help?'] },
+      composer,
+      ['brief.pdf']
+    ),
+    false
+  );
+  // Without uploads there is no attachment requirement.
+  assert.equal(logic.promptSendWasAccepted(before, { userCount: 3, messageCount: 5, busy: false }, composer), true);
+});

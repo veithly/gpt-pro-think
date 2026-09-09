@@ -1,12 +1,12 @@
 # GPT Pro Think
 
-Drive [ChatGPT Pro](https://chatgpt.com) with deep reasoning through your real browser, and bring the response back into any agent or terminal session. Built on [OpenCLI](https://github.com/jackwener/OpenCLI), so it uses your existing ChatGPT login — no API key, no separate auth.
+Drive [ChatGPT Pro](https://chatgpt.com) with deep reasoning through your real browser, and bring the response back into any agent or terminal session. Uses your existing ChatGPT login — no API key, no separate auth. Browser control resolves automatically per environment: **ego-browser (ego lite) first, then [OpenCLI](https://github.com/jackwener/OpenCLI), then Kimi WebBridge**.
 
 ## Why
 
-- **No API key needed.** Uses your real ChatGPT Pro subscription through a local browser daemon.
-- **OpenCLI browser control.** Browser actions use OpenCLI by default, with the existing WebBridge path available through `--browser-backend webbridge`.
-- **Pro by default.** Normal runs select the Pro tier by default; Pro selection is verified and never silently downgraded. Use `--model 极高` (or `--model thinking --effort extra-high`) for the high thinking slider instead.
+- **No API key needed.** Uses your real ChatGPT Pro subscription through a local browser runtime.
+- **ego-browser / OpenCLI / WebBridge control.** `--browser-backend auto` (default) picks the best backend installed: ego lite first (isolated task spaces, real clicks, native file upload), then OpenCLI, then the legacy WebBridge daemon.
+- **GPT-6 Pro by default.** Normal runs select the GPT-6 Pro tier (`6Pro`) by default; selection is verified and never silently downgraded. Use `--model 极高` (or `--model thinking --effort extra-high`) for the high thinking slider instead.
 - **Deep research / Web search.** `--deep-research` / `--deep-search` selects ChatGPT's Deep research tool; `--web-search` selects the lighter Web search tool.
 - **Agent-safe research command.** `research "..."` hides the Deep research plan/iframe/export details and returns the final report.
 - **Resumable.** The text pipeline (`open` → `login-check` → `ensure-model` → `ensure-tool` → `upload` → `send` → `wait` → `extract`) writes progress to disk; image mode swaps in `extract-images`. If anything fails, re-run with `--resume` and pick up where you left off.
@@ -22,9 +22,11 @@ Drive [ChatGPT Pro](https://chatgpt.com) with deep reasoning through your real b
 
 Prerequisites:
 - Node.js ≥ 18 (zero npm dependencies; uses only built-ins)
-- [OpenCLI](https://github.com/jackwener/OpenCLI) installed; `opencli doctor` must report a connected Browser Bridge
-- A Chrome/Edge window open with the OpenCLI extension connected
-- ChatGPT Pro account, logged in
+- One browser backend, checked in this order by `--browser-backend auto`:
+  - [ego-browser (ego lite)](https://github.com/egocortex/ego) installed (`ego-browser onboarding` to set up; ChatGPT must be logged in inside ego lite)
+  - or [OpenCLI](https://github.com/jackwener/OpenCLI) with a connected Browser Bridge and a Chrome/Edge window open
+  - or the Kimi WebBridge daemon (compatibility)
+- ChatGPT Pro account, logged in (in ego lite or Chrome/Edge)
 
 ```bash
 git clone https://github.com/veithly/gpt-pro-think
@@ -106,9 +108,9 @@ The script runs as a state machine. `run` (the default) executes every stage; ea
 | `cleanup` | Close the session tab | — |
 | `run` (default) | All of the above | — |
 | `research` / `deep-search` | Agent-safe Deep research run; waits for exported report | — |
-| `doctor` | Verify OpenCLI, ChatGPT login, and research tool selectors | — |
+| `doctor` | Verify the resolved browser backend (ego/opencli), ChatGPT login, and research tool selectors | — |
 
-Before any command talks to ChatGPT, it verifies the OpenCLI Browser Bridge with a live browser-session query. A disconnected extension is a hard failure; it never silently falls back to Kimi WebBridge.
+Before any command talks to ChatGPT, it verifies the active backend with a live browser-session query. A disconnected backend is a hard failure; it never silently switches backends mid-run.
 
 Completion defaults are tuned for Pro: `--wait 1200`, `--interval 15`, `--stable 60`, `--min-chars 240`, `--refresh 300`. With `--deep-research` / `--deep-search`, the default wait becomes `3600` seconds unless you pass `--wait`. For agent-driven work, pass `--until-complete` so the process hangs, writes `active` wait progress into `state/<session>.json`, refreshes the same tab every 5 minutes, and only prints after the full answer is extracted. Ten minutes without stdout is normal; do not open a new ChatGPT page, re-send the prompt, or start a fresh browser research just because nothing has printed. Use `--min-chars 0` only when you intentionally expect a terse answer.
 
@@ -120,7 +122,7 @@ Model routing:
 
 - Default: `pro` (the independent Pro tier; a failed or ambiguous selection stops the run with `model_switch_failed` and is never silently downgraded).
 - `--model 极高` / `--model thinking`: the thinking slider path; `--effort medium|high|extra-high` selects the slider position.
-- `--browser-backend webbridge`: compatibility path for installations that still require Kimi WebBridge.
+- `--browser-backend auto` (default): resolves ego-browser → OpenCLI → Kimi WebBridge per environment. `ego` / `opencli` / `webbridge` select one explicitly. See [references/ego-backend.md](references/ego-backend.md) for the ego architecture.
 
 ```bash
 node ./search.js doctor --json
@@ -138,7 +140,7 @@ node ./search.js --upload ./brief.pdf --upload ./data.csv --until-complete "Comp
 node ./search.js -s file-thread --resume --until-complete
 ```
 
-For image generation, use `image` or `--image`. Full image runs default to strict Pro (`--model pro`); if Pro cannot be selected, the command fails instead of silently using Instant. Add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. With Pro, one prompt can return about 10 separate generated images; pass `--image-count N` so the script waits for and saves up to 10 images from that same response. Include the same count in the prompt text.
+For image generation, use `image` or `--image`. Full image runs default to strict GPT-6 Pro (`--model gpt-6-pro`) with the composer Power slider set to Extra High (`xhigh`); if GPT-6 Pro cannot be selected, the command fails instead of silently using Instant. Add `--allow-image-model-fallback` only when a one-image Instant fallback is acceptable. The Create image tool is selected automatically. To get multiple images, adjust the prompt text yourself (e.g. "Create exactly 6 separate icons..."); one prompt can return up to 10 images and the script downloads every generated image once generation stops. `--image-count N` (optional, up to 10) makes the wait stage require exactly N images before finishing.
 
 ```bash
 node ./search.js image --until-complete "Create a cinematic product render of a translucent desk lamp." --image-dir ./assets/generated
@@ -162,18 +164,24 @@ node ./scripts/transparent-cutout.js ./assets/generated/icon-on-green.png ./asse
 ## How it works
 
 ```
-┌─ OpenCLI daemon / Browser Bridge ──────┐
+┌─ ego lite / OpenCLI / WebBridge ───────┐
+│ ego task space  (auto: first match)    │
 │ Chrome/Edge  ◄── OpenCLI extension ──┐ │
-│                                        │ │
-│ ChatGPT tab  ◄───────────────────┐    │ │
-└──────────────────────────────────┼────┼─┘
-                                   │    │
-   search.js ─── OpenCLI browser ──┘    │
-       │                                │
+│                                      │ │
+│ ChatGPT tab  ◄─────────────────┐     │ │
+└────────────────────────────────┼─────┼─┘
+                                 │     │
+   search.js ─── browser actions ┘     │
+       │                               │
        └─► state/<session>.json (per-session, persisted)
 ```
 
-Each stage is a thin wrapper around one or two OpenCLI browser calls. The script keeps no in-memory state between sub-commands; everything you need is on disk.
+Each stage is a thin wrapper around one or two browser actions on the active
+backend (`cmd()` primitives: evaluate, click, fill, upload, navigate, ...).
+On ego-browser each action is one one-shot `ego-browser nodejs` program bound
+to the session's task space; on OpenCLI it is one `opencli browser` call. The
+script keeps no in-memory state between sub-commands; everything you need is
+on disk.
 
 ## Documentation
 

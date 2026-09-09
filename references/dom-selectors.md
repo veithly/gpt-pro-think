@@ -7,7 +7,7 @@ Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) verified July 2026
 | Element | Stable selector | ARIA role | Visible name / value |
 |---|---|---|---|
 | Chat input | `[contenteditable="true"][class*="ProseMirror"]` (preferred) — fall back to `[contenteditable="true"]` | textbox | "Chat with ChatGPT" |
-| Model / intelligence pill | `button.__composer-pill` | button | With the picker CLOSED this reads the selected tier: `Pro` / `极速 5.5` / `极高` …; while the picker is OPEN it reads the `Thinking effort` tooltip instead — always verify the pill with the popover closed |
+| Model / intelligence pill | `button.__composer-pill` | button | With the picker CLOSED this reads the selected tier (`6Pro` / `Instant` / …) — but after the Power slider is touched it mirrors the effort label (`High`). While the picker is OPEN it reads the `Thinking effort` tooltip instead. Always verify via the closed pill first, then the picker's `Select model` row |
 | Intelligence picker content | `[data-testid="composer-intelligence-picker-content"]` (preferred) | — | visible picker root under the model pill |
 | Popover item | `[role="menuitemradio"]` | menuitemradio | `极速 5.5` / `中` / `高` / `极高` / `Pro` (English builds use `Instant` / `Medium` / `High` / `Very High` / `Pro`); current = `aria-checked="true"` |
 | Popover header | picker text root | — | `智能` / `Intelligence` |
@@ -18,8 +18,8 @@ Stable CSS / ARIA selectors for ChatGPT (https://chatgpt.com) verified July 2026
 | Generated file entity | `button.behavior-btn[aria-label]` inside the latest assistant message | button | filename such as `HackathonHunter_G0R_Research_Pack.md`; click triggers `/backend-api/files/...` download flow |
 | Generated images | `img` inside the latest assistant message and sibling `[class*="group/imagegen-image"]` roots after the latest user turn | img | ordinary images require at least 128x128 and 65,536 px area; imagegen thumbnails are accepted above the 32 px visibility floor and deduplicated by source URL |
 | File attachment button | `[data-testid="composer-plus-btn"]` | button | `添加文件等` / `Add files and more` |
-| Composer tools menu | `[role="menu"]` or visible popover opened from `[data-testid="composer-plus-btn"]` | menu / popover | contains `创建图片`, `深度研究`, `网页搜索` (English builds use `Create image`, `Deep research`, `Web search`) |
-| Composer tool option | `[role="menuitemradio"], [role="menuitem"], div.group.__menu-item` inside tools menu | menuitemradio / menuitem / div | `创建图片` / `深度研究` / `网页搜索`; legacy menus expose `aria-checked="true"` |
+| Composer tools menu | popover opened by trusted-click `[data-testid="composer-plus-btn"]` | — (no role=menu ancestor; rows are `div[tabindex="0"]`) | contains `Create image`, `Deep research`, `Web search` (`创建图片` / `深度研究` / `网页搜索`); self-dismisses on background windows — see the Sept 2026 section |
+| Composer tool option | menu row via a11y snapshot (`[N]<div tabindex=0` + child spans) | — | match the row's FIRST LINE exactly (`Deep research`); click by snapshot ref |
 | Active tool chip | `button,[role="button"]` with `aria-label*="click to remove"` | button | e.g. `Deep research, click to remove` |
 | Deep Research mode | visible `[role="tablist"]` / `[role="tabpanel"]` containing `深度研究` or `Deep research` | tablist / tabpanel | New UI exposes `推荐` / `报告` tabs and a `发送提示` button instead of a removable chip |
 | General file input | `input#upload-files[type="file"]` | — | hidden input, `multiple=true`, accepts general files |
@@ -44,21 +44,34 @@ The popover renders inside the page (not a separate portal root in current ChatG
 
 Clicking the pill opens a popover containing:
 
-- a `menuitem` with `aria-label="Select model"` whose visible text is the current tier (e.g. `Pro`)
-- a `menuitem` with `aria-label="Power"` (class `__menu-item`, tooltip `Thinking effort`) — the effort slider, replacing the old `Effort` entry
-- `menuitemradio` entries for the chat models (e.g. `GPT-5.6 Sol`, `GPT-5.5`), current one `aria-checked="true"`
+- a `menuitem` with `aria-label="Select model"` whose visible text is the current tier (`6Pro`) or, after the Power slider is touched, the effort label (`Extra High`)
+- a `menuitem` with `aria-label="Power"` (tooltip `Thinking effort`) — a 0-4 slider (`role=slider`, `aria-valuenow` 0-3 = Low…Extra High) driven by Arrow keys while focused
+- `menuitemradio` entries for the chat models behind `Select model` (e.g. `Latest`, `GPT-5.6 Sol`, `GPT-5.5`), current one `aria-checked="true"`
 
-`ensure-model` therefore verifies the closed-state pill first and only walks this popover when a switch is actually needed. Note that `opencli find ... --name "Show advanced options"` exits non-zero with an empty stderr when the entry is absent — optional probes must tolerate any error, not just `semantic_not_found` envelopes.
+`ensure-model` therefore verifies the closed-state pill first and only walks this popover when a switch is actually needed; image runs move Power to Extra High by pressing ArrowRight until the picker text says `Extra High`.
 
-## Composer tools menu
+### Composer tools menu — IMPORTANT (Sept 2026)
 
-As of the verified ChatGPT UI, the `Add files and more` button (`[data-testid="composer-plus-btn"]`) opens a Radix menu whose relevant radio options are:
+The `Add files and more` popover renders tool rows as plain `div[tabindex="0"]` elements with **no** `role=menu` ancestor, and the popover **self-dismisses ~1-2s after opening on background windows** — cross-process polling and in-page synthetic events both lose the race (in-page pointer events often never open it at all).
 
-- `Create image`
-- `Deep research`
-- `Web search`
+The only reliable recipe (verified live) is all CLI-side, via trusted clicks and an a11y snapshot:
 
-Use the same pointer-event sequence as the model popover for both the plus button and the target `[role="menuitemradio"]`. After selecting `Deep research`, the composer shows an active chip whose accessible label is `Deep research, click to remove`. After selecting `Web search`, the chip label is currently `Search, click to remove`. The script uses those chips for idempotent detection and for `ensure-tool none`.
+1. Re-issue `open <same-url>` WITHOUT the background flag — same-URL open reuses the tab and raises the window (the page may reload; wait for `readyState=complete` plus ~800ms hydration).
+2. Trusted click `[data-testid="composer-plus-btn"]`.
+3. `opencli browser <s> state` — parse row containers (`[N]<div tabindex=0`) and their child span texts until the next container; match the row by EXACT first-line text (substring matching pulls sidebar titles like "Create Sticker Images").
+4. Trusted click the matched row ref.
+
+After selection a `[data-inline-selection-pill]` chip appears (e.g. `Deep research`); on some builds the chip is not detectable, so image runs continue when verification fails despite a successful click.
+
+### Uploads
+
+OpenCLI's native `upload` clicks the input and waits for a file chooser, which never fires for the hidden composer `input#upload-files` (even if un-hidden). The working transport is an in-page `DataTransfer` attach plus synthetic `input`/`change` events; ChatGPT then shows the normal `Remove file N: <name>` chip.
+
+## Resilience notes
+
+- `opencli keys` prints plain text (`Pressed: X`) — pass through as plain output, never JSON-parse it.
+- `opencli fill` cannot carry multi-line prompt values as CLI arguments; insert prompt text with in-page `document.execCommand('insertText')`.
+- Evaluations on freshly opened background tabs can fail with a bare "Command failed" (execution context destroyed mid-navigation) — retry transiently.
 
 ## Generated image extraction
 

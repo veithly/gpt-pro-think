@@ -37,7 +37,7 @@ Schema (v1):
   "conversationUrl": "https://chatgpt.com/c/...",
   "model": "pro | thinking | instant",
   "effort": "medium | high | extra-high",
-  "browserBackend": "opencli | webbridge",
+  "browserBackend": "ego | opencli | webbridge",
   "tool": "auto | none | deep-research | web-search | create-image",
   "images": [],
   "files": [],
@@ -124,7 +124,7 @@ Stages that take a prompt (`send`, `run`, `image`) also accept `-f` and `-` (std
 - **Auto-retry on transient errors**: each `cmd()` call retries up to 3 times with exponential backoff (200ms, 600ms, 1800ms) for network / daemon / `extension_error: No current window` cases.
 - **Auto-reuse tabs**: `open` calls `find_tab` first; if a ChatGPT tab already exists in the session, it reuses it instead of opening a new one.
 - **Auto-cleanup**: one-shot `run`, `research` / `deep-search`, `image`, `latest`, `doctor`, and `--dry-run` commands close their ChatGPT tab on success. The state file is kept (default) so the Agent can inspect what happened or recover the saved conversation URL. Pass `--cleanup-state` to delete it. To keep the browser tab open, use `--keep-session` or `--continue` (state still records the run).
-- **Idempotent model switch**: `ensure-model` uses OpenCLI's ChatGPT model adapter by default, which drives the real intelligence slider and verifies the final selection. `pro` is a separate target and failures are fail-closed; use `--browser-backend webbridge` for the legacy path.
+- **Idempotent model switch**: `ensure-model` uses the backend-specific picker flow: OpenCLI drives its own a11y-ref flow; ego-browser tags picker rows via `evaluate` and real-clicks them (see [ego-backend.md](ego-backend.md)); WebBridge uses the synthetic pointer-event DOM flow. `pro` is a separate target and failures are fail-closed; the default `gpt-6-pro` target is verified from the composer pill on every backend.
 - **Idempotent tool switch**: `ensure-tool` checks the active tool chip and the `Add files and more` menu before clicking `Deep research`, `Web search`, `Create image`, or clearing the current selection.
 
 ## Adding a new sub-command

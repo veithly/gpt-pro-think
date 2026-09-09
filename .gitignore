@@ -22,3 +22,8 @@ Thumbs.db
 # Environment / secrets
 .env
 .env.local
+
+# Run artifacts (regenerated on every real run)
+gpt-pro-response-*.md
+gpt-pro-images-*/
+gpt-pro-files/

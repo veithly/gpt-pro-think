@@ -1,6 +1,13 @@
 # Operations: daemon, sessions, failure modes, time budget
 
-## Daemon endpoint
+## Backend health
+
+- `search.js --status` runs the health check of the resolved backend and prints it as JSON.
+- ego: `EGO_BROWSER_BIN` (or `~/.local/bin/ego-browser` / PATH) must be an executable `ego-browser`; the check runs a live `listTaskSpaces()` probe. Install/setup: see the ego-browser skill's `references/install.md` or run `ego-browser onboarding`.
+- opencli: `OPENCLI_BIN` (or `/opt/homebrew/bin/opencli`, `/usr/local/bin/opencli`) must exist; the check lists session tabs.
+- webbridge: `~/.kimi-webbridge/bin/kimi-webbridge status` must report the daemon running with the extension connected.
+
+## Daemon endpoint (webbridge only)
 
 - URL: `http://127.0.0.1:10086/command`
 - Method: POST
@@ -56,7 +63,9 @@ pitch/gpt-pro/
 
 | Failure | Fix |
 |---|---|
-| Daemon not running | `search.js` auto-starts Kimi WebBridge and removes a stale pid file when the recorded process is gone; if health check still fails, inspect `~/.kimi-webbridge/bin/kimi-webbridge logs` and run `~/.kimi-webbridge/bin/kimi-webbridge restart` manually |
+| Backend not installed | `auto` resolves ego → opencli → webbridge at startup and logs the choice; install one of them or pass `--browser-backend <name>` explicitly |
+| ego health check fails | `ego-browser --version` must work; run `ego-browser onboarding` or see the ego-browser skill's install reference, or fall back to `--browser-backend opencli` |
+| Daemon not running (webbridge) | `search.js` auto-starts Kimi WebBridge and removes a stale pid file when the recorded process is gone; if health check still fails, inspect `~/.kimi-webbridge/bin/kimi-webbridge logs` and run `~/.kimi-webbridge/bin/kimi-webbridge restart` manually |
 | `fill` returns "No node with given id" | Click the input first, then retry `fill` |
 | Model not switching | Take a snapshot, find the composer pill, dispatch the pointer-event sequence (see [dom-selectors.md](dom-selectors.md)), then click the desired menuitemradio |
 | Tool not switching | Run `search.js doctor --json`; if it fails, open **Add files and more**, choose `Deep research` / `Web search` manually, then run `search.js ensure-tool deep-research --resume --until-complete` |

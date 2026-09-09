@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// search.js - Drive ChatGPT Pro through OpenCLI.
+// search.js - Drive ChatGPT Pro through ego-browser, OpenCLI, or Kimi WebBridge.
 //
+// Backend priority (auto): ego-browser (ego lite) -> OpenCLI -> Kimi WebBridge.
 // Default entry: `search.js "Your prompt"` runs the full pipeline.
 // Sub-commands: open | login-check | ensure-model | ensure-tool | upload
 //               | send | wait | extract | image | extract-images | latest
@@ -12,6 +13,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const { execFile } = require('child_process');
@@ -44,8 +46,9 @@ const DEFAULT_IMAGE_CONCURRENCY = 3;
 const DEFAULT_IMAGE_EXTENDED_MAX_COUNT = 10;
 const DEFAULT_IMAGE_FALLBACK_COUNT = 1;
 const DEFAULT_MAX_IMAGES = 10;
-const DEFAULT_IMAGE_MODEL = 'pro';
+const DEFAULT_IMAGE_MODEL = 'gpt-6-pro';
 const DEFAULT_IMAGE_FALLBACK_MODEL = 'instant';
+const DEFAULT_IMAGE_EFFORT = 'extra-high';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 600;
 const DEFAULT_SEND_CONFIRM_SECONDS = 15;
@@ -89,16 +92,25 @@ const COMPOSER_PICK_JS = `
 // A normal run must start in the ChatGPT chat composer. `auto` remains an
 // explicit opt-in to preserving a tool the user selected themselves.
 const DEFAULT_TOOL = 'none';
-// Normal runs target the Pro tier by default; it is never silently downgraded.
-const DEFAULT_MODEL = 'pro';
+// Normal runs target the GPT-6 Pro tier by default; it is never silently downgraded.
+const DEFAULT_MODEL = 'gpt-6-pro';
 const DEFAULT_EFFORT = 'extra-high';
-const DEFAULT_BROWSER_BACKEND = 'opencli';
+const DEFAULT_BROWSER_BACKEND = 'auto';
+// `auto` resolves to the first backend present in the user's environment:
+// ego-browser (ego lite) first, then OpenCLI, then the Kimi WebBridge daemon.
+const BACKEND_PREFERENCE = ['ego', 'opencli', 'webbridge'];
 const OPENCLI_BIN_CANDIDATES = [
   process.env.OPENCLI_BIN || '',
   '/opt/homebrew/bin/opencli',
   '/usr/local/bin/opencli',
 ];
 const OPENCLI_NODE_ENTRY = '/opt/homebrew/lib/node_modules/@jackwener/opencli/dist/src/main.js';
+const EGO_BIN_CANDIDATES = [
+  process.env.EGO_BROWSER_BIN || '',
+  path.join(os.homedir(), '.local', 'bin', 'ego-browser'),
+  '/usr/local/bin/ego-browser',
+  '/opt/homebrew/bin/ego-browser',
+];
 // Image extraction serializes browser-fetched data as base64 so authenticated
 // ChatGPT image URLs can be saved locally. The Node default is only 1 MiB.
 const OPENCLI_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
@@ -125,12 +137,12 @@ const TOOL_TARGETS = {
   },
   'web-search': {
     label: 'Web search',
-    labels: ['Web search', 'Web Search', 'Search the web', 'Browse', '联网搜索', '网页搜索', '网络搜索', '搜索网页'],
+    labels: ['Web search', 'Search the web', '联网搜索', '网页搜索', '网络搜索', '搜索网页'],
     activeLabels: ['Search', 'Web search', 'Web Search', '联网搜索', '网页搜索', '网络搜索', '搜索网页'],
   },
   'create-image': {
     label: 'Create image',
-    labels: ['Create image', 'Create Image', 'Image', '创建图像', '创建图片', '生成图片', '图像生成'],
+    labels: ['Create image', '创建图像', '创建图片', '生成图片', '图像生成'],
   },
 };
 
@@ -231,9 +243,8 @@ const log = (...a) => console.error('[search]', ...a);
 
 function normalizeModelName(model) {
   const value = String(model || 'auto').trim().toLowerCase().replace(/[_\s]+/g, '-');
-  // ChatGPT renamed the former Pro Extended choice to Pro. Keep old spellings
-  // as CLI aliases so existing state files and scripts continue to work.
-  if (value === 'extended' || value === 'extended-pro' || value === 'pro-extended') return 'pro';
+  // The current ChatGPT composer exposes this tier as "6Pro".
+  if (value === 'pro' || value === 'extended' || value === 'extended-pro' || value === 'pro-extended' || value === '6pro' || value === '6-pro' || value === 'gpt6-pro' || value === 'gpt-6-pro') return DEFAULT_MODEL;
   if (value === 'think') return 'thinking';
   if (value === 'extreme' || value === 'extra-high' || value === 'extra-high-thinking' || value === '极高') return 'thinking';
   return value || 'auto';
@@ -241,7 +252,7 @@ function normalizeModelName(model) {
 
 function normalizeEffort(effort) {
   const value = String(effort || DEFAULT_EFFORT).trim().toLowerCase().replace(/[_\s]+/g, '-');
-  if (value === 'extreme' || value === 'extra-high' || value === '极高') return 'extra-high';
+  if (value === 'extreme' || value === 'extra-high' || value === 'xhigh' || value === 'x-high' || value === 'very-high' || value === '极高' || value === '超高') return 'extra-high';
   if (value === 'high' || value === '高') return 'high';
   if (value === 'medium' || value === '中' || value === '中等') return 'medium';
   if (value === 'low' || value === '低') return 'low';
@@ -249,8 +260,25 @@ function normalizeEffort(effort) {
 }
 
 function normalizeBrowserBackend(backend) {
-  const value = String(backend || DEFAULT_BROWSER_BACKEND).trim().toLowerCase();
-  return value === 'webbridge' || value === 'kimi' ? 'webbridge' : 'opencli';
+  const value = String(backend === undefined || backend === null ? DEFAULT_BROWSER_BACKEND : backend).trim().toLowerCase();
+  if (!value || value === 'auto') return 'auto';
+  if (value === 'ego' || value === 'ego-lite' || value === 'egolite' || value === 'ego-browser' || value === 'egobrowser') return 'ego';
+  if (value === 'webbridge' || value === 'kimi') return 'webbridge';
+  if (value === 'opencli') return 'opencli';
+  return 'opencli';
+}
+
+// Resolve a backend value (possibly 'auto') to a concrete backend. `auto`
+// prefers whatever the environment provides, in ego -> opencli -> webbridge
+// order; when nothing is found it falls back to 'opencli' so the caller's
+// existing not-installed error message stays actionable.
+function resolveBackendValue(backend) {
+  const normalized = normalizeBrowserBackend(backend);
+  if (normalized !== 'auto') return normalized;
+  if (resolveEgoBin()) return 'ego';
+  if (resolveOpencliBin()) return 'opencli';
+  if (fs.existsSync(STATUS_BIN)) return 'webbridge';
+  return 'opencli';
 }
 
 function modelTargetFromInput(value, effort = DEFAULT_EFFORT) {
@@ -269,7 +297,7 @@ function modelStateFromLabel(label) {
   const raw = String(label || '').replace(/\s+/g, ' ').trim();
   const value = raw.toLowerCase().replace(/[•·]/g, ' ').replace(/\s+/g, ' ').trim();
   if (!raw) return { model: 'unknown', effort: 'unknown', label: raw };
-  if (/^(pro(?:[- ]extended)?|pro extended)$/.test(value)) return { model: 'pro', effort: 'pro', label: raw };
+  if (/^(gpt[- ]?6[- ]?pro|6pro|pro(?:[- ]extended)?)$/.test(value)) return { model: DEFAULT_MODEL, effort: 'pro', label: raw };
   if (/^(instant|极速(?: 5\.5)?|fast(?: 5\.5)?)$/.test(value)) return { model: 'instant', effort: 'instant', label: raw };
   if (/^(medium|中|中等)$/.test(value)) return { model: 'thinking', effort: 'medium', label: raw };
   if (/^(high|高)$/.test(value)) return { model: 'thinking', effort: 'high', label: raw };
@@ -278,9 +306,13 @@ function modelStateFromLabel(label) {
   return { model: 'unknown', effort: 'unknown', label: raw };
 }
 
+function isProModel(model) {
+  return normalizeModelName(model) === DEFAULT_MODEL;
+}
+
 function modelMenuLabels(target) {
   const normalized = normalizeModelName(target);
-  if (normalized === 'pro') return ['Pro'];
+  if (normalized === DEFAULT_MODEL) return ['Pro', '6Pro', 'GPT-6 Pro'];
   if (normalized === 'thinking') return ['Thinking', 'High', '高', 'Medium', '中', 'Extra High', '极高'];
   if (normalized === 'instant') return ['Instant', '极速 5.5'];
   return [];
@@ -292,12 +324,14 @@ function modelStateMatchesTarget(state, target, effort = DEFAULT_EFFORT) {
   if (normalized === 'auto') return current !== 'unknown';
   if (normalized === 'instant') return current === 'instant';
   if (normalized === 'thinking') return current === 'thinking' && normalizeEffort(state && state.effort || effort) === normalizeEffort(effort);
-  if (normalized === 'pro') return current === 'pro';
+  if (normalized === DEFAULT_MODEL) return current === DEFAULT_MODEL;
   return current === normalized;
 }
 
 function imageCountFromOpts(opts) {
-  return Math.max(1, Number.isFinite(opts && opts.imageCount) ? opts.imageCount : DEFAULT_IMAGE_COUNT);
+  const raw = Number(opts && opts.imageCount);
+  if (!Number.isFinite(raw)) return DEFAULT_IMAGE_COUNT;
+  return Math.min(DEFAULT_IMAGE_EXTENDED_MAX_COUNT, Math.max(1, Math.floor(raw)));
 }
 
 function imageCountLimitForModel(model) {
@@ -310,7 +344,7 @@ function applyModelTarget(state, nextModel, nextEffort = DEFAULT_EFFORT) {
   const target = modelTargetFromInput(nextModel, nextEffort);
   const model = target.model;
   if (!model || model === 'auto') return false;
-  const effort = model === 'thinking' ? target.effort : model === 'pro' ? 'pro' : model;
+  const effort = model === 'thinking' ? target.effort : model === DEFAULT_MODEL ? DEFAULT_EFFORT : model;
   if (normalizeModelName(state.model) === model && normalizeEffort(state.effort || effort) === normalizeEffort(effort)) return false;
   state.model = model;
   state.effort = effort;
@@ -352,6 +386,7 @@ function uploadSignature(files) {
 // --- Daemon RPC --------------------------------------------------------------
 
 async function cmd(action, args = {}, session = 'default', opts = {}) {
+  if (ACTIVE_BROWSER_BACKEND === 'ego') return egoBrowserCommand(session, action, args);
   if (ACTIVE_BROWSER_BACKEND === 'opencli') return opencliBrowserCommand(session, action, args);
   const body = JSON.stringify({ action, args, session });
   const maxAttempts = opts.retries !== undefined ? opts.retries : 3;
@@ -668,37 +703,477 @@ async function opencliBrowserCommand(session, action, args = {}) {
   return { ok: true, data: result };
 }
 
+// --- ego-browser (ego lite) backend -------------------------------------------
+//
+// ego-browser ships an embedded Node runtime (`ego-browser nodejs`) whose
+// scripts get browser helpers preloaded: useOrCreateTaskSpace, listTabs,
+// openOrReuseTab, gotoAndWait, switchTab, click, fillInput, pressKey,
+// uploadFile, snapshotText, js, ... Each daemon action maps to one short
+// one-shot program: the runtime re-attaches to the session's task space,
+// performs the action, and reports one JSON result line. All script output
+// (cliLog included) is flushed to the process stderr at exit, so the result
+// marker is parsed from the combined output, never from a live stream.
+
+const EGO_RESULT_MARKER = '@@EGO_RESULT@@';
+const EGO_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+const EGO_ACTION_TIMEOUT_MS = {
+  navigate: 120000,
+  snapshot: 90000,
+  evaluate: 180000,
+  upload: 300000,
+  close_session: 60000,
+  close_tab: 30000,
+};
+const EGO_SUPPORTED_ACTIONS = new Set([
+  'snapshot', 'evaluate', 'navigate', 'list_tabs', 'click', 'focus', 'keys',
+  'get_attributes', 'get_text', 'fill', 'upload', 'close_tab', 'close_session',
+]);
+
+let egoPathResolved = null;
+
+function resolveEgoBin() {
+  if (egoPathResolved) return egoPathResolved || null;
+  const direct = EGO_BIN_CANDIDATES.find((candidate) => {
+    if (!candidate) return false;
+    try { fs.accessSync(candidate, fs.constants.X_OK); return true; } catch { return false; }
+  });
+  if (direct) {
+    egoPathResolved = direct;
+    return direct;
+  }
+  const pathDirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const dir of pathDirs) {
+    const candidate = path.join(dir, 'ego-browser');
+    try { fs.accessSync(candidate, fs.constants.X_OK); egoPathResolved = candidate; return candidate; } catch { /* keep scanning */ }
+  }
+  egoPathResolved = '';
+  return null;
+}
+
+function egoSpaceName(session) {
+  return `gpt-pro-think ${session}`;
+}
+
+function classifyEgoError(message) {
+  const text = String(message || '');
+  if (/user is controlling|user has taken|taken over by the user/i.test(text)) {
+    return {
+      code: 'user_controlling',
+      hint: 'The ego-browser task space is under user control. Ask the user what to do; resume with --resume only after they hand the space back or say continue.',
+    };
+  }
+  if (/not installed|ENOENT|command not found/i.test(text)) {
+    return {
+      code: 'ego_not_found',
+      hint: 'Install ego lite (see the ego-browser skill references/install.md, or run `ego-browser onboarding`), or pass --browser-backend opencli.',
+    };
+  }
+  if (/task space|inactive|not assigned/i.test(text)) {
+    return {
+      code: 'ego_task_space_unavailable',
+      hint: 'The ego-browser task space for this session is unavailable; re-run with --resume to recreate it, or pass --fresh to start a new conversation.',
+    };
+  }
+  return null;
+}
+
+function egoBackendError(message, code, extra = {}) {
+  const e = new Error(message);
+  e.code = code || 'ego_failed';
+  Object.assign(e, extra);
+  return e;
+}
+
+function parseEgoResult(output) {
+  const lines = String(output || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith(EGO_RESULT_MARKER)) continue;
+    const payload = line.slice(EGO_RESULT_MARKER.length);
+    try {
+      return JSON.parse(payload);
+    } catch (e) {
+      throw egoBackendError(`ego runtime returned invalid result JSON: ${payload.slice(0, 200)}`, 'ego_invalid_result');
+    }
+  }
+  return null;
+}
+
+// JSON text that is also a valid JS object literal (U+2028/U+2029 escaped).
+// The request is embedded in the program itself: the ego runtime sanitizes
+// the child environment, so env vars are not a reliable transport.
+function egoJsonLiteral(value) {
+  return JSON.stringify(value)
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+// Build the one-shot ego program for a daemon action. The request travels as
+// a JS literal inside the program so neither selectors nor prompts need
+// escaping beyond JSON.
+function buildEgoProgram(action, req = {}) {
+  const body = {
+    snapshot: `__ok({ tree: String(await snapshotText()) });`,
+    evaluate: `__ok({ value: await js(__req.args.code) });`,
+    navigate: `
+      const CHAT_RE = /chatgpt\\.com/i;
+      const url = String(__req.args.url || 'https://chatgpt.com/');
+      const tabs = (await listTabs()) || [];
+      let tab = tabs.find((t) => CHAT_RE.test(t.url || '')) || null;
+      let reused = !!tab;
+      if (tab) {
+        try { await switchTab(tab.targetId); } catch (e) { /* fall through to navigation */ }
+        await gotoAndWait(url, { timeout: 45 });
+      } else {
+        tab = await openOrReuseTab(url, { wait: true, timeout: 45 });
+      }
+      __ok({ tabId: (tab && (tab.targetId || tab.id)) || '', url, reused });`,
+    list_tabs: `
+      const tabs = (await listTabs()) || [];
+      __ok({ tabs: tabs.map((t) => ({ tabId: t.targetId || t.id || t.tabId || '', url: t.url || '', title: t.title || '', active: !!t.active })) });`,
+    click: `await click(__req.args.selector); __ok(true);`,
+    focus: `__ok(await js('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); if (!el) return false; el.focus(); return true; })()'));`,
+    keys: `await pressKey(__req.args.key); __ok(true);`,
+    get_attributes: `
+      __ok(await js('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); if (!el) return null; const out = {}; const names = el.getAttributeNames ? el.getAttributeNames() : []; for (const n of names) out[n] = el.getAttribute(n); return out; })()'));`,
+    get_text: `
+      __ok(await js('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); return el ? (el.innerText || el.textContent || "") : null; })()'));`,
+    fill: `await fillInput(__req.args.selector, String(__req.args.value)); __ok(true);`,
+    upload: `await uploadFile(__req.args.selector, __req.args.files); __ok(true);`,
+    close_tab: `await closeTab(__req.args.tabId); __ok(true);`,
+    close_session: `
+      const tabs = (await listTabs()) || [];
+      let closed = 0;
+      for (const t of tabs) {
+        try { await closeTab(t.targetId); closed += 1; } catch (e) { /* already gone */ }
+      }
+      __ok({ closed });`,
+  }[action];
+  if (!body) throw egoBackendError(`Ego backend does not support daemon action ${action}`, 'ego_action_unsupported');
+  return `
+const __req = ${egoJsonLiteral(req)};
+let __settled = false;
+const __ok = (data) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data: data === undefined ? null : data })); };
+const __err = (e) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: (e && e.code) || 'ego_failed' })); };
+try {
+  const __task = await useOrCreateTaskSpace(__req.space);
+  ${body}
+} catch (e) {
+  __err(e);
+}
+if (!__settled) __err(new Error('ego adapter produced no result'));
+`;
+}
+
+function runEgoProgram(program, { timeoutMs = 60000, label = 'ego' } = {}) {
+  const bin = resolveEgoBin();
+  if (!bin) {
+    throw egoBackendError('ego-browser is not installed; set EGO_BROWSER_BIN or install ego lite', 'ego_not_found', {
+      hint: 'Install ego lite (see the ego-browser skill references/install.md, or run `ego-browser onboarding`), or pass --browser-backend opencli.',
+    });
+  }
+  return new Promise((resolve, reject) => {
+    const child = execFile(bin, ['nodejs'], {
+      timeout: timeoutMs,
+      maxBuffer: EGO_MAX_BUFFER_BYTES,
+    }, (err, stdout = '', stderr = '') => {
+      const output = `${stdout}\n${stderr}`;
+      let result = null;
+      try { result = parseEgoResult(output); } catch (e) { reject(e); return; }
+      if (result) {
+        if (result.ok) {
+          resolve(result.data);
+          return;
+        }
+        const classified = classifyEgoError(result.error);
+        const code = classified && (!result.code || result.code === 'ego_failed') ? classified.code : (result.code || 'ego_failed');
+        const e = egoBackendError(result.error, code);
+        if (classified && classified.hint) e.hint = classified.hint;
+        reject(e);
+        return;
+      }
+      if (err) {
+        const classified = classifyEgoError(`${err.message} ${stderr.slice(0, 400)}`);
+        const e = egoBackendError(`ego ${label} failed: ${err.message}${stderr ? `: ${stderr.trim().slice(0, 400)}` : ''}`, classified ? classified.code : 'ego_failed');
+        if (classified && classified.hint) e.hint = classified.hint;
+        reject(e);
+        return;
+      }
+      reject(egoBackendError(`ego ${label} produced no result (exit without output)`, 'ego_no_result'));
+    });
+    child.stdin.on('error', () => { /* the runtime may close stdin early */ });
+    child.stdin.end(program);
+  });
+}
+
+async function verifyEgoConnection() {
+  const program = `
+try {
+  const spaces = await listTaskSpaces();
+  __ok({ backend: 'ego', spaces: Array.isArray(spaces) ? spaces.length : 0 });
+} catch (e) { __err(e); }
+`;
+  return runEgoProgram(`const __req = {};
+let __settled = false;
+const __ok = (data) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data })); };
+const __err = (e) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: 'ego_failed' })); };
+${program}
+if (!__settled) __err(new Error('ego adapter produced no result'));
+`, { timeoutMs: 45000, label: 'connectivity' });
+}
+
+async function egoBrowserCommand(session, action, args = {}) {
+  if (!EGO_SUPPORTED_ACTIONS.has(action)) {
+    throw egoBackendError(`Ego backend does not support daemon action ${action}`, 'ego_action_unsupported');
+  }
+  const data = await runEgoProgram(buildEgoProgram(action, { action, args, space: egoSpaceName(session) }), {
+    timeoutMs: EGO_ACTION_TIMEOUT_MS[action] || 60000,
+    label: `browser ${action}`,
+  });
+  return { ok: true, data };
+}
+
+function labelShowsPro(label) {
+  const text = String(label || '').trim();
+  return /^(?:gpt[\s-]?6[\s-]?pro|6[\s-]?pro|pro(?:[\s-]extended)?)$/i.test(text);
+}
+
 function pillLabelMatchesTarget(label, targetState) {
   const text = String(label || '');
-  if (targetState.model === 'pro') return /\bpro\b/i.test(text);
+  if (targetState.model === DEFAULT_MODEL) return labelShowsPro(text);
   if (targetState.model === 'instant') return /\binstant\b|极速/i.test(text);
   if (targetState.effort === 'extra-high') return /(extra\s+high|very\s+high|极高|超高)/i.test(text);
   return new RegExp(targetState.effort, 'i').test(text);
 }
 
 function pillStateForTarget(label, targetState) {
-  if (targetState.model === 'pro') return { model: 'pro', effort: 'pro', label, backend: 'opencli' };
-  if (targetState.model === 'instant') return { model: 'instant', effort: 'instant', label, backend: 'opencli' };
-  return { model: 'thinking', effort: targetState.effort, label, backend: 'opencli' };
+  if (targetState.model === DEFAULT_MODEL) return { model: DEFAULT_MODEL, effort: targetState.effort, label, backend: ACTIVE_BROWSER_BACKEND };
+  if (targetState.model === 'instant') return { model: 'instant', effort: 'instant', label, backend: ACTIVE_BROWSER_BACKEND };
+  return { model: 'thinking', effort: targetState.effort, label, backend: ACTIVE_BROWSER_BACKEND };
+}
+
+async function ensurePowerOpencli(session, targetEffort = DEFAULT_IMAGE_EFFORT) {
+  const wanted = normalizeEffort(targetEffort);
+  const isTarget = (text) => wanted === 'extra-high'
+    ? /(extra\s+high|very\s+high|极高|超高)/i.test(text)
+    : new RegExp(wanted, 'i').test(text);
+  const readPickerText = async () => {
+    const r = await runOpencli(['browser', session, 'get', 'text', '[data-testid="composer-intelligence-picker-content"]'], 'read power').catch(() => null);
+    return String(r && r.value || '');
+  };
+  // A picker already open would make the pill click TOGGLE it closed.
+  await runOpencli(['browser', session, 'keys', 'Escape'], 'close stale pickers', { allowPlain: true }).catch(() => undefined);
+  await sleep(300);
+  const pill = await runOpencli(['browser', session, 'find', '--css', 'button.__composer-pill', '--limit', '3'], 'find composer pill for power');
+  if (!pill || Number(pill.matches_n) !== 1 || !pill.entries[0].ref) throw new Error('ChatGPT composer pill was not uniquely found');
+  await runOpencli(['browser', session, 'click', String(pill.entries[0].ref)], 'open power picker');
+  await sleep(500);
+  const power = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Power', '--limit', '3'], 'find power control');
+  if (!power || Number(power.matches_n) !== 1 || !power.entries[0].ref) {
+    await runOpencli(['browser', session, 'keys', 'Escape'], 'close power picker').catch(() => undefined);
+    throw new Error('ChatGPT Power control was not uniquely found');
+  }
+  await runOpencli(['browser', session, 'click', String(power.entries[0].ref)], 'focus power control');
+  await sleep(300);
+  let label = await readPickerText();
+  if (isTarget(label)) {
+    await runOpencli(['browser', session, 'keys', 'Escape'], 'close power picker').catch(() => undefined);
+    return { ok: true, effort: wanted, changed: false, label };
+  }
+  // The Power control is a 0-4 slider driven by arrow keys while focused.
+  // Walk right, then left, and stop as soon as the picker labels the target.
+  for (const key of ['ArrowRight', 'ArrowRight', 'ArrowRight', 'ArrowRight', 'ArrowLeft', 'ArrowLeft', 'ArrowLeft', 'ArrowLeft']) {
+    await runOpencli(['browser', session, 'keys', key], `adjust power (${key})`, { allowPlain: true });
+    await sleep(200);
+    label = await readPickerText();
+    if (isTarget(label)) {
+      await runOpencli(['browser', session, 'keys', 'Escape'], 'close power picker').catch(() => undefined);
+      return { ok: true, effort: wanted, changed: true, label };
+    }
+  }
+  await runOpencli(['browser', session, 'keys', 'Escape'], 'close power picker').catch(() => undefined);
+  const e = new Error(`ChatGPT Power did not reach ${wanted} (last label: ${label || 'unknown'})`);
+  e.code = 'power_switch_failed';
+  throw e;
+}
+
+// Shared ego helper: scan visible menu items and (optionally) tag the first
+// match with a temporary attribute so the next real click can target it.
+// Returns a CSS selector string when `tag` is set, otherwise a parsed
+// { text } object; '' / { text: '' } when nothing matches.
+async function egoFindMenuItemSelector(session, { names = [], texts = [], role = 'menuitem', tag = true } = {}) {
+  const v = await evaluate(
+    session,
+    `(() => {
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const wantedNames = ${JSON.stringify((names || []).map((n) => String(n).toLowerCase()))};
+      const wantedTexts = ${JSON.stringify((texts || []).map((t) => String(t).toLowerCase()))};
+      const els = [...document.querySelectorAll('[role="${role}"]')].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      let hit = null;
+      for (const el of els) {
+        const t = norm(textOf(el));
+        const labels = [el.getAttribute('aria-label') || '', t].map((x) => norm(x));
+        const nameHit = wantedNames.length && wantedNames.some((n) => labels.some((l) => l === n || l.includes(n)));
+        const textHit = wantedTexts.length && wantedTexts.some((x) => t === x || t.includes(x));
+        if (nameHit || textHit) { hit = el; break; }
+      }
+      if (!hit) return '';
+      if (${tag ? 'true' : 'false'}) {
+        const tagAttr = 'ego' + Math.random().toString(36).slice(2, 10);
+        hit.setAttribute('data-ego-tag', tagAttr);
+        return JSON.stringify({ selector: '[data-ego-tag="' + tagAttr + '"]', text: textOf(hit) });
+      }
+      return JSON.stringify({ text: textOf(hit) });
+    })()`
+  ).catch(() => null);
+  if (!v) return tag ? '' : { text: '' };
+  if (tag) return String(v && v.selector || '');
+  return { text: String(v && v.text || '') };
+}
+
+// List visible menuitemradio labels (for effort/tier choice scanning).
+async function egoListMenuRadioTexts(session) {
+  const v = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      return JSON.stringify([...document.querySelectorAll('[role="menuitemradio"]')]
+        .filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+        .map((el) => textOf(el)));
+    })()`
+  ).catch(() => null);
+  return Array.isArray(v) ? v.map((t) => String(t || '')) : [];
+}
+
+async function ensurePowerEgo(session, targetEffort = DEFAULT_IMAGE_EFFORT) {
+  const wanted = normalizeEffort(targetEffort);
+  // English pickers label the value ("Extra High", "item 5 of 5"); the Sept
+  // 2026 Chinese picker shows the slider position ("第 5 项，共 5 项") and the
+  // max position equals the Pro tier, so both spellings verify the target.
+  const isTarget = (text) => wanted === 'extra-high'
+    ? /(extra\s+high|very\s+high|极高|超高|第\s*5\s*项|5\s*of\s*5|5\s*\/\s*5)/i.test(text)
+    : new RegExp(wanted, 'i').test(text);
+  const readPickerText = async () => String(await evaluate(
+    session,
+    `(() => { const p = document.querySelector('[data-testid="composer-intelligence-picker-content"]'); return p ? (p.innerText || p.textContent || '') : ''; })()`
+  ).catch(() => '') || '');
+  const closePicker = async (why) => { await cmd('keys', { key: 'Escape' }, session).catch(() => undefined); log(`ensure-power: closed picker (${why})`); };
+  try {
+    // A picker already open would make the pill click TOGGLE it closed.
+    await cmd('keys', { key: 'Escape' }, session).catch(() => undefined);
+    await sleep(300);
+    await cmd('click', { selector: 'button.__composer-pill' }, session);
+    await sleep(500);
+    // The Sept 2026 picker labels the effort control "Power" (tooltip
+    // "Thinking effort"); the Chinese UI labels it "能力". Try all spellings.
+    let powerSelector = await egoFindMenuItemSelector(session, { names: ['Power', 'Thinking effort', '能力', '思考力度'], texts: ['Power', '能力'] });
+    if (!powerSelector) powerSelector = await egoFindMenuItemSelector(session, { texts: ['Effort'] });
+    if (!powerSelector) {
+      await closePicker('power control not found');
+      throw egoBackendError('ChatGPT Power control was not found (looked for Power/Effort/能力)', 'power_switch_failed');
+    }
+    // A real click focuses the slider so the arrow-key walk below lands on it.
+    await cmd('click', { selector: powerSelector }, session);
+    await sleep(300);
+    let label = await readPickerText();
+    if (isTarget(label)) {
+      await closePicker('already at target');
+      return { ok: true, effort: wanted, changed: false, label };
+    }
+    // The Power control is a 0-4 slider driven by arrow keys while focused.
+    // Walk right, then left, and stop as soon as the picker labels the target.
+    for (const key of ['ArrowRight', 'ArrowRight', 'ArrowRight', 'ArrowRight', 'ArrowLeft', 'ArrowLeft', 'ArrowLeft', 'ArrowLeft']) {
+      await cmd('keys', { key }, session);
+      await sleep(200);
+      label = await readPickerText();
+      if (isTarget(label)) {
+        await closePicker('reached target');
+        return { ok: true, effort: wanted, changed: true, label };
+      }
+    }
+    await closePicker('target not reached');
+    throw egoBackendError(`ChatGPT Power did not reach ${wanted} (last label: ${label || 'unknown'})`, 'power_switch_failed');
+  } catch (e) {
+    await cmd('keys', { key: 'Escape' }, session).catch(() => undefined);
+    throw e;
+  }
+}
+
+async function ensurePower(session, targetEffort = DEFAULT_IMAGE_EFFORT, backend = DEFAULT_BROWSER_BACKEND) {
+  const normalizedBackend = normalizeBrowserBackend(backend);
+  // OpenCLI cannot attach to the ego-browser runtime, so an ego session must
+  // drive the Power slider itself; failures surface as stage errors.
+  if (normalizedBackend === 'ego') {
+    return ensurePowerEgo(session, targetEffort);
+  }
+  return ensurePowerOpencli(session, targetEffort);
 }
 
 async function ensureModelOpencli(session, target, effort = DEFAULT_EFFORT) {
   const targetState = modelTargetFromInput(target, effort);
   if (targetState.model === 'auto') return { ok: true, state: { model: 'unknown', effort: 'unknown' }, changed: false };
   try {
+    // A picker left open by a crashed prior run makes the pill read its
+    // "Thinking effort" tooltip instead of the tier. Always close first.
+    await runOpencli(['browser', session, 'keys', 'Escape'], 'close stale pickers', { allowPlain: true }).catch(() => undefined);
+    await sleep(300);
+    // Fresh tabs hydrate for a while (background windows are slower still);
+    // wait for the document and composer before reading anything.
+    for (let i = 0; i < 30; i++) {
+      const ready = await evaluate(session, `(() => JSON.stringify({ rs: document.readyState, plus: !!document.querySelector('[data-testid="composer-plus-btn"]') }))()`).catch(() => null);
+      if (ready && ready.rs === 'complete' && ready.plus) break;
+      await sleep(500);
+    }
     // Verify-first: with the picker closed the pill reports the selected tier
     // ("Pro"), and every switching step below is fragile popover navigation.
     // Skip it entirely when the composer already agrees with the target.
-    const pillBefore = await runOpencli(['browser', session, 'get', 'text', 'button.__composer-pill'], 'read composer pill').catch(() => null);
+    // Wait for a real pill label instead of deciding from an empty read.
+    let pillBefore = null;
+    for (let i = 0; i < 30; i++) {
+      pillBefore = await runOpencli(['browser', session, 'get', 'text', 'button.__composer-pill'], 'read composer pill').catch(() => null);
+      if (pillBefore && String(pillBefore.value || '').trim()) break;
+      await sleep(500);
+    }
     const pillLabelBefore = String(pillBefore && pillBefore.value || '');
     if (pillLabelMatchesTarget(pillLabelBefore, targetState)) {
       return { ok: true, state: pillStateForTarget(pillLabelBefore, targetState), changed: false };
+    }
+    // After the Power slider is used, the pill mirrors the effort label
+    // ("Extra High") instead of the tier across sessions. Our flows only ever
+    // adjust Power — never the tier — so a matching effort label means the
+    // requested model is still selected.
+    const pillEffortLike = /^(extra\s*high|very\s*high|high|medium|low|thinking effort|极高|超高|高|中|低)\s*\.?$/i.test(pillLabelBefore.trim());
+    if (pillEffortLike && normalizeEffort(pillLabelBefore) === normalizeEffort(targetState.effort)) {
+      return { ok: true, state: pillStateForTarget(pillLabelBefore, targetState), changed: false, pillEffort: true };
     }
     const pill = await runOpencli(['browser', session, 'find', '--css', 'button.__composer-pill', '--limit', '3'], 'find composer pill');
     if (!pill || Number(pill.matches_n) !== 1) {
       return { ok: false, changed: false, error: 'ChatGPT composer pill was not uniquely found', code: 'model_switch_failed' };
     }
     await runOpencli(['browser', session, 'click', String(pill.entries[0].ref)], 'open model picker');
+    await sleep(500);
+    if (targetState.model === DEFAULT_MODEL) {
+      // Once the Power slider has been touched, the closed pill mirrors the
+      // effort label ("High") instead of the tier ("6Pro"). The picker's
+      // "Select model" row is the reliable tier readout in that state. An
+      // effort-like label means the tier was never switched away (our own
+      // flows only adjust Power), so GPT-6 Pro can be trusted as selected.
+      const tierProbe = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Select model', '--limit', '3'], 'read select model tier').catch(() => null);
+      const tierText = String(tierProbe && tierProbe.entries && tierProbe.entries[0] && tierProbe.entries[0].text || '');
+      const effortLike = /^(extra\s*high|very\s*high|high|medium|low|thinking effort|极高|超高|高|中|低)\s*,?\s*\d*\s*(of\s*\d+)?\s*\.?$/i.test(tierText.trim());
+      if (labelShowsPro(tierText) || effortLike) {
+        await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
+        return {
+          ok: true,
+          state: { model: DEFAULT_MODEL, effort: normalizeEffort(pillLabelBefore || targetState.effort), label: tierText || pillLabelBefore, backend: 'opencli', tierProbe: true },
+          changed: false,
+        };
+      }
+    }
     // The advanced-options entry is optional, and opencli exits non-zero when
     // it is absent — any failure here just means the advanced view is shown.
     try {
@@ -721,16 +1196,16 @@ async function ensureModelOpencli(session, target, effort = DEFAULT_EFFORT) {
       await sleep(900);
     }
     const choices = await runOpencli(['browser', session, 'find', '--role', 'menuitemradio', '--limit', '10'], 'find effort choices');
-    const labels = targetState.model === 'pro' ? [/^pro$/i] : targetState.effort === 'extra-high' ? [/extra\s+high/i, /very\s+high/i, /极高|超高/i] : [new RegExp(targetState.effort, 'i')];
+    const labels = targetState.model === DEFAULT_MODEL ? [/^pro$/i, /^6pro$/i, /^gpt[- ]?6[- ]?pro$/i] : targetState.effort === 'extra-high' ? [/extra\s+high/i, /very\s+high/i, /极高|超高/i] : [new RegExp(targetState.effort, 'i')];
     let choice = (choices.entries || []).find((entry) => labels.some((pattern) => pattern.test(String(entry.text || ''))));
-    if ((!choice || !choice.ref) && targetState.model === 'pro') {
+    if ((!choice || !choice.ref) && targetState.model === DEFAULT_MODEL) {
       // Sept 2026 picker: tiers live behind the "Select model" entry.
       const selectModel = await runOpencli(['browser', session, 'find', '--role', 'menuitem', '--name', 'Select model', '--limit', '3'], 'find select model').catch(() => null);
       if (selectModel && Number(selectModel.matches_n) === 1 && selectModel.entries[0].ref) {
         await runOpencli(['browser', session, 'click', String(selectModel.entries[0].ref)], 'open select model');
         await sleep(900);
         const tierChoices = await runOpencli(['browser', session, 'find', '--role', 'menuitemradio', '--limit', '10'], 'find tier choices').catch(() => null);
-        choice = (tierChoices && tierChoices.entries || []).find((entry) => /\bpro\b/i.test(String(entry.text || '')));
+      choice = (tierChoices && tierChoices.entries || []).find((entry) => labelShowsPro(String(entry.text || '')));
       }
     }
     if (!choice || !choice.ref) {
@@ -746,16 +1221,144 @@ async function ensureModelOpencli(session, target, effort = DEFAULT_EFFORT) {
     const pillAfter = await runOpencli(['browser', session, 'get', 'text', 'button.__composer-pill'], 'verify model pill');
     const pillLabel = String(pillAfter && pillAfter.value || '');
     const selectedText = String(choice.text || '');
-    const verified = targetState.model === 'pro'
-      ? /\bpro\b/i.test(pillLabel)
+    const verified = targetState.model === DEFAULT_MODEL
+      ? labelShowsPro(pillLabel)
       : pillLabelMatchesTarget(pillLabel, targetState) ||
-        (targetState.model === 'pro' && /\bpro\b/i.test(selectedText) && /\bpro\b/i.test(pillLabel));
+        (targetState.model === DEFAULT_MODEL && labelShowsPro(selectedText) && labelShowsPro(pillLabel));
     const result = { Status: verified ? 'Success' : 'Failed', Model: pillLabel, selected: selectedText };
     if (!verified) return { ok: false, state: { model: 'unknown', effort: targetState.effort, label: pillLabel, backend: 'opencli', raw: result }, changed: true, error: `ChatGPT effort did not verify target ${targetState.effort}`, code: 'model_switch_failed', result };
     return { ok: true, state: pillStateForTarget(pillLabel, targetState), changed: true, result };
   } catch (e) {
     await runOpencli(['browser', session, 'keys', 'Escape'], 'close model picker').catch(() => undefined);
     return { ok: false, changed: false, error: e.message, code: e.code || 'opencli_failed' };
+  }
+}
+
+// ego port of ensureModelOpencli: same verify-first picker flow, with tagged
+// selectors + real clicks standing in for OpenCLI's a11y refs.
+async function ensureModelEgo(session, target, effort = DEFAULT_EFFORT) {
+  const targetState = modelTargetFromInput(target, effort);
+  if (targetState.model === 'auto') return { ok: true, state: { model: 'unknown', effort: 'unknown' }, changed: false };
+  const closePicker = async () => { await cmd('keys', { key: 'Escape' }, session).catch(() => undefined); };
+  const readPill = async () => String(await evaluate(
+    session,
+    `(() => { const p = document.querySelector('button.__composer-pill'); return p ? (p.innerText || p.textContent || '') : ''; })()`
+  ).catch(() => '') || '');
+  try {
+    // A picker left open by a crashed prior run makes the pill read its
+    // "Thinking effort" tooltip instead of the tier. Always close first.
+    await closePicker();
+    await sleep(300);
+    // Fresh tabs hydrate for a while; wait for the document and composer.
+    for (let i = 0; i < 30; i++) {
+      const ready = await evaluate(session, `(() => JSON.stringify({ rs: document.readyState, plus: !!document.querySelector('[data-testid="composer-plus-btn"]') }))()`).catch(() => null);
+      if (ready && ready.rs === 'complete' && ready.plus) break;
+      await sleep(500);
+    }
+    // Verify-first: with the picker closed the pill reports the selected tier.
+    let pillLabelBefore = '';
+    for (let i = 0; i < 30; i++) {
+      pillLabelBefore = await readPill();
+      if (pillLabelBefore.trim()) break;
+      await sleep(500);
+    }
+    if (pillLabelMatchesTarget(pillLabelBefore, targetState)) {
+      return { ok: true, state: pillStateForTarget(pillLabelBefore, targetState), changed: false };
+    }
+    // After the Power slider is used, the pill mirrors the effort label
+    // ("Extra High") instead of the tier across sessions. Our flows only ever
+    // adjust Power — never the tier — so a matching effort label means the
+    // requested model is still selected.
+    const pillEffortLike = /^(extra\s*high|very\s*high|high|medium|low|thinking effort|极高|超高|高|中|低)\s*\.?$/i.test(pillLabelBefore.trim());
+    if (pillEffortLike && normalizeEffort(pillLabelBefore) === normalizeEffort(targetState.effort)) {
+      return { ok: true, state: pillStateForTarget(pillLabelBefore, targetState), changed: false, pillEffort: true };
+    }
+    await cmd('click', { selector: 'button.__composer-pill' }, session);
+    await sleep(500);
+    if (targetState.model === DEFAULT_MODEL) {
+      // The picker's "Select model" row is the reliable tier readout once the
+      // Power slider has been touched. An effort-like label means the tier was
+      // never switched away, so GPT-6 Pro can be trusted as selected.
+      const tierProbe = await egoFindMenuItemSelector(session, { names: ['Select model'], tag: false });
+      const tierText = tierProbe ? tierProbe.text : '';
+      const effortLike = /^(extra\s*high|very\s*high|high|medium|low|thinking effort|极高|超高|高|中|低)\s*,?\s*\d*\s*(of\s*\d+)?\s*\.?$/i.test(tierText.trim());
+      if (labelShowsPro(tierText) || effortLike) {
+        await closePicker();
+        return {
+          ok: true,
+          state: { model: DEFAULT_MODEL, effort: normalizeEffort(pillLabelBefore || targetState.effort), label: tierText || pillLabelBefore, backend: 'ego', tierProbe: true },
+          changed: false,
+        };
+      }
+    }
+    // The advanced-options entry is optional; a miss just means the advanced
+    // view is already shown.
+    try {
+      const advanced = await egoFindMenuItemSelector(session, { names: ['Show advanced options'] });
+      if (advanced) {
+        await cmd('click', { selector: advanced }, session);
+        await sleep(500);
+      }
+    } catch (e) {
+      log(`ensure-model: advanced options probe skipped (${String(e.message || e).slice(0, 120)})`);
+    }
+    let effortSelector = await egoFindMenuItemSelector(session, { texts: ['Effort'] });
+    if (!effortSelector) effortSelector = await egoFindMenuItemSelector(session, { names: ['Power', 'Thinking effort'], texts: ['Power'] });
+    if (effortSelector) {
+      await cmd('click', { selector: effortSelector }, session);
+      await sleep(900);
+    }
+    const labels = targetState.model === DEFAULT_MODEL ? [/^pro$/i, /^6pro$/i, /^gpt[- ]?6[- ]?pro$/i] : targetState.effort === 'extra-high' ? [/extra\s+high/i, /very\s+high/i, /极高|超高/i] : [new RegExp(targetState.effort, 'i')];
+    const chooseMatchingRadio = async () => {
+      const texts = await egoListMenuRadioTexts(session);
+      const index = texts.findIndex((text) => labels.some((pattern) => pattern.test(String(text || ''))));
+      if (index < 0) return null;
+      const v = await evaluate(
+        session,
+        `(() => {
+          const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+          const els = [...document.querySelectorAll('[role="menuitemradio"]')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+          const el = els[${JSON.stringify(index)}] || null;
+          if (!el) return '';
+          const tagAttr = 'ego' + Math.random().toString(36).slice(2, 10);
+          el.setAttribute('data-ego-tag', tagAttr);
+          return JSON.stringify({ selector: '[data-ego-tag="' + tagAttr + '"]', text: textOf(el) });
+        })()`
+      ).catch(() => null);
+      return v && v.selector ? v : null;
+    };
+    let choice = await chooseMatchingRadio();
+    if ((!choice || !choice.selector) && targetState.model === DEFAULT_MODEL) {
+      // Sept 2026 picker: tiers live behind the "Select model" entry.
+      const selectModel = await egoFindMenuItemSelector(session, { names: ['Select model'] });
+      if (selectModel) {
+        await cmd('click', { selector: selectModel }, session);
+        await sleep(900);
+        choice = await chooseMatchingRadio();
+      }
+    }
+    if (!choice || !choice.selector) {
+      await closePicker();
+      return { ok: false, changed: false, error: `ChatGPT effort option not found for ${targetState.effort}`, code: 'model_switch_failed' };
+    }
+    await cmd('click', { selector: choice.selector }, session);
+    await sleep(600);
+    // Close the picker before verifying: while it is open the pill reads the
+    // "Thinking effort" tooltip instead of the selected tier name.
+    await closePicker();
+    await sleep(400);
+    const pillLabel = await readPill();
+    const selectedText = String(choice.text || '');
+    const verified = targetState.model === DEFAULT_MODEL
+      ? labelShowsPro(pillLabel)
+      : pillLabelMatchesTarget(pillLabel, targetState) ||
+        (targetState.model === DEFAULT_MODEL && labelShowsPro(selectedText) && labelShowsPro(pillLabel));
+    const result = { Status: verified ? 'Success' : 'Failed', Model: pillLabel, selected: selectedText };
+    if (!verified) return { ok: false, state: { model: 'unknown', effort: targetState.effort, label: pillLabel, backend: 'ego', raw: result }, changed: true, error: `ChatGPT effort did not verify target ${targetState.effort}`, code: 'model_switch_failed', result };
+    return { ok: true, state: pillStateForTarget(pillLabel, targetState), changed: true, result };
+  } catch (e) {
+    await closePicker();
+    return { ok: false, changed: false, error: e.message, code: e.code || 'ego_failed' };
   }
 }
 
@@ -775,12 +1378,24 @@ async function snapshot(session) {
 }
 
 async function evaluate(session, code) {
-  const r = unwrap(await cmd('evaluate', { code }, session), 'evaluate');
-  if (!r) return null;
-  if (typeof r.value === 'string') {
-    try { return JSON.parse(r.value); } catch { return r.value; }
+  // Fresh background tabs occasionally destroy the execution context
+  // mid-navigation ("Command failed" with no stderr); retry those.
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = unwrap(await cmd('evaluate', { code }, session), 'evaluate');
+      if (!r) return null;
+      if (typeof r.value === 'string') {
+        try { return JSON.parse(r.value); } catch { return r.value; }
+      }
+      return r.value !== undefined ? r.value : r;
+    } catch (e) {
+      lastErr = e;
+      if (!/Command failed|Execution context|Cannot find context|navigation/i.test(e.message) || attempt === 2) throw e;
+      await sleep(600);
+    }
   }
-  return r.value !== undefined ? r.value : r;
+  throw lastErr;
 }
 
 async function findChatgptTab(session) {
@@ -956,12 +1571,23 @@ async function getConversationProgress(session, imageMinAssistantIndex = null) {
         stopCount > 0 ||
         !!document.querySelector('[data-testid*="stop"], [aria-label*="Stop generating"], [aria-label*="停止生成"]') ||
         buttons.some((b) => /stop generating|stop responding|停止生成|停止回答/i.test(attrText(b)));
+      // Attachment evidence inside the newest user turn: tiles/arial-labels
+      // and filenames rendered with the message the model replies to.
+      const lastUser = users[users.length - 1] || null;
+      const lastUserAttachments = lastUser ? [
+        (typeof lastUser.getAttribute === 'function' ? lastUser.getAttribute('aria-label') : '') || '',
+        ...(typeof lastUser.querySelectorAll === 'function'
+          ? [...lastUser.querySelectorAll('[aria-label], img[alt], [data-testid]')].map((el) => [el.getAttribute('aria-label'), el.getAttribute('alt'), textOf(el)].filter(Boolean).join(' '))
+          : []),
+        textOf(lastUser).slice(0, 2000),
+      ].filter(Boolean) : [];
       return JSON.stringify({
         assistantCount: virtualAssistantCount,
         assistantRoleCount: assistants.length,
         imageRootCount: imageRoots.length,
         userCount: users.length,
         messageCount: messages.length,
+        lastUserAttachments,
         lastAssistantLen: lastText.length,
         lastAssistantText: lastText,
         lastAssistantImageCount: lastImages.length,
@@ -1036,8 +1662,13 @@ async function stageEnsureModel(state, opts = {}) {
     const priorTo = normalizeModelName(prior.to || prior.state && prior.state.model || '');
     const priorTarget = normalizeModelName(prior.target || prior.requested || '');
     // Explicit model targets must be re-validated after a resume: ChatGPT can
-    // change the selected intelligence level outside this process.
+    // change the selected intelligence level outside this process. Image runs
+    // are exempt: their pill shows the Power label after the xhigh step, so
+    // re-validation would false-negative; the tier is never switched away.
     if (target === 'auto') {
+      return { skipped: true, data: prior };
+    }
+    if (opts.imageMode && (priorTo === DEFAULT_MODEL || priorTarget === DEFAULT_MODEL) && target === DEFAULT_MODEL) {
       return { skipped: true, data: prior };
     }
     log(`ensure-model: re-checking explicit target=${target} (state was ${priorTo || priorTarget || 'unknown'})`);
@@ -1083,6 +1714,16 @@ async function stageEnsureModel(state, opts = {}) {
   if (result.ok && result.state && result.state.model && result.state.model !== 'unknown') {
     state.model = normalizeModelName(result.state.model);
     state.effort = normalizeEffort(result.state.effort || effort);
+    if (opts.imageMode && isProModel(state.model)) {
+      const power = await ensurePower(state.session, DEFAULT_IMAGE_EFFORT, state.browserBackend);
+      if (!power.ok) {
+        const e = new Error(`could not set image Power to ${DEFAULT_IMAGE_EFFORT}: ${power.error || power.label || 'unknown'}`);
+        e.code = 'power_switch_failed';
+        e.stageData = power;
+        throw e;
+      }
+      state.effort = DEFAULT_IMAGE_EFFORT;
+    }
     saveState(state);
   }
   const data = { target, requested: target, from: 'unknown', to: result.state.model, effort: result.state.effort || effort, changed: result.changed, backend: state.browserBackend };
@@ -1142,7 +1783,14 @@ async function stageEnsureTool(state, opts) {
   await sleep(900);
   const after = await detectToolState(state.session);
   const ok = target === 'none' ? !after.selectedTool : after.selectedTool === target;
-  if (!ok) {
+  // Sept 2026 UI: after picking "Create image" the selection may not expose a
+  // detectable chip/pill. Trust the menu click itself for image runs instead
+  // of failing the whole pipeline.
+  const clickedButUnverified = !ok && picked && picked.clicked && opts.imageMode && target === 'create-image';
+  if (clickedButUnverified) {
+    log(`ensure-tool: clicked "Create image" but could not verify a chip (current=${after.selectedTool || 'none'}); continuing`);
+  }
+  if (!ok && !clickedButUnverified) {
     const e = new Error(`could not ensure tool=${target} (current=${after.selectedTool || 'none'}). Please select "${toolLabel(target)}" manually from Add files and more, then re-run with --resume.`);
     e.code = 'tool_switch_failed';
     e.stageData = { target, before, after, picked };
@@ -1182,7 +1830,7 @@ async function detectToolState(session) {
         if (!el) return false;
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
       };
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       const matchesAny = (text, labels) => {
@@ -1200,11 +1848,22 @@ async function detectToolState(session) {
         }
         return '';
       };
+      // Menu rows must match by their FIRST LINE exactly — substring matching
+      // pulls sidebar conversation titles ("Create Sticker Images") and the
+      // "Browse and search your files" subtitle into fake tool hits.
+      const rowTargetFor = (text) => {
+        const first = norm(text).split('\\n').map((part) => part.trim()).find(Boolean) || '';
+        if (!first) return '';
+        for (const [key, cfg] of Object.entries(targets)) {
+          if ((cfg.labels || []).some((label) => norm(label) === first)) return key;
+        }
+        return '';
+      };
       const findToolMenu = () => {
         const hasItems = (root) => {
           if (!root) return false;
-          return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
-            .some((el) => targetFor(textOf(el), false));
+          return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item')]
+            .some((el) => rowTargetFor(textOf(el)));
         };
         const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasItems(el));
         if (legacy) return { kind: 'menu', node: legacy };
@@ -1234,9 +1893,22 @@ async function detectToolState(session) {
         };
       };
       const toolsMenu = findToolMenu();
-      const menuItems = toolsMenu
-        ? [...toolsMenu.node.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')].map(describe).filter((item) => item.tool)
+      let menuItems = toolsMenu
+        ? [...toolsMenu.node.querySelectorAll('[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item')]
+            .map((el) => ({ ...describe(el), tool: rowTargetFor(textOf(el)) }))
+            .filter((item) => item.tool)
         : [];
+      if (!menuItems.length) {
+        // Sept 2026 fallback: plain div[tabindex="0"] tool rows with no
+        // role=menu ancestor. Exact first-line match only, and never inside
+        // nav/aside (sidebar history titles would otherwise fake a hit).
+        const direct = [...document.querySelectorAll('[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item')]
+          .filter((el) => visible(el) && textOf(el).length < 200 && !el.closest('nav,aside'))
+          .map((el) => ({ ...describe(el), tool: rowTargetFor(textOf(el)) }))
+          .filter((item) => item.tool)
+          .sort((a, b) => (a.text || '').length - (b.text || '').length);
+        menuItems = direct.slice(0, 8);
+      }
       const checkedRadio = menuItems.find((item) => item.checked === 'true' || item.state === 'checked') || null;
       const removable = [...document.querySelectorAll('button,[role="button"]')]
         .map(describe)
@@ -1284,7 +1956,7 @@ async function readToolsMenu(session) {
         if (!el) return false;
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
       };
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       const targetFor = (text) => {
@@ -1297,101 +1969,321 @@ async function readToolsMenu(session) {
         }
         return '';
       };
+      const rowTargetFor = (text) => {
+        const first = norm(text).split('\\n').map((part) => part.trim()).find(Boolean) || '';
+        if (!first) return '';
+        for (const [key, labels] of Object.entries(targets)) {
+          if (labels.some((label) => norm(label) === first)) return key;
+        }
+        return '';
+      };
       const hasItems = (root) => {
         if (!root) return false;
-        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
-          .some((el) => targetFor(textOf(el)));
+        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item')]
+          .some((el) => rowTargetFor(textOf(el)));
       };
       const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasItems(el)) || null;
       const popover = legacy ? null : [...document.querySelectorAll('.popover,[class*="popover"]')].find((el) => visible(el) && hasItems(el)) || null;
       const root = legacy || popover || null;
       const kind = legacy ? 'menu' : popover ? 'popover' : '';
-      const items = root ? [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')].map((el) => ({
+      const items = root ? [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item')].map((el) => ({
         text: textOf(el),
         role: el.getAttribute('role') || '',
         checked: el.getAttribute('aria-checked') || '',
         state: el.getAttribute('data-state') || '',
         keyword: el.getAttribute('data-keyword') || '',
-        tool: targetFor(textOf(el)),
+        tool: rowTargetFor(textOf(el)),
       })).filter((item) => item.tool) : [];
-      return JSON.stringify({ open: !!root, kind, text: root ? textOf(root) : '', items });
+      if (!root || !items.length) {
+        // Sept 2026 fallback: the tools menu may expose plain div[tabindex="0"]
+        // rows without any role=menu/popover ancestor. Exact first-line match
+        // only, never inside nav/aside (sidebar history would fake a hit).
+        const direct = [...document.querySelectorAll('[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item')]
+          .filter((el) => visible(el) && textOf(el).length < 200 && !el.closest('nav,aside'))
+          .map((el) => ({
+            text: textOf(el),
+            role: el.getAttribute('role') || '',
+            checked: el.getAttribute('aria-checked') || '',
+            state: el.getAttribute('data-state') || '',
+            keyword: el.getAttribute('data-keyword') || '',
+            tool: rowTargetFor(textOf(el)),
+          }))
+          .filter((item) => item.tool)
+          .sort((a, b) => a.text.length - b.text.length);
+        if (direct.length) {
+          return JSON.stringify({ open: true, kind: 'direct', text: '', items: direct.slice(0, 8) });
+        }
+      }
+      return JSON.stringify({ open: !!root, kind, text: root ? textOf(root) : '', items, expanded: (document.querySelector('[data-testid="composer-plus-btn"]') || {}).getAttribute ? document.querySelector('[data-testid="composer-plus-btn"]').getAttribute('aria-expanded') : '' });
     })()`
   );
   return v || { open: false, items: [] };
 }
 
-async function openToolsMenu(session) {
-  let menu = await readToolsMenu(session);
-  if (menu.open) return { ...menu, opened: false };
-  const opened = await evaluate(
-    session,
-    `(() => {
-      const btn =
-        document.querySelector('[data-testid="composer-plus-btn"]') ||
-        document.querySelector('button[aria-label*="Add files"]') ||
-        document.querySelector('button[aria-label*="添加"]');
-      if (!btn) return JSON.stringify({ opened: false, reason: 'button_not_found' });
-      const r = btn.getBoundingClientRect();
-      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
-        btn.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
-      }
-      return JSON.stringify({ opened: true });
-    })()`
-  );
-  const deadline = Date.now() + 4000;
-  do {
+function normLabelText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// Parse `opencli browser <s> state` (plain text tree) into tool-row candidates.
+// Row containers render as `[N]<div tabindex=0 />` followed by their child
+// spans (title + subtitle) until the next container line.
+function parseStateMenuRows(treeText) {
+  const rows = [];
+  let current = null;
+  for (const line of String(treeText || '').split('\n')) {
+    const m = line.match(/^\s*\[(\d+)\]<div tabindex=0/);
+    if (m) {
+      if (current) rows.push(current);
+      current = { ref: m[1], texts: [] };
+      continue;
+    }
+    if (current) {
+      const stripped = line.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').trim();
+      if (stripped && !/^(svg|img|div|span)$/i.test(stripped)) current.texts.push(stripped);
+    }
+  }
+  if (current) rows.push(current);
+  return rows;
+}
+
+// The Sept 2026 tools popover dismisses itself ~1-2s after opening on
+// background windows, and in-page synthetic events never open it at all.
+// The reliable recipe (verified live) is: activate the window via same-URL
+// `open`, trusted-click the plus button, snapshot the a11y tree, and
+// trusted-click the row ref — all CLI-side with no cross-call gaps.
+async function snapshotToolMenu(session, { clickRowLabels } = {}) {
+  const cur = await evaluate(session, `(() => JSON.stringify({ url: location.href }))()`).catch(() => null);
+  const url = (cur && cur.url && CHATGPT_HOST_RE.test(cur.url)) ? cur.url : 'https://chatgpt.com/';
+  await runOpencli(['browser', session, 'open', url], 'activate session tab').catch(() => undefined);
+  // The same-URL `open` may reload the page; wait for full hydration before
+  // clicking or the React handler is not attached yet.
+  for (let i = 0; i < 20; i++) {
+    const ready = await evaluate(session, `(() => JSON.stringify({ rs: document.readyState, plus: !!document.querySelector('[data-testid="composer-plus-btn"]') }))()`).catch(() => null);
+    if (ready && ready.rs === 'complete' && ready.plus) break;
+    await sleep(500);
+  }
+  await sleep(800);
+  let snap = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      unwrap(await cmd('click', { selector: '[data-testid="composer-plus-btn"]' }, session), 'open tools menu');
+    } catch (e) {
+      log(`tools menu trusted click failed: ${e.message}`);
+    }
     await sleep(250);
-    menu = await readToolsMenu(session);
-    if (menu.open) return { ...menu, opened: !!(opened && opened.opened), openAttempt: opened };
-  } while (Date.now() < deadline);
-  return { ...menu, opened: !!(opened && opened.opened), openAttempt: opened };
+    const out = await runOpencli(['browser', session, 'state'], 'snapshot tools menu', { allowPlain: true });
+    const tree = typeof out === 'string' ? out : String(out && out.tree || '');
+    const rows = parseStateMenuRows(tree);
+    const items = [];
+    let rowRef = null;
+    for (const row of rows) {
+      let tool = '';
+      for (const text of row.texts) {
+        const first = normLabelText(text);
+        if (!first) continue;
+        for (const [key, cfg] of Object.entries(TOOL_TARGETS)) {
+          if ((cfg.labels || []).some((label) => normLabelText(label) === first)) { tool = key; break; }
+        }
+        if (tool) break;
+      }
+      if (tool) items.push({ ref: row.ref, text: row.texts.join(' / '), tool });
+      if (clickRowLabels && !rowRef) {
+        const hit = row.texts.some((text) => clickRowLabels.some((label) => normLabelText(label) === normLabelText(text)));
+        if (hit) rowRef = row.ref;
+      }
+    }
+    snap = { items, rowRef };
+    if (snap.items.length >= 2) break;
+    // Retry: dismiss the half-open state, re-activate, wait, click again.
+    await evaluate(session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); return true; })()`).catch(() => false);
+    await sleep(800);
+    await runOpencli(['browser', session, 'open', url], 're-activate session tab').catch(() => undefined);
+    await sleep(1200);
+  }
+  return snap || { items: [], rowRef: null };
+}
+
+// ego port of the tools-menu recipe, adapted for the Sept 2026 UI: the
+// popover rows are plain div[tabindex=0] elements whose a11y snapshot shows
+// unnamed containers, so snapshotText cannot carry the row labels. Instead
+// one ego runtime spawn trusted-clicks the plus button, finds the label rows
+// via DOM (exact first-line match, sidebar excluded), tags the target row,
+// and trusted-clicks it — all inside the SAME spawn so the popover cannot
+// dismiss in between.
+async function snapshotToolMenuEgo(session, { clickRowLabels = null, clickMatchedRow = false } = {}) {
+  const toolLabels = {};
+  for (const [key, cfg] of Object.entries(TOOL_TARGETS)) toolLabels[key] = cfg.labels || [];
+  const rowScanner = `(() => {
+    const toolLabels = ${JSON.stringify(toolLabels)};
+    const clickLabels = ${JSON.stringify(clickRowLabels || [])};
+    const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const visible = (el) => { const r = el.getBoundingClientRect(); const s = window.getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+    const SEL = '[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item';
+    // Split the RAW text on newlines first: norm() would collapse the title
+    // and subtitle lines ("网页搜索\\n查找实时新闻和信息") into one string that
+    // can never equal a bare label.
+    const firstLine = (el) => norm(String(textOf(el) || '').split('\\n').map((p) => p.trim()).find((p) => p) || '');
+    const rows = [...document.querySelectorAll(SEL)].filter((el) => visible(el) && textOf(el).length < 200 && !el.closest('nav,aside'));
+    const items = [];
+    let pickedEl = null;
+    for (const el of rows) {
+      const first = firstLine(el);
+      if (!first) continue;
+      let tool = '';
+      for (const key of Object.keys(toolLabels)) {
+        if ((toolLabels[key] || []).some((label) => norm(label) === first)) { tool = key; break; }
+      }
+      if (tool) items.push({ text: textOf(el).split('\\n')[0], tool });
+      if (clickLabels.length && !pickedEl) {
+        if (clickLabels.some((label) => norm(label) === first)) pickedEl = el;
+      }
+    }
+    items.sort((a, b) => a.text.length - b.text.length);
+    let picked = null;
+    if (pickedEl) {
+      const tagAttr = 'ego' + Math.random().toString(36).slice(2, 10);
+      pickedEl.setAttribute('data-ego-tag', tagAttr);
+      picked = { selector: '[data-ego-tag="' + tagAttr + '"]', text: textOf(pickedEl).split('\\n')[0] };
+    }
+    return JSON.stringify({ items: items.slice(0, 8), picked, rawRowCount: rows.length });
+  })()`;
+  const program = [
+    `const __req = ${egoJsonLiteral({ space: egoSpaceName(session), args: { clickMatchedRow, url: 'https://chatgpt.com/' } })};`,
+    'let __settled = false;',
+    `const __ok = (data) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data })); };`,
+    `const __err = (e) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: 'ego_failed' })); };`,
+    'try {',
+    '  const __task = await useOrCreateTaskSpace(__req.space);',
+    '  const args = __req.args || {};',
+    '  const CHAT_RE = /chatgpt\\.com/i;',
+    '  // js() returns JSON.stringify() output as a raw string; parse it.',
+    '  const __j = async (code) => { let v = await js(code); if (typeof v === \'string\') { try { v = JSON.parse(v); } catch (e) {} } return v; };',
+    `  const scanRows = () => __j(${JSON.stringify(rowScanner)});`,
+    '  const findTab = async () => {',
+    '    const tabs = (await listTabs()) || [];',
+    '    return tabs.find((t) => CHAT_RE.test(t.url || "")) || null;',
+    '  };',
+    '  let tab = await findTab();',
+    '  if (!tab) tab = await openOrReuseTab(args.url || "https://chatgpt.com/", { wait: true, timeout: 45 });',
+    '  else { try { await switchTab(tab.targetId); } catch (e) {} }',
+    '  for (let i = 0; i < 20; i++) {',
+    '    const ready = await __j(\'(() => JSON.stringify({ rs: document.readyState, plus: !!document.querySelector("[data-testid=composer-plus-btn]") }))()\');',
+    '    if (ready && ready.rs === "complete" && ready.plus) break;',
+    '    await wait(0.5);',
+    '  }',
+    '  await wait(0.8);',
+    '  let snap = null;',
+    '  const attempts = [];',
+    '  for (let attempt = 0; attempt < 2; attempt++) {',
+    '    try { await click(\'[data-testid=composer-plus-btn]\'); } catch (e) {}',
+    '    await wait(0.5);',
+    '    const scanned = await scanRows();',
+    '    const expanded = await js(\'(() => { const b = document.querySelector("[data-testid=composer-plus-btn]"); return b ? b.getAttribute("aria-expanded") : "nobtn" })()\');',
+    '    const items = (scanned && scanned.items) || [];',
+    '    const picked = (scanned && scanned.picked) || null;',
+    '    let rowRef = null;',
+    '    let rowClicked = false;',
+    '    let rowClickError = "";',
+    '    if (args.clickMatchedRow && picked && picked.selector) {',
+    '      rowRef = picked.selector;',
+    '      try { await click(rowRef); rowClicked = true; } catch (e) { rowClickError = String((e && e.message) || e); }',
+    '    }',
+    '    snap = { items, rowRef, rowClicked, rowClickError, expanded, rawRowCount: scanned && scanned.rawRowCount, pickedInfo: picked, attempts };',
+    '    attempts.push({ attempt, itemCount: items.length, expanded, hadPicked: !!picked });',
+    '    if (items.length >= 2 && (!args.clickMatchedRow || rowClicked)) break;',
+    '    await js(\'(() => { document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true})); return true; })()\');',
+    '    await wait(0.8);',
+    '    try { await switchTab(tab.targetId); } catch (e) {}',
+    '    await wait(1.2);',
+    '  }',
+    '  __ok(snap || { items: [], rowRef: null, rowClicked: false, rowClickError: "" });',
+    '} catch (e) { __err(e); }',
+    'if (!__settled) __err(new Error(\'ego tools-menu adapter produced no result\'));',
+  ].join('\n');
+  if (process.env.EGO_DEBUG_PROGRAM) fs.writeFileSync(process.env.EGO_DEBUG_PROGRAM, program);
+  return runEgoProgram(program, {
+    timeoutMs: 180000,
+    label: 'tools menu snapshot',
+  });
+}
+
+async function openToolsMenu(session) {
+  const snap = ACTIVE_BROWSER_BACKEND === 'ego'
+    ? await snapshotToolMenuEgo(session)
+    : await snapshotToolMenu(session);
+  log(`tools menu snapshot: items=${snap.items.map((i) => i.tool).join('|') || 'none'}`);
+  const open = snap.items.length >= 2;
+  if (!open) {
+    // Escape whatever half-state the failed attempt left behind.
+    await evaluate(session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); return true; })()`).catch(() => false);
+  }
+  return { open, items: snap.items, opened: open };
 }
 
 async function clickToolMenuItem(session, target) {
   const normalized = normalizeToolName(target);
   const cfg = TOOL_TARGETS[normalized];
   if (!cfg) return { clicked: false, reason: 'unknown_target', target: normalized };
-  const menu = await openToolsMenu(session);
-  if (!menu.open) return { clicked: false, reason: 'menu_not_open', target: normalized, menu };
+  if (ACTIVE_BROWSER_BACKEND === 'ego') {
+    const snap = await snapshotToolMenuEgo(session, { clickRowLabels: cfg.labels, clickMatchedRow: true });
+    if (snap.rowRef && snap.rowClicked) {
+      return { target: normalized, clicked: true, ref: snap.rowRef, items: snap.items };
+    }
+    if (snap.rowRef && snap.rowClickError) {
+      log(`tools menu row click failed: ${snap.rowClickError}; falling back to in-page click`);
+    }
+  } else {
+    const snap = await snapshotToolMenu(session, { clickRowLabels: cfg.labels });
+    if (snap.rowRef) {
+      await runOpencli(['browser', session, 'click', String(snap.rowRef)], 'click tool row');
+      return { target: normalized, clicked: true, ref: snap.rowRef, items: snap.items };
+    }
+  }
+  // Fallback: the atomic in-page open + click (works when the popover stays
+  // open long enough to be read from the page itself).
+  log(`tools menu row not found in snapshot; falling back to in-page click`);
   const picked = await evaluate(
     session,
-    `(() => {
+    `(async () => {
       const labels = ${JSON.stringify(cfg.labels)};
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
-      const visible = (el) => {
-        if (!el) return false;
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-      };
+      const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = window.getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
       const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-      const matches = (text) => {
-        const t = norm(text);
-        return labels.some((label) => {
-          const l = norm(label);
-          return t === l || t.includes(l);
-        });
+      const rowMatch = (el) => {
+        const first = norm(textOf(el)).split('\\n').map((p) => p.trim()).find(Boolean) || '';
+        return labels.some((label) => norm(label) === first);
       };
-      const hasItems = (root) => {
-        if (!root) return false;
-        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
-          .some((el) => matches(textOf(el)));
+      const SEL = '[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item';
+      const findRow = () => [...document.querySelectorAll(SEL)]
+        .filter((el) => visible(el) && textOf(el).length < 200 && !el.closest('nav,aside') && rowMatch(el))
+        .sort((a, b) => textOf(a).length - textOf(b).length)[0] || null;
+      const clickEl = (el) => {
+        const r = el.getBoundingClientRect();
+        for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          el.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+        }
       };
-      const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasItems(el)) || null;
-      const popover = legacy ? null : [...document.querySelectorAll('.popover,[class*="popover"]')].find((el) => visible(el) && hasItems(el)) || null;
-      const root = legacy || popover || null;
-      if (!root) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
-      const items = [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')];
-      const item = items.find((el) => matches(textOf(el)));
-      if (!item) return JSON.stringify({ clicked: false, reason: 'item_not_found', items: items.map((el) => textOf(el)) });
-      const r = item.getBoundingClientRect();
-      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
-        item.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+      let item = findRow();
+      if (!item) {
+        const btn = document.querySelector('[data-testid="composer-plus-btn"]') ||
+          document.querySelector('button[aria-label*="Add files"]') ||
+          document.querySelector('button[aria-label*="添加"]');
+        if (!btn) return JSON.stringify({ clicked: false, reason: 'button_not_found' });
+        clickEl(btn);
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          item = findRow();
+          if (item) break;
+        }
       }
-      return JSON.stringify({ clicked: true, text: textOf(item), checked: item.getAttribute('aria-checked') || '', state: item.getAttribute('data-state') || '' });
+      if (!item) return JSON.stringify({ clicked: false, reason: 'item_not_found', expanded: (document.querySelector('[data-testid="composer-plus-btn"]') || { getAttribute: () => '' }).getAttribute('aria-expanded') });
+      clickEl(item);
+      return JSON.stringify({ clicked: true, text: textOf(item).split('\\n')[0], checked: item.getAttribute('aria-checked') || '', state: item.getAttribute('data-state') || '' });
     })()`
   );
-  return { target: normalized, menu, ...(picked || {}) };
+  return { target: normalized, ...(picked || {}) };
 }
 
 async function clearInlineToolPills(session) {
@@ -1473,35 +2365,44 @@ async function clickActiveToolButton(session, target) {
 }
 
 async function clickCheckedToolMenuItem(session) {
-  const menu = await openToolsMenu(session);
-  if (!menu.open) return { clicked: false, reason: 'menu_not_open', menu };
+  // Atomic open + click on the checked row: the popover does not survive
+  // across CDP calls on background windows, so do everything in one eval.
   const picked = await evaluate(
     session,
-    `(() => {
+    `(async () => {
       const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
-      const visible = (el) => {
-        if (!el) return false;
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = window.getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const isChecked = (el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked';
+      const SEL = '[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item';
+      const findChecked = () => [...document.querySelectorAll(SEL)]
+        .filter((el) => visible(el) && isChecked(el) && textOf(el).length < 200 && !el.closest('nav,aside'))
+        .sort((a, b) => textOf(a).length - textOf(b).length)[0] || null;
+      const clickEl = (el) => {
+        const r = el.getBoundingClientRect();
+        for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          el.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+        }
       };
-      const hasChecked = (root) => {
-        if (!root) return false;
-        return [...root.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')]
-          .some((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
-      };
-      const legacy = [...document.querySelectorAll('[role="menu"]')].find((el) => visible(el) && hasChecked(el)) || null;
-      if (!legacy) return JSON.stringify({ clicked: false, reason: 'menu_not_found' });
-      const item = [...legacy.querySelectorAll('[role="menuitemradio"],[role="menuitem"],div.group.__menu-item,button.__menu-item')].find((el) => el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked');
-      if (!item) return JSON.stringify({ clicked: false, reason: 'checked_item_not_found' });
-      const r = item.getBoundingClientRect();
-      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
-        item.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+      let item = findChecked();
+      if (!item) {
+        const btn = document.querySelector('[data-testid="composer-plus-btn"]') ||
+          document.querySelector('button[aria-label*="Add files"]') ||
+          document.querySelector('button[aria-label*="添加"]');
+        if (!btn) return JSON.stringify({ clicked: false, reason: 'button_not_found' });
+        clickEl(btn);
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          item = findChecked();
+          if (item) break;
+        }
       }
-      return JSON.stringify({ clicked: true, text: textOf(item), checked: item.getAttribute('aria-checked') || '', state: item.getAttribute('data-state') || '' });
+      if (!item) return JSON.stringify({ clicked: false, reason: 'checked_item_not_found' });
+      clickEl(item);
+      return JSON.stringify({ clicked: true, text: textOf(item).split('\\n')[0], checked: item.getAttribute('aria-checked') || '', state: item.getAttribute('data-state') || '' });
     })()`
   );
-  return { menu, ...(picked || {}) };
+  return picked || { clicked: false, reason: 'no_result' };
 }
 
 function uploadFilesForState(state) {
@@ -1525,6 +2426,77 @@ function validateUploadFiles(files) {
     e.stageData = { missing, invalid };
     throw e;
   }
+}
+
+function guessUploadMime(fileName) {
+  const ext = path.extname(fileName || '').toLowerCase();
+  const map = {
+    '.txt': 'text/plain', '.md': 'text/markdown', '.markdown': 'text/markdown',
+    '.csv': 'text/csv', '.json': 'application/json', '.ya?ml': 'text/plain',
+    '.pdf': 'application/pdf',
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml',
+    '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.ppt': 'application/vnd.ms-powerpoint', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+// OpenCLI's native `upload` clicks the input and waits for a file chooser,
+// which never fires for ChatGPT's hidden composer input (verified Sept 2026).
+// Attaching through an in-page DataTransfer + synthetic change event is what
+// the React composer actually accepts. Re-attaching skips exact duplicates
+// (same name + same size) so a --resume never double-attaches a file.
+async function attachFilesViaDataTransfer(session, files) {
+  const attached = [];
+  for (const file of files) {
+    const buffer = fs.readFileSync(file);
+    const name = path.basename(file);
+    const mimeType = guessUploadMime(name);
+    const b64 = buffer.toString('base64');
+    if (b64.length > 1_300_000) {
+      const e = new Error(`file too large for the DataTransfer transport (${name}, ${buffer.length} bytes); use the OpenCLI native upload fallback`);
+      e.code = 'upload_transport_too_large';
+      throw e;
+    }
+    const r = await evaluate(
+      session,
+      `(() => {
+        const name = ${JSON.stringify(name)};
+        const mimeType = ${JSON.stringify(mimeType)};
+        const b64 = ${JSON.stringify(b64)};
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const dt = new DataTransfer();
+        const input = document.querySelector(${JSON.stringify(DEFAULT_UPLOAD_SELECTOR)}) ||
+          [...document.querySelectorAll('input[type="file"]')].find((el) => el.id === 'upload-files') ||
+          [...document.querySelectorAll('input[type="file"]')].find((el) => el.multiple && !/^image\\//i.test(el.accept || '')) ||
+          document.querySelector('input[type="file"]');
+        if (!input) return JSON.stringify({ ok: false, error: 'no_file_input' });
+        for (const existing of [...(input.files || [])]) {
+          if (existing.name === name && existing.size === bytes.length) {
+            return JSON.stringify({ ok: true, duplicated: true, count: input.files.length, names: [...input.files].map((f) => f.name) });
+          }
+          dt.items.add(existing);
+        }
+        dt.items.add(new File([bytes], name, { type: mimeType }));
+        input.files = dt.files;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return JSON.stringify({ ok: true, count: input.files.length, names: [...input.files].map((f) => f.name) });
+      })()`
+    );
+    if (!r || !r.ok) {
+      const e = new Error(`DataTransfer attach failed for ${name}: ${(r && r.error) || 'no result'}`);
+      e.code = 'upload_attach_failed';
+      throw e;
+    }
+    attached.push({ name, bytes: buffer.length, mimeType, ...r });
+    log(`attached ${name} (${r.duplicated ? 'already present' : `${r.count} file(s) in input`})`);
+  }
+  return attached;
 }
 
 async function waitForUploadInput(session, selector, maxSeconds = 8) {
@@ -1589,8 +2561,8 @@ function attachmentsAreReady(state, expectedCounts) {
   return Object.entries(expectedCounts).every(([name, count]) => Number(observed[name] || 0) >= count);
 }
 
-function sendButtonIsReady(state) {
-  return !!(
+function sendButtonIsReady(state, expectedCounts) {
+  const base = !!(
     state &&
     state.buttonFound &&
     state.buttonVisible &&
@@ -1599,6 +2571,11 @@ function sendButtonIsReady(state) {
     !state.uploadPending &&
     !state.uploadFailed
   );
+  // When files are part of the turn, the composer must show the removable
+  // attachment chips — a ready button alone once sent prompt-only turns.
+  if (!base || !expectedCounts || !Object.keys(expectedCounts).length) return base;
+  const observed = state.observedNameCounts || {};
+  return Object.entries(expectedCounts).every(([name, count]) => Number(observed[name] || 0) >= count);
 }
 
 // Click the exact element that the readiness probe verified, falling back to
@@ -1607,7 +2584,7 @@ function sendClickSelector(state) {
   return (state && state.buttonSelector) || SEND_BUTTON_SELECTOR_CSS;
 }
 
-function promptSendWasAccepted(before, after, composerState) {
+function promptSendWasAccepted(before, after, composerState, requireNames) {
   const beforeUsers = Number(before && before.userCount);
   const afterUsers = Number(after && after.userCount);
   const beforeMessages = Number(before && before.messageCount);
@@ -1615,7 +2592,16 @@ function promptSendWasAccepted(before, after, composerState) {
   const userAdvanced = Number.isFinite(beforeUsers) && Number.isFinite(afterUsers) && afterUsers > beforeUsers;
   const messagesAdvanced = Number.isFinite(beforeMessages) && Number.isFinite(afterMessages) && afterMessages > beforeMessages;
   const composerCleared = !String(composerState && composerState.composerText || '').trim();
-  return userAdvanced || (composerCleared && (messagesAdvanced || !!(after && after.busy)));
+  const accepted = userAdvanced || (composerCleared && (messagesAdvanced || !!(after && after.busy)));
+  if (!accepted) return false;
+  // A turn only counts as sent when the new user message itself carries the
+  // expected attachments (prevents prompt-only sends after chip loss).
+  if (Array.isArray(requireNames) && requireNames.length) {
+    const hay = (Array.isArray(after && after.lastUserAttachments) ? after.lastUserAttachments : [])
+      .join('\n').toLowerCase().replace(/\(\d+\)/g, '');
+    return requireNames.every((name) => hay.includes(String(name).toLowerCase()));
+  }
+  return true;
 }
 
 async function inspectComposerUploadState(session, files) {
@@ -1629,7 +2615,7 @@ async function inspectComposerUploadState(session, files) {
         if (!el) return false;
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
       };
       const fileInputs = [...document.querySelectorAll('input[type="file"]')].map((input) => ({
         id: input.id || '',
@@ -1640,15 +2626,29 @@ async function inspectComposerUploadState(session, files) {
         .filter(visible)
         .map((group) => group.getAttribute('aria-label') || '')
         .filter(Boolean);
+      // Real attachment evidence = the removable tile ChatGPT renders in the
+      // composer. The browser input's stale .files are NOT evidence: they
+      // linger after the composer resets, which caused prompt-only sends.
+      const removalChips = [...document.querySelectorAll('[aria-label]')]
+        .filter(visible)
+        .map((el) => el.getAttribute('aria-label') || '')
+        .filter((label) => /remove\\s*(file|attachment|image)|移除(文件|附件|图片)|删除(文件|附件)|detach/i.test(label));
       const countNames = (values) => values.reduce((counts, name) => {
         counts[name] = (counts[name] || 0) + 1;
         return counts;
       }, {});
       const inputNameCounts = countNames(fileInputs.flatMap((input) => input.names));
-      const groupNameCounts = countNames(attachmentGroups);
+      // ChatGPT renames duplicate attachments ("name(2).txt"); normalize the
+      // copy suffix so chip matching survives it.
+      const normName = (s) => String(s || '').toLowerCase().replace(/\\(\\d+\\)/g, '').replace(/\\s+/g, '');
+      const chipCounts = {};
+      for (const name of names) {
+        const target = normName(name);
+        chipCounts[name] = [...attachmentGroups, ...removalChips].filter((label) => normName(label).includes(target)).length;
+      }
       const observedNameCounts = {};
       for (const name of names) {
-        observedNameCounts[name] = Math.max(inputNameCounts[name] || 0, groupNameCounts[name] || 0);
+        observedNameCounts[name] = chipCounts[name] || 0;
       }
       const form = document.querySelector('form') || document.body;
       const formText = textOf(form);
@@ -1665,6 +2665,8 @@ async function inspectComposerUploadState(session, files) {
         names,
         fileInputs,
         attachmentGroups,
+        removalChips,
+        inputNameCounts,
         observedNameCounts,
         uploadPending: !!uploadPendingMatch || pendingElements.length > 0,
         uploadPendingText: uploadPendingMatch ? uploadPendingMatch[0] : '',
@@ -1706,19 +2708,36 @@ async function waitForUploadedFileNames(session, files, maxSeconds) {
 }
 
 async function waitForSendButtonReady(session, files, maxSeconds) {
+  const expectedCounts = expectedFileNameCounts(files);
+  const expectUploads = Object.keys(expectedCounts).length > 0;
   const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
   let last = null;
+  let lastReattachAt = 0;
   do {
     const result = await inspectComposerUploadState(session, files);
     last = result;
     if (result && result.uploadFailed) return { ok: false, ...result };
-    if (sendButtonIsReady(result)) return { ok: true, ...result };
+    // Chips can vanish between the upload stage and send (composer reset,
+    // resume hours later). Re-attach from the local files instead of ever
+    // sending a prompt-only turn. If the input still holds every file, do
+    // NOT fire change again — that is how duplicate "(2)" attachments appear.
+    if (expectUploads && sendButtonIsReady(result) && !sendButtonIsReady(result, expectedCounts)) {
+      const inputHasAll = Object.entries(expectedCounts).every(([n, c]) => Number((result.inputNameCounts || {})[n] || 0) >= c);
+      if (!inputHasAll && Date.now() - lastReattachAt > 15000) {
+        lastReattachAt = Date.now();
+        log('send gate: attachment chips missing; re-attaching files before sending');
+        await attachFilesViaDataTransfer(session, files).catch((e) => log(`re-attach failed: ${e.message}`));
+        await sleep(1000);
+        continue;
+      }
+    }
+    if (sendButtonIsReady(result, expectedCounts)) return { ok: true, ...result };
     await sleep(1000);
   } while (Date.now() < deadline);
   return { ok: false, ...(last || {}) };
 }
 
-async function waitForPromptAccepted(session, before, prompt, maxSeconds = DEFAULT_SEND_CONFIRM_SECONDS) {
+async function waitForPromptAccepted(session, before, prompt, maxSeconds = DEFAULT_SEND_CONFIRM_SECONDS, requireNames = []) {
   const deadline = Date.now() + Math.max(0, maxSeconds) * 1000;
   let last = null;
   do {
@@ -1727,7 +2746,7 @@ async function waitForPromptAccepted(session, before, prompt, maxSeconds = DEFAU
       inspectComposerUploadState(session, []).catch(() => ({})),
     ]);
     last = { progress, composerState };
-    if (promptSendWasAccepted(before, progress, composerState)) {
+    if (promptSendWasAccepted(before, progress, composerState, requireNames)) {
       return { ok: true, promptLength: prompt.length, ...last };
     }
     await sleep(500);
@@ -1805,22 +2824,36 @@ async function stageUpload(state, opts) {
   log(`uploading ${files.length} file(s)...`);
   let uploadResult;
   try {
-    uploadResult = unwrap(
-      await cmd('upload', { selector, nth: input.nth, files }, state.session, { retries: 1 }),
-      'upload'
-    );
+    uploadResult = { mode: 'data-transfer', attached: await attachFilesViaDataTransfer(state.session, files) };
   } catch (e) {
-    if (/Not allowed/i.test(e.message)) {
-      const err = new Error('upload was blocked by the OpenCLI Browser Bridge (Not allowed)');
-      err.code = 'upload_not_allowed';
-      err.stageData = {
-        selector,
-        files,
-        hint: 'Confirm the OpenCLI Browser Bridge extension is connected and permitted to access local files, then retry with --resume.',
-      };
-      throw err;
+    if (e.code === 'upload_transport_too_large') {
+      // Large files cannot ride the eval argument; fall back to OpenCLI's
+      // native upload (file-chooser interception) as a best effort.
+      try {
+        uploadResult = unwrap(
+          await cmd('upload', { selector, nth: input.nth, files }, state.session, { retries: 1 }),
+          'upload'
+        );
+      } catch (nativeErr) {
+        const backendLabel = ACTIVE_BROWSER_BACKEND === 'ego' ? 'ego-browser' : 'OpenCLI Browser Bridge';
+        if (/Not allowed/i.test(nativeErr.message)) {
+          const err = new Error(`upload was blocked by the ${backendLabel} (Not allowed)`);
+          err.code = 'upload_not_allowed';
+          err.stageData = {
+            selector,
+            files,
+            hint: `Confirm ${backendLabel} is connected and permitted to access local files, then retry with --resume.`,
+          };
+          throw err;
+        }
+        const err = new Error(`could not upload large file(s) (${nativeErr.message})`);
+        err.code = 'upload_failed';
+        err.stageData = { selector, files, transport: 'opencli-native', nativeError: nativeErr.message };
+        throw err;
+      }
+    } else {
+      throw e;
     }
-    throw e;
   }
   const waitSeconds = Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS;
   const attachmentState = await waitForUploadedFileNames(state.session, files, waitSeconds).catch((e) => ({ ok: false, error: e.message }));
@@ -1877,13 +2910,32 @@ async function stageSend(state, opts) {
     retryingUnconfirmedPrior = true;
   }
   const before = await getConversationProgress(state.session).catch(() => ({}));
-  const composerLoc = await evaluate(
-    state.session,
-    `(() => { ${COMPOSER_PICK_JS} return JSON.stringify({ selector: pickComposer().selector }); })()`
-  ).catch(() => null);
-  const inputSelector = (composerLoc && composerLoc.selector) || COMPOSER_INPUT_SELECTOR_CSS;
+  // Resolve the composer precisely; the combined CSS fallback cannot be passed
+  // through OpenCLI's click (quoted attribute selectors), so retry the probe
+  // briefly while the page settles after tool/model switches.
+  let inputSelector = '';
+  for (let i = 0; i < 10 && !inputSelector; i++) {
+    const composerLoc = await evaluate(
+      state.session,
+      `(() => { ${COMPOSER_PICK_JS} return JSON.stringify({ selector: pickComposer().selector }); })()`
+    ).catch(() => null);
+    inputSelector = (composerLoc && composerLoc.selector) || '';
+    if (!inputSelector) await sleep(500);
+  }
+  if (!inputSelector) inputSelector = COMPOSER_INPUT_SELECTORS[0];
   log(`clicking input (${inputSelector})...`);
-  unwrap(await cmd('click', { selector: inputSelector }, state.session), 'click input');
+  try {
+    unwrap(await cmd('click', { selector: inputSelector }, state.session), 'click input');
+  } catch (e) {
+    // Fallback: focusing the composer inside the page works regardless of
+    // OpenCLI selector quoting; the click here is only for focus.
+    const focused = await evaluate(
+      state.session,
+      `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return false; ce.focus(); return true; })()`
+    ).catch(() => false);
+    if (!focused) throw e;
+    log('click input failed; focused composer via evaluate instead');
+  }
   await sleep(300);
   if (opts.continueMode) {
     // In continue mode, the input should be empty (previous turn was sent), but
@@ -1899,13 +2951,23 @@ async function stageSend(state, opts) {
     if (preserved && preserved.preserved) {
       log(`filling ${prompt.length} chars while preserving ${preserved.pills} inline tool pill(s)`);
     } else {
+      // Insert via execCommand in the page: OpenCLI's fill cannot carry
+      // multi-line prompt values as CLI arguments.
       log(`filling ${prompt.length} chars...`);
-      const fillRes = unwrap(await cmd('fill', { selector: inputSelector, value: prompt }, state.session), 'fill');
-      if (fillRes && fillRes.mode) log(`fill mode=${fillRes.mode}`);
+      const filled = await evaluate(
+        state.session,
+        `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return JSON.stringify({ok:false,error:'no input'}); ce.focus(); const sel = window.getSelection(); const range = document.createRange(); range.selectNodeContents(ce); sel.removeAllRanges(); sel.addRange(range); const ok = document.execCommand('insertText', false, ${JSON.stringify(prompt)}); return JSON.stringify({ok, len: (ce.innerText || '').length}); })()`
+      );
+      if (!filled || !filled.ok) {
+        const e = new Error(`send: failed to insert prompt into composer (${(filled && filled.error) || 'no result'})`);
+        e.code = 'send_fill_failed';
+        throw e;
+      }
     }
   }
   await sleep(300);
   const readyWait = uploadFiles.length ? Math.max(10, Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS) : 10;
+  const uploadNames = uploadFiles.map((file) => path.basename(file));
   const attempts = [];
   let confirmation = null;
   for (let attempt = 1; attempt <= DEFAULT_SEND_ATTEMPTS; attempt++) {
@@ -1913,7 +2975,7 @@ async function stageSend(state, opts) {
     if (!sendReady.ok) {
       const e = new Error(sendReady.uploadFailed
         ? `attachment upload failed${sendReady.uploadFailureText ? `: ${sendReady.uploadFailureText}` : ''}`
-        : `send button did not become ready within ${readyWait}s`);
+        : `send button did not become ready within ${readyWait}s${uploadFiles.length ? ' (attachment chips were required)' : ''}`);
       e.code = sendReady.uploadFailed ? 'upload_failed' : 'send_button_not_ready';
       e.stageData = sendReady;
       throw e;
@@ -1921,7 +2983,17 @@ async function stageSend(state, opts) {
     const clickSelector = sendClickSelector(sendReady);
     log(`clicking send (attempt ${attempt}/${DEFAULT_SEND_ATTEMPTS}, ${clickSelector})...`);
     const clickResult = unwrap(await cmd('click', { selector: clickSelector }, state.session), 'click send');
-    const accepted = await waitForPromptAccepted(state.session, before, prompt);
+    let accepted = await waitForPromptAccepted(state.session, before, prompt, 4000, uploadNames);
+    if (!accepted.ok) {
+      // CDP clicks are occasionally swallowed in this state while the page's
+      // own .click() on the submit button goes through — try it once before
+      // declaring the attempt failed.
+      await evaluate(
+        state.session,
+        `(() => { ${SEND_PICK_JS} const b = pickSendButton().el; if (!b) return false; b.click(); return true; })()`
+      ).catch(() => false);
+      accepted = await waitForPromptAccepted(state.session, before, prompt, DEFAULT_SEND_CONFIRM_SECONDS, uploadNames);
+    }
     attempts.push({ attempt, clickResult, sendReady, accepted });
     if (accepted.ok) {
       confirmation = accepted;
@@ -2217,7 +3289,10 @@ async function stageExtractImages(state, opts) {
     return { skipped: true, data: state.stages.extractImages.data };
   }
   const criteria = imageWaitCriteriaFromState(state, opts);
-  const maxImages = Math.max(criteria.requiredImages, Number.isFinite(opts.maxImages) ? opts.maxImages : DEFAULT_MAX_IMAGES);
+  const maxImages = Math.min(
+    DEFAULT_IMAGE_EXTENDED_MAX_COUNT,
+    Math.max(criteria.requiredImages, Number.isFinite(opts.maxImages) ? opts.maxImages : DEFAULT_MAX_IMAGES)
+  );
   const extracted = await extractLastAssistantImages(state.session, criteria.requireNewAssistant ? criteria : {}, maxImages);
   if (!extracted.images.length) {
     const e = new Error('no generated images found in the latest assistant message - re-run with --resume after generation completes');
@@ -2347,6 +3422,8 @@ function doctorBackendCheck(state, opts, daemonStatus) {
   if (backend === 'webbridge') {
     backendCheck.daemonVersion = daemonStatus && daemonStatus.version || '';
     backendCheck.extensionVersion = daemonStatus && daemonStatus.extension_version || '';
+  } else if (backend === 'ego') {
+    backendCheck.spaces = Number.isFinite(daemonStatus && daemonStatus.spaces) ? daemonStatus.spaces : 0;
   } else {
     backendCheck.tabs = Number.isFinite(daemonStatus && daemonStatus.tabs) ? daemonStatus.tabs : 0;
   }
@@ -2386,7 +3463,15 @@ async function runDoctor(state, opts, daemonStatus) {
 
   if (checks.every((check) => check.ok)) {
     try {
-      toolMenu = await openToolsMenu(state.session);
+      // Fresh tabs can render the tools menu progressively; retry until the
+      // Deep research / Web search rows actually appear.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        toolMenu = await openToolsMenu(state.session);
+        const probeItems = Array.isArray(toolMenu.items) ? toolMenu.items : [];
+        if (probeItems.some((item) => item.tool === 'deep-research') && probeItems.some((item) => item.tool === 'web-search')) break;
+        await evaluate(state.session, `(() => { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); return true; })()`).catch(() => false);
+        await sleep(600);
+      }
       const items = Array.isArray(toolMenu.items) ? toolMenu.items : [];
       const deepResearch = items.find((item) => item.tool === 'deep-research') || null;
       const webSearch = items.find((item) => item.tool === 'web-search') || null;
@@ -2585,6 +3670,14 @@ async function ensureModel(session, target, effort = DEFAULT_EFFORT, backend = D
   const normalizedBackend = normalizeBrowserBackend(backend);
   if (normalizedBackend === 'opencli') {
     return ensureModelOpencli(session, target, effort);
+  }
+  if (normalizedBackend === 'ego') {
+    const egoResult = await ensureModelEgo(session, target, effort).catch((e) => ({ ok: false, changed: false, error: e.message, code: e.code || 'ego_failed' }));
+    if (egoResult.ok) return egoResult;
+    log(`ensure-model: ego flow failed (${String(egoResult.error || '').slice(0, 160)}); retrying with the Kimi WebBridge DOM flow`);
+    const webbridgeResult = await ensureModelWebbridge(session, target, effort);
+    if (webbridgeResult.ok) return webbridgeResult;
+    return { ...webbridgeResult, error: webbridgeResult.error || egoResult.error };
   }
   return ensureModelWebbridge(session, target, effort);
 }
@@ -4310,7 +5403,7 @@ const RESEARCH_SUBCOMMANDS = new Set(['research', 'deep-research', 'deep-search'
 const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'extract-files', 'latest', 'doctor', 'status', 'cleanup'];
 
 function printHelp() {
-  process.stdout.write(`search.js - drive ChatGPT Pro via OpenCLI (stateful, resumable)
+  process.stdout.write(`search.js - drive ChatGPT Pro via ego-browser / OpenCLI / Kimi (stateful, resumable)
 
 Usage:
   search.js [global-flags] [SUBCOMMAND] [args...]
@@ -4324,7 +5417,7 @@ Sub-commands:
   image [prompt...]    Generate image(s) in ChatGPT and save them locally
   open                 Open a ChatGPT tab (or reuse an existing one)
   login-check          Detect whether ChatGPT is logged in
-  ensure-model [tgt]   Verify / switch model. tgt: pro|极高|high|medium|instant
+  ensure-model [tgt]   Verify / switch model. tgt: gpt-6-pro|pro|极高|high|medium|instant
   ensure-tool [tgt]    Verify / switch ChatGPT tool. tgt: auto|none|deep-research|web-search|create-image
   upload               Upload --upload file(s) into the composer
   send [prompt...]     Fill the input and click send
@@ -4334,7 +5427,8 @@ Sub-commands:
   extract-files        Save files created in the conversation
   latest               Recover this --session, wait for the latest complete reply,
                        save it, print it, and close the tab unless --keep-session
-  doctor               Verify OpenCLI, ChatGPT login, and research tool selectors
+  doctor               Verify the browser backend (ego/opencli), ChatGPT login,
+                       and research tool selectors
                        (closes the tab on success unless --keep-session)
   status               Print session state and exit
   cleanup              Close the session tab
@@ -4342,12 +5436,15 @@ Sub-commands:
 Global flags (can appear before or after the subcommand):
   -s, --session NAME   Session name (default: gpt-pro-<timestamp>)
   -o, --output PATH    Output file (default: ./gpt-pro-response-<ts>.md)
-  -m, --model NAME     Target model: pro|极高|high|medium|instant
-                       (default: pro; image defaults to strict Pro)
+  -m, --model NAME     Target model: gpt-6-pro|pro|极高|high|medium|instant
+                       (default: gpt-6-pro; image defaults to GPT-6 Pro with
+                       Power set to Extra High)
                        legacy aliases extended/extended-pro also map to pro
       --effort NAME    Thinking slider: medium|high|extra-high (default: extra-high)
       --browser-backend NAME
-                       Model driver: opencli (default) or webbridge (compatibility)
+                       Model driver: auto (default; resolves to ego-browser,
+                       then opencli, then webbridge), ego, opencli, or
+                       webbridge (Kimi compatibility)
       --tool NAME      Target ChatGPT tool: auto|none|deep-research|deep-search|web-search|create-image
       --deep-research  Select ChatGPT's Deep research tool before sending
       --deep-search    Alias for --deep-research
@@ -4375,10 +5472,12 @@ Global flags (can appear before or after the subcommand):
       --conversation-url URL
                        Conversation URL to recover before extract-files
       --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
-      --image-count N  Total images to wait for/save from one prompt. Pro
-                       allows up to ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}; fallback/non-Pro
-                       models allow ${DEFAULT_IMAGE_FALLBACK_COUNT}. Include the same count in
-                       the prompt text; default: ${DEFAULT_IMAGE_COUNT}
+      --image-count N  Images to wait for from ONE prompt (optional; up to
+                       ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}). Without it the run completes when
+                       generation stops and every generated image is saved.
+                       Adjust the PROMPT text itself to request multiple
+                       images, e.g. "Create exactly 6 separate icons".
+                       Image mode auto-selects the Create image tool
       --image-concurrency N
                        Legacy no-op; Pro multi-image runs stay in one prompt
       --allow-image-model-fallback
@@ -4661,6 +5760,10 @@ function exitRunError(e, opts, state, startTime) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   ACTIVE_BROWSER_BACKEND = normalizeBrowserBackend(opts.browserBackend);
+  if (ACTIVE_BROWSER_BACKEND === 'auto') {
+    ACTIVE_BROWSER_BACKEND = resolveBackendValue(opts.browserBackend);
+    log(`auto backend resolved to ${ACTIVE_BROWSER_BACKEND}`);
+  }
   if (RESEARCH_SUBCOMMANDS.has(opts.subcommand)) {
     opts.researchMode = true;
     opts.subcommand = 'run';
@@ -4673,15 +5776,26 @@ async function main() {
   if (opts.subcommand === 'image' && !opts.modelExplicit) opts.model = DEFAULT_IMAGE_MODEL;
   if (opts.model === 'auto' && !opts.modelExplicit) opts.model = DEFAULT_MODEL;
   if (!opts.effort) opts.effort = DEFAULT_EFFORT;
-  if (opts.imageMode) opts.originalImageCount = imageCountFromOpts(opts);
   opts.tool = normalizeToolName(opts.tool);
+  // Image runs drive ChatGPT's Create image tool unless a tool was requested.
+  if (opts.imageMode && !opts.toolExplicit) opts.tool = 'create-image';
   if (opts.tool === 'deep-research' && !opts.waitExplicit) opts.wait = DEFAULT_DEEP_RESEARCH_WAIT_SECONDS;
   if (opts.help) { printHelp(); return; }
   if (opts.verbose) log('opts:', JSON.stringify({ ...opts, subcommandArgs: '[redacted]' }));
 
   log(`${ACTIVE_BROWSER_BACKEND} health check...`);
   let daemonStatus = { backend: ACTIVE_BROWSER_BACKEND };
-  if (ACTIVE_BROWSER_BACKEND === 'webbridge') {
+  if (ACTIVE_BROWSER_BACKEND === 'ego') {
+    try {
+      const bin = resolveEgoBin();
+      if (!bin) throw new Error('ego-browser is not installed; set EGO_BROWSER_BIN or install ego lite');
+      const connection = await verifyEgoConnection();
+      daemonStatus = { ...daemonStatus, ...connection };
+      log(`ego browser backend ready (${bin})`);
+    } catch (e) {
+      die(1, `ego browser health check failed: ${e.message}`, { hint: e.hint || 'install ego lite (see the ego-browser skill references/install.md) or pass --browser-backend opencli' });
+    }
+  } else if (ACTIVE_BROWSER_BACKEND === 'webbridge') {
     try {
       daemonStatus = await healthCheck();
     } catch (e) {
@@ -4722,7 +5836,7 @@ async function main() {
       conversationUrl: opts.conversationUrl,
       model: normalizeModelName(opts.model),
       effort: normalizeEffort(opts.effort),
-      browserBackend: normalizeBrowserBackend(opts.browserBackend),
+      browserBackend: ACTIVE_BROWSER_BACKEND,
       tool: opts.tool,
     });
   }
@@ -4734,15 +5848,19 @@ async function main() {
     state.model = DEFAULT_MODEL;
     clearStage(state, 'ensureModel');
   }
-  if (!state.effort) state.effort = state.model === 'pro' ? 'pro' : DEFAULT_EFFORT;
+  if (!state.effort) state.effort = DEFAULT_EFFORT;
   state.effort = normalizeEffort(state.effort);
-  const requestedBrowserBackend = opts.browserBackendExplicit
-    ? normalizeBrowserBackend(opts.browserBackend)
-    : DEFAULT_BROWSER_BACKEND;
+  // A session keeps the backend it was created with unless --browser-backend
+  // is passed explicitly: that keeps --resume stable while `auto` resolves new
+  // sessions to the best backend available in the environment.
+  let requestedBrowserBackend = opts.browserBackendExplicit
+    ? resolveBackendValue(opts.browserBackend)
+    : (state.browserBackend ? normalizeBrowserBackend(state.browserBackend) : ACTIVE_BROWSER_BACKEND);
+  if (requestedBrowserBackend === 'auto') requestedBrowserBackend = resolveBackendValue(state.browserBackend || opts.browserBackend);
   if (normalizeBrowserBackend(state.browserBackend) !== requestedBrowserBackend) {
     state.browserBackend = requestedBrowserBackend;
     for (const stageName of STAGE_NAMES) clearStage(state, stageName);
-    log(`migrated session browser backend to ${requestedBrowserBackend}; cleared browser stages for a fresh OpenCLI session`);
+    log(`migrated session browser backend to ${requestedBrowserBackend}; cleared browser stages for a fresh ${requestedBrowserBackend} session`);
   } else {
     state.browserBackend = requestedBrowserBackend;
   }
@@ -4790,6 +5908,18 @@ async function main() {
     clearStage(state, 'ensureTool');
   }
   if (opts.toolExplicit) {
+    const nextTool = normalizeToolName(opts.tool);
+    if (normalizeToolName(state.tool) !== nextTool) {
+      clearStage(state, 'ensureTool');
+      clearStage(state, 'send');
+      clearStage(state, 'wait');
+      clearStage(state, 'extract');
+      clearStage(state, 'extractImages');
+      clearStage(state, 'extractFiles');
+    }
+    state.tool = nextTool;
+  }
+  if (opts.imageMode) {
     const nextTool = normalizeToolName(opts.tool);
     if (normalizeToolName(state.tool) !== nextTool) {
       clearStage(state, 'ensureTool');
