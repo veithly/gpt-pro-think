@@ -134,3 +134,51 @@ test('a turn with expected files only counts as sent when the user turn carries 
   // Without uploads there is no attachment requirement.
   assert.equal(logic.promptSendWasAccepted(before, { userCount: 3, messageCount: 5, busy: false }, composer), true);
 });
+
+test('send escalation ladder recovers when the trusted send click is swallowed', async () => {
+  const searchPath = path.join(projectRoot, 'search.js');
+  const source = fs.readFileSync(searchPath, 'utf8').replace(
+    /\nmain\(\)\.catch\(\(e\) => \{[\s\S]*?\n\}\);\s*$/,
+    ''
+  );
+  const context = {
+    Buffer,
+    URL,
+    __dirname: projectRoot,
+    __filename: searchPath,
+    clearTimeout,
+    console,
+    module: { exports: {} },
+    process,
+    require,
+    setTimeout,
+  };
+  context.exports = context.module.exports;
+  context.globalThis = context;
+  const overrides = `
+;const __mockEval = async (session, code) => {
+  if (code.includes("pickSendButton")) return true;
+  if (code.includes("return true; })()") && code.includes("ce.focus")) return true;
+  if (code.includes("insertText")) return { ok: true, len: 26 };
+  if (code.includes("len: ce ?")) return { len: 26 };
+  return { ok: true };
+};
+evaluate = __mockEval;
+cmd = async (action, args) => ({ ok: true, data: true });
+let __confirms = 0;
+waitForPromptAccepted = async (session, before, prompt) => { __confirms += 1; return { ok: __confirms >= 2, promptLength: prompt.length }; };
+waitForSendButtonReady = async () => ({ ok: true, buttonSelector: "[data-testid=send-button]" });
+getConversationProgress = async () => ({ userCount: 1, messageCount: 2, assistantCount: 1, busy: true });
+inspectComposerUploadState = async () => ({ composerText: "x" });
+let __clicks = 0;
+globalThis.__ladderTest = { layer2Fired: () => __clicks > 0 };
+`;
+  vm.runInNewContext(`${source}\n${overrides}\nglobalThis.__ladderTest.stageSend = stageSend;`, context, { filename: searchPath });
+  const result = await context.__ladderTest.stageSend(
+    { session: 'ladder-unit', prompt: 'unit prompt value', turns: 0, stages: {}, uploads: [] },
+    { continueMode: false }
+  );
+  assert.equal(result.data.attempts.length, 1);
+  assert.equal(result.data.confirmed, true);
+  assert.equal(result.data.turn, 1);
+});

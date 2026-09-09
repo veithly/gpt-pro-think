@@ -2965,13 +2965,61 @@ async function stageSend(state, opts) {
       }
     }
   }
+  // Verify the prompt actually landed. A silently failed insert used to
+  // strand the run at the send gate with an empty composer.
+  const landed = await evaluate(
+    state.session,
+    `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; return JSON.stringify({ len: ce ? (ce.innerText || '').trim().length : -1 }); })()`
+  ).catch(() => null);
+  if (!landed || Number(landed.len) <= 0) {
+    log('fill verification: composer reads empty; re-inserting the prompt once');
+    const refilled = await evaluate(
+      state.session,
+      `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return JSON.stringify({ ok: false, error: 'no input' }); ce.focus(); const sel = window.getSelection(); const range = document.createRange(); range.selectNodeContents(ce); range.collapse(false); sel.removeAllRanges(); sel.addRange(range); const ok = document.execCommand('insertText', false, ${JSON.stringify(prompt)}); return JSON.stringify({ ok, len: (ce.innerText || '').length }); })()`
+    ).catch(() => null);
+    if (!refilled || !refilled.ok) {
+      const e = new Error('send: prompt did not land in the composer after retry');
+      e.code = 'send_fill_failed';
+      throw e;
+    }
+  }
   await sleep(300);
   const readyWait = uploadFiles.length ? Math.max(10, Number.isFinite(opts.uploadWait) ? opts.uploadWait : DEFAULT_UPLOAD_WAIT_SECONDS) : 10;
   const uploadNames = uploadFiles.map((file) => path.basename(file));
   const attempts = [];
   let confirmation = null;
+  // Wait for a user turn once, then re-check with a short window. Sending is
+  // verified by conversation state, never by click success — the trusted
+  // click can be silently swallowed by an overlay over the send button.
+  const confirmSend = (windowSeconds) => waitForPromptAccepted(state.session, before, prompt, windowSeconds, uploadNames);
   for (let attempt = 1; attempt <= DEFAULT_SEND_ATTEMPTS; attempt++) {
-    const sendReady = await waitForSendButtonReady(state.session, uploadFiles, readyWait);
+    let sendReady = await waitForSendButtonReady(state.session, uploadFiles, readyWait);
+    if (!sendReady.ok && !sendReady.uploadFailed) {
+      // Programmatic inserts can leave ProseMirror holding text while React
+      // never re-enables the button. Nudge it with a space+delete
+      // transaction, then re-check once before failing the attempt.
+      const woke = await evaluate(
+        state.session,
+        `(() => {
+          const ce = document.querySelector('#prompt-textarea[contenteditable="true"], [contenteditable="true"]');
+          if (!ce) return false;
+          const before = (ce.innerText || '').length;
+          ce.focus();
+          const sel = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(ce);
+          range.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('insertText', false, ' ');
+          document.execCommand('delete');
+          return JSON.stringify({ before, after: (ce.innerText || '').length });
+        })()`
+      ).catch(() => null);
+      log(`send gate: button not ready; composer nudge ${woke ? `(${woke.before} -> ${woke.after} chars)` : 'skipped (no composer)'}`);
+      await sleep(500);
+      sendReady = await waitForSendButtonReady(state.session, uploadFiles, 5);
+    }
     if (!sendReady.ok) {
       const e = new Error(sendReady.uploadFailed
         ? `attachment upload failed${sendReady.uploadFailureText ? `: ${sendReady.uploadFailureText}` : ''}`
@@ -2982,24 +3030,47 @@ async function stageSend(state, opts) {
     }
     const clickSelector = sendClickSelector(sendReady);
     log(`clicking send (attempt ${attempt}/${DEFAULT_SEND_ATTEMPTS}, ${clickSelector})...`);
-    const clickResult = unwrap(await cmd('click', { selector: clickSelector }, state.session), 'click send');
-    let accepted = await waitForPromptAccepted(state.session, before, prompt, 4000, uploadNames);
+    let clickError = '';
+    try {
+      unwrap(await cmd('click', { selector: clickSelector }, state.session), 'click send');
+    } catch (e) {
+      clickError = e.message;
+      log(`send trusted click failed: ${clickError}`);
+    }
+    let accepted = await confirmSend(4);
     if (!accepted.ok) {
-      // CDP clicks are occasionally swallowed in this state while the page's
-      // own .click() on the submit button goes through — try it once before
-      // declaring the attempt failed.
-      await evaluate(
+      // Layer 2: in-page native click. el.click() bypasses hit-testing, so it
+      // still lands when an invisible layer swallows real pointer events.
+      const jsClicked = await evaluate(
         state.session,
         `(() => { ${SEND_PICK_JS} const b = pickSendButton().el; if (!b) return false; b.click(); return true; })()`
       ).catch(() => false);
-      accepted = await waitForPromptAccepted(state.session, before, prompt, DEFAULT_SEND_CONFIRM_SECONDS, uploadNames);
+      log(jsClicked ? 'send: trusted click not accepted; in-page click dispatched' : 'send: in-page click unavailable');
+      accepted = await confirmSend(3);
     }
-    attempts.push({ attempt, clickResult, sendReady, accepted });
+    if (!accepted.ok) {
+      // Layer 3: Enter-key submit. With content in the composer, Enter sends
+      // the turn and bypasses the send button entirely.
+      const enterArmed = await evaluate(
+        state.session,
+        `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return false; ce.focus(); return true; })()`
+      ).catch(() => false);
+      if (enterArmed) {
+        try {
+          unwrap(await cmd('keys', { key: 'Enter' }, state.session), 'enter submit');
+          log('send: dispatched Enter key on focused composer');
+        } catch (e) {
+          log(`send: Enter submit failed: ${e.message}`);
+        }
+        accepted = await confirmSend(3);
+      }
+    }
+    attempts.push({ attempt, clickSelector, clickError, sendReady, accepted });
     if (accepted.ok) {
       confirmation = accepted;
       break;
     }
-    log('send click was not accepted by ChatGPT; waiting for readiness and retrying');
+    log('send was not accepted by ChatGPT; waiting for readiness and retrying');
   }
   if (!confirmation) {
     const e = new Error(`ChatGPT did not accept the prompt after ${DEFAULT_SEND_ATTEMPTS} send attempts`);
