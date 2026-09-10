@@ -103,9 +103,9 @@ test('buildEgoProgram embeds the request and the action body', () => {
     args: { code: '1+1' },
     space: runtime.egoSpaceName('my-session'),
   });
-  assert.match(program, /useOrCreateTaskSpace\(__req\.space\)/);
+  assert.match(program, /await taskSpace\(__req\.space\)/);
   assert.match(program, /"space":"gpt-pro-think my-session"/);
-  assert.match(program, /await js\(__req\.args\.code\)/);
+  assert.match(program, /__p\.evaluate\(__req\.args\.code\)/);
   assert.throws(() => runtime.buildEgoProgram('bogus_action', {}), /does not support daemon action/);
 });
 

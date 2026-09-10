@@ -808,60 +808,87 @@ function egoJsonLiteral(value) {
     .replace(/\u2029/g, '\\u2029');
 }
 
-// Build the one-shot ego program for a daemon action. The request travels as
-// a JS literal inside the program so neither selectors nor prompts need
-// escaping beyond JSON.
+// Build the one-shot ego program for a daemon action (ego-browser >= 0.5,
+// skill 2.0 TaskSpace/Page API). The request travels as a JS literal inside
+// the program so neither selectors nor prompts need escaping beyond JSON.
 function buildEgoProgram(action, req = {}) {
   const body = {
-    snapshot: `__ok({ tree: String(await snapshotText()) });`,
-    evaluate: `__ok({ value: await js(__req.args.code) });`,
+    snapshot: `const __p = await __page(); __ok({ tree: String(await __p.snapshot({ scope: 'full_page' })) });`,
+    evaluate: `const __p = await __page(); __ok({ value: await __p.evaluate(__req.args.code) });`,
     navigate: `
-      const CHAT_RE = /chatgpt\\.com/i;
       const url = String(__req.args.url || 'https://chatgpt.com/');
-      const tabs = (await listTabs()) || [];
-      let tab = tabs.find((t) => CHAT_RE.test(t.url || '')) || null;
+      const tabs = await __task.tabs();
+      const tab = tabs.find((t) => CHAT_RE.test(t.url || '')) || null;
       let reused = !!tab;
-      if (tab) {
-        try { await switchTab(tab.targetId); } catch (e) { /* fall through to navigation */ }
-        await gotoAndWait(url, { timeout: 45 });
-      } else {
-        tab = await openOrReuseTab(url, { wait: true, timeout: 45 });
-      }
-      __ok({ tabId: (tab && (tab.targetId || tab.id)) || '', url, reused });`,
+      let page = null;
+      if (tab && tab.label) page = __task.page(tab.label);
+      else if (tab) { try { page = await __task.adopt(tab.page); } catch (e) { page = null; } }
+      if (!page) { page = __task.page('p1'); reused = false; }
+      await page.goto(url, { timeout: 45000 });
+      __ok({ tabId: page.targetId || '', url, reused });`,
     list_tabs: `
-      const tabs = (await listTabs()) || [];
-      __ok({ tabs: tabs.map((t) => ({ tabId: t.targetId || t.id || t.tabId || '', url: t.url || '', title: t.title || '', active: !!t.active })) });`,
-    click: `await click(__req.args.selector); __ok(true);`,
-    focus: `__ok(await js('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); if (!el) return false; el.focus(); return true; })()'));`,
-    keys: `await pressKey(__req.args.key); __ok(true);`,
+      const tabs = await __task.tabs();
+      __ok({ tabs: tabs.map((t) => ({ tabId: t.targetId || '', url: t.url || '', title: t.title || '', active: !!t.active })) });`,
+    click: `const __p = await __page(); await __click(__p, __req.args.selector); __ok(true);`,
+    focus: `const __p = await __page(); await __p.focus(__req.args.selector); __ok(true);`,
+    keys: `const __p = await __page(); await __p.keyboard.press(__req.args.key); __ok(true);`,
     get_attributes: `
-      __ok(await js('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); if (!el) return null; const out = {}; const names = el.getAttributeNames ? el.getAttributeNames() : []; for (const n of names) out[n] = el.getAttribute(n); return out; })()'));`,
+      const __p = await __page();
+      __ok({ value: await __p.evaluate('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); if (!el) return null; const out = {}; const names = el.getAttributeNames ? el.getAttributeNames() : []; for (const n of names) out[n] = el.getAttribute(n); return out; })()') });`,
     get_text: `
-      __ok(await js('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); return el ? (el.innerText || el.textContent || "") : null; })()'));`,
-    fill: `await fillInput(__req.args.selector, String(__req.args.value)); __ok(true);`,
-    upload: `await uploadFile(__req.args.selector, __req.args.files); __ok(true);`,
-    close_tab: `await closeTab(__req.args.tabId); __ok(true);`,
-    close_session: `
-      const tabs = (await listTabs()) || [];
-      let closed = 0;
-      for (const t of tabs) {
-        try { await closeTab(t.targetId); closed += 1; } catch (e) { /* already gone */ }
-      }
-      __ok({ closed });`,
+      const __p = await __page();
+      __ok({ value: await __p.evaluate('(() => { const el = document.querySelector(' + JSON.stringify(__req.args.selector) + '); return el ? (el.innerText || el.textContent || "") : null; })()') });`,
+    fill: `const __p = await __page(); await __p.fill(__req.args.selector, String(__req.args.value)); __ok(true);`,
+    upload: `const __p = await __page(); await __p.setInputFiles(__req.args.selector, __req.args.files); __ok(true);`,
+    close_tab: `
+      const tabs = await __task.tabs();
+      const tab = tabs.find((t) => t.targetId === __req.args.tabId) || null;
+      if (tab && tab.label) { await __task.page(tab.label).close(); }
+      else { await __task.cdp('Target.closeTarget', { targetId: __req.args.tabId }); }
+      __ok({ closed: 1 });`,
+    close_session: `await __task.finish({ keep: [] }); __ok({ finished: true });`,
   }[action];
   if (!body) throw egoBackendError(`Ego backend does not support daemon action ${action}`, 'ego_action_unsupported');
+  // The 0.5 runtime compiles stdin as a plain vm.Script where top-level
+  // await inside a try block is rejected, so the whole program is wrapped
+  // in an async IIFE — standard semantics, and the runtime waits for it.
   return `
+(async () => {
 const __req = ${egoJsonLiteral(req)};
 let __settled = false;
-const __ok = (data) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data: data === undefined ? null : data })); };
-const __err = (e) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: (e && e.code) || 'ego_failed' })); };
+const __ok = (data) => { if (__settled) return; __settled = true; console.log(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data: data === undefined ? null : data })); };
+const __err = (e) => { if (__settled) return; __settled = true; console.log(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: (e && e.code) || 'ego_failed' })); };
 try {
-  const __task = await useOrCreateTaskSpace(__req.space);
+  const __task = await taskSpace(__req.space);
+  const CHAT_RE = /chatgpt\\.com/i;
+  // Resolve the session's ChatGPT Page: prefer the active chatgpt.com tab,
+  // adopt an unmanaged one, else fall back to the space's first Page.
+  const __page = async () => {
+    const tabs = await __task.tabs();
+    const chat = tabs.filter((t) => CHAT_RE.test(t.url || ''));
+    const tab = chat.find((t) => t.active) || chat[0] || null;
+    if (tab && tab.label) return __task.page(tab.label);
+    if (tab) { try { return await __task.adopt(tab.page); } catch (e) { /* fall through */ } }
+    return __task.page('p1');
+  };
+  // v2 selectors require exactly one match; retry wide matches at nth=0.
+  const __click = async (page, selector) => {
+    try {
+      await page.click(selector, { timeout: 5000 });
+    } catch (e) {
+      if (/matched \\d+ elements/i.test(String((e && e.message) || e))) {
+        await page.click(selector + ' >> nth=0', { timeout: 5000 });
+        return;
+      }
+      throw e;
+    }
+  };
   ${body}
 } catch (e) {
   __err(e);
 }
 if (!__settled) __err(new Error('ego adapter produced no result'));
+})();
 `;
 }
 
@@ -878,6 +905,10 @@ function runEgoProgram(program, { timeoutMs = 60000, label = 'ego' } = {}) {
       maxBuffer: EGO_MAX_BUFFER_BYTES,
     }, (err, stdout = '', stderr = '') => {
       const output = `${stdout}\n${stderr}`;
+      if (/\[ego-browser:notice\]/.test(output) && !runEgoProgram.noticeLogged) {
+        runEgoProgram.noticeLogged = true;
+        log('ego-browser: an upgrade is available; ask the user before running `ego-browser upgrade`');
+      }
       let result = null;
       try { result = parseEgoResult(output); } catch (e) { reject(e); return; }
       if (result) {
@@ -907,18 +938,17 @@ function runEgoProgram(program, { timeoutMs = 60000, label = 'ego' } = {}) {
 }
 
 async function verifyEgoConnection() {
-  const program = `
+  return runEgoProgram(`
+(async () => {
+let __settled = false;
+const __ok = (data) => { if (__settled) return; __settled = true; console.log(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data })); };
+const __err = (e) => { if (__settled) return; __settled = true; console.log(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: 'ego_failed' })); };
 try {
   const spaces = await listTaskSpaces();
   __ok({ backend: 'ego', spaces: Array.isArray(spaces) ? spaces.length : 0 });
 } catch (e) { __err(e); }
-`;
-  return runEgoProgram(`const __req = {};
-let __settled = false;
-const __ok = (data) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data })); };
-const __err = (e) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: 'ego_failed' })); };
-${program}
 if (!__settled) __err(new Error('ego adapter produced no result'));
+})();
 `, { timeoutMs: 45000, label: 'connectivity' });
 }
 
@@ -2149,37 +2179,42 @@ async function snapshotToolMenuEgo(session, { clickRowLabels = null, clickMatche
     return JSON.stringify({ items: items.slice(0, 8), picked, rawRowCount: rows.length });
   })()`;
   const program = [
+    '(async () => {',
     `const __req = ${egoJsonLiteral({ space: egoSpaceName(session), args: { clickMatchedRow, url: 'https://chatgpt.com/' } })};`,
     'let __settled = false;',
-    `const __ok = (data) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data })); };`,
-    `const __err = (e) => { if (__settled) return; __settled = true; cliLog(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: 'ego_failed' })); };`,
+    `const __ok = (data) => { if (__settled) return; __settled = true; console.log(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: true, data })); };`,
+    `const __err = (e) => { if (__settled) return; __settled = true; console.log(${JSON.stringify(EGO_RESULT_MARKER)} + JSON.stringify({ ok: false, error: String((e && e.message) || e), code: 'ego_failed' })); };`,
     'try {',
-    '  const __task = await useOrCreateTaskSpace(__req.space);',
+    '  const __task = await taskSpace(__req.space);',
     '  const args = __req.args || {};',
     '  const CHAT_RE = /chatgpt\\.com/i;',
-    '  // js() returns JSON.stringify() output as a raw string; parse it.',
-    '  const __j = async (code) => { let v = await js(code); if (typeof v === \'string\') { try { v = JSON.parse(v); } catch (e) {} } return v; };',
+    '  // page.evaluate returns JSON.stringify() output as a raw string; parse it.',
+    '  const __j = async (code) => { const page = await __page(); let v = await page.evaluate(code); if (typeof v === \'string\') { try { v = JSON.parse(v); } catch (e) {} } return v; };',
     `  const scanRows = () => __j(${JSON.stringify(rowScanner)});`,
-    '  const findTab = async () => {',
-    '    const tabs = (await listTabs()) || [];',
-    '    return tabs.find((t) => CHAT_RE.test(t.url || "")) || null;',
+    '  const __page = async () => {',
+    '    const tabs = await __task.tabs();',
+    '    const chat = tabs.filter((t) => CHAT_RE.test(t.url || ""));',
+    '    const tab = chat.find((t) => t.active) || chat[0] || null;',
+    '    if (tab && tab.label) return __task.page(tab.label);',
+    '    if (tab) { try { return await __task.adopt(tab.page); } catch (e) { /* fall through */ } }',
+    '    const page = __task.page("p1");',
+    '    await page.goto(args.url || "https://chatgpt.com/", { timeout: 45000 });',
+    '    return page;',
     '  };',
-    '  let tab = await findTab();',
-    '  if (!tab) tab = await openOrReuseTab(args.url || "https://chatgpt.com/", { wait: true, timeout: 45 });',
-    '  else { try { await switchTab(tab.targetId); } catch (e) {} }',
+    '  const page = await __page();',
     '  for (let i = 0; i < 20; i++) {',
     '    const ready = await __j(\'(() => JSON.stringify({ rs: document.readyState, plus: !!document.querySelector("[data-testid=composer-plus-btn]") }))()\');',
     '    if (ready && ready.rs === "complete" && ready.plus) break;',
-    '    await wait(0.5);',
+    '    await page.waitForTimeout(500);',
     '  }',
-    '  await wait(0.8);',
+    '  await page.waitForTimeout(800);',
     '  let snap = null;',
     '  const attempts = [];',
     '  for (let attempt = 0; attempt < 2; attempt++) {',
-    '    try { await click(\'[data-testid=composer-plus-btn]\'); } catch (e) {}',
-    '    await wait(0.5);',
+    '    try { await page.click(\'[data-testid="composer-plus-btn"]\', { timeout: 5000 }); } catch (e) {}',
+    '    await page.waitForTimeout(500);',
     '    const scanned = await scanRows();',
-    '    const expanded = await js(\'(() => { const b = document.querySelector("[data-testid=composer-plus-btn]"); return b ? b.getAttribute("aria-expanded") : "nobtn" })()\');',
+    '    const expanded = await page.evaluate(\'(() => { const b = document.querySelector("[data-testid=composer-plus-btn]"); return b ? b.getAttribute("aria-expanded") : "nobtn" })()\');',
     '    const items = (scanned && scanned.items) || [];',
     '    const picked = (scanned && scanned.picked) || null;',
     '    let rowRef = null;',
@@ -2187,19 +2222,19 @@ async function snapshotToolMenuEgo(session, { clickRowLabels = null, clickMatche
     '    let rowClickError = "";',
     '    if (args.clickMatchedRow && picked && picked.selector) {',
     '      rowRef = picked.selector;',
-    '      try { await click(rowRef); rowClicked = true; } catch (e) { rowClickError = String((e && e.message) || e); }',
+    '      try { await page.click(rowRef, { timeout: 5000 }); rowClicked = true; } catch (e) { rowClickError = String((e && e.message) || e); }',
     '    }',
     '    snap = { items, rowRef, rowClicked, rowClickError, expanded, rawRowCount: scanned && scanned.rawRowCount, pickedInfo: picked, attempts };',
     '    attempts.push({ attempt, itemCount: items.length, expanded, hadPicked: !!picked });',
     '    if (items.length >= 2 && (!args.clickMatchedRow || rowClicked)) break;',
-    '    await js(\'(() => { document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true})); return true; })()\');',
-    '    await wait(0.8);',
-    '    try { await switchTab(tab.targetId); } catch (e) {}',
-    '    await wait(1.2);',
+    '    await page.keyboard.press(\'Escape\').catch(() => {});',
+    '    await page.waitForTimeout(800);',
+    '    await page.waitForTimeout(1200);',
     '  }',
     '  __ok(snap || { items: [], rowRef: null, rowClicked: false, rowClickError: "" });',
     '} catch (e) { __err(e); }',
     'if (!__settled) __err(new Error(\'ego tools-menu adapter produced no result\'));',
+    '})();',
   ].join('\n');
   if (process.env.EGO_DEBUG_PROGRAM) fs.writeFileSync(process.env.EGO_DEBUG_PROGRAM, program);
   return runEgoProgram(program, {
