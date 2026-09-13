@@ -28,7 +28,7 @@ const STATUS_BIN = path.join(
 const DAEMON_PID_FILE = path.join(path.dirname(path.dirname(STATUS_BIN)), 'daemon.pid');
 const STATE_DIR = path.join(__dirname, 'state');
 const STATE_VERSION = 1;
-const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'ensureConnector', 'upload', 'send', 'wait', 'extract', 'extractImages', 'extractFiles'];
+const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'ensureConnector', 'branch', 'upload', 'send', 'wait', 'extract', 'extractImages', 'extractFiles'];
 const CHATGPT_HOST_RE = /^https?:\/\/(www\.)?chatgpt\.com\//;
 const DEFAULT_WAIT_SECONDS = 1200;
 const DEFAULT_DEEP_RESEARCH_WAIT_SECONDS = 3600;
@@ -54,6 +54,8 @@ const DEFAULT_UPLOAD_WAIT_SECONDS = 600;
 const DEFAULT_SEND_CONFIRM_SECONDS = 15;
 const DEFAULT_AUTO_CONTINUE_MAX = 2;
 const DEFAULT_AUTO_CONTINUE_TEXT = '继续';
+const DEFAULT_BRANCH_MAX_MESSAGES = 20;
+const DEFAULT_BRANCH_MAX_CHARS = 24000;
 const DEFAULT_SEND_ATTEMPTS = 3;
 // ChatGPT's send button has shipped builds where [data-testid="send-button"]
 // is gone but the aria-labels remain. Readiness probes and the actual click
@@ -3700,6 +3702,93 @@ async function stageExtractFiles(state, opts = {}) {
   return { skipped: false, data };
 }
 
+// Create a new conversation branch: capture the source conversation from the
+// DOM, open a fresh chat, and prime it with the transcript (+ optional
+// follow-up question). The original conversation is never modified. The
+// native "打开新分支" affordance is not automatable in current builds, so
+// this context-carrying fork is the reliable mechanism.
+async function stageBranch(state, opts) {
+  const prior = state.stages.branch;
+  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.newChat) {
+    return { skipped: true, data: prior.data };
+  }
+  const progress = await getConversationProgress(state.session).catch(() => ({}));
+  const tabUrl = progress.url || '';
+  const sourceUrl = /chatgpt\.com\/c\/[a-f0-9-]/i.test(tabUrl)
+    ? tabUrl
+    : (/\/c\//.test(state.conversationUrl || '') ? state.conversationUrl : '');
+  if (!sourceUrl) {
+    const e = new Error('branch: no source conversation - pass --conversation-url <url> (or run from a session with history)');
+    e.code = 'branch_no_source';
+    e.stageData = { sourceUrl: '' };
+    throw e;
+  }
+  if (!/chatgpt\.com\/c\//i.test(tabUrl)) {
+    await cmd('navigate', { url: sourceUrl }, state.session);
+    await waitForMessages(state.session, 15).catch(() => null);
+  }
+  const maxMessages = Math.max(1, Number.isFinite(opts.branchMaxMessages) ? opts.branchMaxMessages : DEFAULT_BRANCH_MAX_MESSAGES);
+  const maxChars = Math.max(500, Number.isFinite(opts.branchMaxChars) ? opts.branchMaxChars : DEFAULT_BRANCH_MAX_CHARS);
+  const transcript = await evaluate(
+    state.session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const cap = (t) => (t.length > 4000 ? t.slice(0, 4000) + '…[截断]' : t);
+      const items = [...document.querySelectorAll('[data-message-author-role]')]
+        .map((el) => ({ role: el.getAttribute('data-message-author-role'), text: cap(textOf(el)) }))
+        .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.text);
+      return JSON.stringify({ title: document.title.replace(/^ChatGPT\s*[-—–]\s*/i, '').trim(), messages: items.slice(-${JSON.stringify(maxMessages)}) });
+    })()`
+  ).catch(() => null);
+  const parsed = transcript && typeof transcript === 'object' ? transcript : null;
+  const messages = (parsed && parsed.messages) || [];
+  if (!messages.length) {
+    const e = new Error('branch: source conversation has no readable messages');
+    e.code = 'branch_empty_source';
+    e.stageData = { sourceUrl };
+    throw e;
+  }
+  const title = (parsed && parsed.title) || state.conversationTitle || '未命名';
+  const question = String(state.prompt || '').trim();
+  let totalChars = 0;
+  const lines = [];
+  for (const m of messages) {
+    const line = `${m.role === 'user' ? '用户' : '助手'}: ${m.text}`;
+    if (totalChars + line.length > maxChars) break;
+    totalChars += line.length;
+    lines.push(line);
+  }
+  const primerParts = [
+    `【对话分支】以下是我们此前对话《${title}》的最近记录,请把它作为你的上下文记忆,后续回答基于它继续,不要复述或总结这些内容。`,
+    '---',
+    ...lines,
+    '---',
+  ];
+  if (question) primerParts.push(`【新问题】${question}`);
+  else primerParts.push('收到后请只回复:已就绪');
+  const primer = primerParts.join('\n');
+  // Fresh chat in the same tab (single ChatGPT tab per session space).
+  await cmd('navigate', { url: 'https://chatgpt.com/' }, state.session);
+  await sleep(3000);
+  state.prompt = primer;
+  state.promptSource = 'branch-primer';
+  state.conversationUrl = '';
+  state.conversationTitle = '';
+  for (const stageName of ['send', 'wait', 'extract', 'extractImages', 'extractFiles']) clearStage(state, stageName);
+  const data = {
+    sourceUrl,
+    sourceTitle: title,
+    newChat: true,
+    primerChars: primer.length,
+    capturedMessages: messages.length,
+    capturedChars: totalChars,
+    question,
+  };
+  markStage(state, 'branch', data);
+  saveState(state);
+  return { skipped: false, data };
+}
+
 async function stageStatus(state) {
   // Read-only: print the state.
   return { skipped: true, data: state };
@@ -5746,6 +5835,7 @@ const STAGE_FNS = {
   ensureModel: stageEnsureModel,
   ensureTool: stageEnsureTool,
   ensureConnector: stageEnsureConnector,
+  branch: stageBranch,
   upload: stageUpload,
   send: stageSend,
   wait: stageWait,
@@ -5772,7 +5862,7 @@ const SUBCOMMAND_TO_STAGE = {
 // --- CLI --------------------------------------------------------------------
 
 const RESEARCH_SUBCOMMANDS = new Set(['research', 'deep-research', 'deep-search']);
-const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'upload', 'send', 'wait', 'extract', 'extract-images', 'extract-files', 'latest', 'doctor', 'status', 'cleanup'];
+const SUBCOMMANDS = ['run', 'research', 'deep-research', 'deep-search', 'image', 'branch', 'open', 'login-check', 'ensure-model', 'ensure-tool', 'ensure-connector', 'upload', 'send', 'wait', 'extract', 'extract-images', 'extract-files', 'latest', 'doctor', 'status', 'cleanup'];
 
 function printHelp() {
   process.stdout.write(`search.js - drive ChatGPT Pro via ego-browser / OpenCLI / Kimi (stateful, resumable)
@@ -5791,6 +5881,12 @@ Sub-commands:
   login-check          Detect whether ChatGPT is logged in
   ensure-model [tgt]   Verify / switch model. tgt: gpt-6-pro|pro|极高|high|medium|instant
   ensure-tool [tgt]    Verify / switch ChatGPT tool. tgt: auto|none|deep-research|web-search|create-image
+  ensure-connector     Verify / switch the connector (MCP/plugin) selected in
+                       the composer tools menu. Uses --connector <name>.
+  branch [question]    Create a new conversation branch: copies the recent
+                       history of --conversation-url (or the session's saved
+                       conversation) into a NEW chat and optionally asks
+                       question there. The source stays untouched.
   upload               Upload --upload file(s) into the composer
   send [prompt...]     Fill the input and click send
   wait                 Poll until response completes
@@ -5834,6 +5930,10 @@ Global flags (can appear before or after the subcommand):
                        was interrupted (default: up to ${DEFAULT_AUTO_CONTINUE_MAX} auto-continues)
       --auto-continue-max N
                        Max auto-continuation appends per run (default: ${DEFAULT_AUTO_CONTINUE_MAX})
+      --branch-max-messages N
+                       Branch transcript: recent messages to carry over (default: ${DEFAULT_BRANCH_MAX_MESSAGES})
+      --branch-max-chars N
+                       Branch transcript: total char cap (default: ${DEFAULT_BRANCH_MAX_CHARS})
       --continue-text TEXT
                        Text appended on interruption auto-recovery (default: ${DEFAULT_AUTO_CONTINUE_TEXT})
       --stable SEC     Assistant text must be unchanged this long (default: ${DEFAULT_STABLE_SECONDS})
@@ -6016,6 +6116,8 @@ function parseArgs(argv) {
     else if (a === '--conversation-url' || a === '--url') { opts.conversationUrl = argv[++i] || ''; }
     else if (a === '--connector') { opts.connector = argv[++i] || ''; opts.connectorExplicit = true; }
     else if (a === '--no-auto-continue') opts.autoContinue = false;
+    else if (a === '--branch-max-messages') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.branchMaxMessages = Math.max(1, n); }
+    else if (a === '--branch-max-chars') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.branchMaxChars = Math.max(500, n); }
     else if (a === '--auto-continue-max') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.autoContinueMax = Math.max(0, n); }
     else if (a === '--continue-text') opts.autoContinueText = argv[++i] || ''; 
     else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
@@ -6049,6 +6151,8 @@ function parseArgs(argv) {
         else if (k === 'min-chars') { opts.minChars = parseInt(v, 10); opts.minCharsExplicit = true; if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
         else if (k === 'stable' || k === 'stable-seconds') { opts.stableSec = parseInt(v, 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
         else if (k === 'no-auto-continue') opts.autoContinue = false;
+        else if (k === 'branch-max-messages') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.branchMaxMessages = Math.max(1, n); }
+        else if (k === 'branch-max-chars') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.branchMaxChars = Math.max(500, n); }
         else if (k === 'auto-continue-max') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.autoContinueMax = Math.max(0, n); }
         else if (k === 'continue-text') opts.autoContinueText = String(v || '');
         else if (k === 'connector') { opts.connector = String(v || ''); opts.connectorExplicit = true; }
@@ -6363,6 +6467,15 @@ async function main() {
     state.promptSource = promptInfo.source;
     saveState(state);
   }
+  // branch: the prompt is an optional follow-up question; a terse ack reply
+  // is expected when it is absent.
+  if (opts.subcommand === 'branch' && !opts.dryRun) {
+    promptInfo = await readPrompt(opts, state);
+    state.prompt = promptInfo.text;
+    state.promptSource = promptInfo.source;
+    if (!promptInfo.text && !opts.minCharsExplicit) opts.minChars = 0;
+    saveState(state);
+  }
 
   // For ensure-model subcommand, override the target if first arg given
   if (opts.subcommand === 'ensure-model' && opts.subcommandArgs.length) {
@@ -6437,6 +6550,9 @@ async function main() {
   try {
     if (opts.subcommand === 'run') {
       result = await runPipeline(state, opts);
+    } else if (opts.subcommand === 'branch') {
+      const branchPipeline = ['open', 'loginCheck', 'branch', 'send', 'wait', 'extract', 'extractFiles'];
+      result = await runPipeline(state, opts, branchPipeline);
     } else if (opts.subcommand === 'image') {
       result = await runPipeline(state, { ...opts, imageMode: true }, IMAGE_PIPELINE);
     } else if (opts.subcommand === 'latest') {
