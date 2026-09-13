@@ -39,7 +39,7 @@ function loadSearchRuntime(envOverrides = {}, fsShadow = null) {
   context.exports = context.module.exports;
   context.globalThis = context;
   vm.runInNewContext(
-    `${source}\nglobalThis.__egoTest = { normalizeBrowserBackend, resolveBackendValue, resolveEgoBin, buildEgoProgram, parseEgoResult, classifyEgoError, egoSpaceName, egoJsonLiteral, runEgoProgram };`,
+    `${source}\nglobalThis.__egoTest = { normalizeBrowserBackend, resolveBackendValue, resolveEgoBin, buildEgoProgram, parseEgoResult, classifyEgoError, egoSpaceName, egoJsonLiteral, runEgoProgram, parseArgs, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_TEXT };`,
     context,
     { filename: searchPath }
   );
@@ -164,4 +164,26 @@ test('runEgoProgram resolves result data from stderr and rejects typed errors', 
 test('egoSpaceName namespaces sessions into task spaces', () => {
   const runtime = loadSearchRuntime();
   assert.equal(runtime.egoSpaceName('gpt-pro-123'), 'gpt-pro-think gpt-pro-123');
+});
+
+test('parseArgs accepts connector and auto-continue flags in both value forms', () => {
+  const runtime = loadSearchRuntime();
+  const spaceForm = runtime.parseArgs(['--connector', 'MacMCPX', '--no-auto-continue', '--continue-text', 'go on', '--auto-continue-max', '3']);
+  assert.equal(spaceForm.connector, 'MacMCPX');
+  assert.equal(spaceForm.connectorExplicit, true);
+  assert.equal(spaceForm.autoContinue, false);
+  assert.equal(spaceForm.autoContinueText, 'go on');
+  assert.equal(spaceForm.autoContinueMax, 3);
+  const eqForm = runtime.parseArgs(['--connector=Gmail', '--auto-continue-max=1']);
+  assert.equal(eqForm.connector, 'Gmail');
+  assert.equal(eqForm.autoContinueMax, 1);
+  assert.equal(runtime.DEFAULT_AUTO_CONTINUE_MAX, 2);
+  assert.equal(runtime.DEFAULT_AUTO_CONTINUE_TEXT, '继续');
+});
+
+test('buildEgoProgram close_session finishes the task space', () => {
+  const runtime = loadSearchRuntime();
+  const program = runtime.buildEgoProgram('close_session', { action: 'close_session', args: {}, space: 'gpt-pro-think unit' });
+  assert.match(program, /finish\(\{ keep: \[\] \}\)/);
+  assert.match(program, /\(async \(\) => \{/);
 });

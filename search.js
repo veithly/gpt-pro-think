@@ -28,7 +28,7 @@ const STATUS_BIN = path.join(
 const DAEMON_PID_FILE = path.join(path.dirname(path.dirname(STATUS_BIN)), 'daemon.pid');
 const STATE_DIR = path.join(__dirname, 'state');
 const STATE_VERSION = 1;
-const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractImages', 'extractFiles'];
+const STAGE_NAMES = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'ensureConnector', 'upload', 'send', 'wait', 'extract', 'extractImages', 'extractFiles'];
 const CHATGPT_HOST_RE = /^https?:\/\/(www\.)?chatgpt\.com\//;
 const DEFAULT_WAIT_SECONDS = 1200;
 const DEFAULT_DEEP_RESEARCH_WAIT_SECONDS = 3600;
@@ -52,6 +52,8 @@ const DEFAULT_IMAGE_EFFORT = 'extra-high';
 const DEFAULT_UPLOAD_SELECTOR = 'input#upload-files[type="file"]';
 const DEFAULT_UPLOAD_WAIT_SECONDS = 600;
 const DEFAULT_SEND_CONFIRM_SECONDS = 15;
+const DEFAULT_AUTO_CONTINUE_MAX = 2;
+const DEFAULT_AUTO_CONTINUE_TEXT = '继续';
 const DEFAULT_SEND_ATTEMPTS = 3;
 // ChatGPT's send button has shipped builds where [data-testid="send-button"]
 // is gone but the aria-labels remain. Readiness probes and the actual click
@@ -612,6 +614,7 @@ function newState(session, opts) {
     effort: normalizeEffort(opts.effort || DEFAULT_EFFORT),
     browserBackend: normalizeBrowserBackend(opts.browserBackend),
     tool: normalizeToolName(opts.tool || DEFAULT_TOOL),
+    connector: String(opts.connector || ''),
     conversationUrl: opts.conversationUrl || '',
     conversationTitle: '',
     images: [],
@@ -1456,8 +1459,26 @@ async function stageOpen(state, opts) {
   const tab = await findChatgptTab(state.session);
   let data;
   if (tab) {
-    log(`open: reusing existing tab ${tab.tabId} (${tab.url})`);
-    data = { tabId: tab.tabId, url: tab.url, reused: true };
+    // A saved conversation URL must win over whatever the reused tab shows —
+    // otherwise --continue appends into the wrong conversation. Steer the
+    // existing tab to the target conversation instead of reusing blindly.
+    const wantUrl = !opts.fresh && state.conversationUrl && /\/c\//.test(state.conversationUrl)
+      ? state.conversationUrl
+      : '';
+    if (wantUrl && tab.url !== wantUrl) {
+      log(`open: steering existing tab to conversation ${wantUrl}`);
+      await cmd('navigate', { url: wantUrl }, state.session);
+      const loaded = await waitForMessages(state.session, 15).catch(() => null);
+      if (loaded && loaded.msgCount > 0) {
+        log(`open: ${loaded.msgCount} message(s) loaded from ${loaded.url}`);
+      } else {
+        log(`open: warning - conversation did not load (continuing on ${wantUrl})`);
+      }
+      data = { tabId: tab.tabId, url: wantUrl, reused: true, navigated: true };
+    } else {
+      log(`open: reusing existing tab ${tab.tabId} (${tab.url})`);
+      data = { tabId: tab.tabId, url: tab.url, reused: true };
+    }
   } else {
     // Try to recover the previous conversation if we have its URL.
     // Skip recovery if --fresh is set (start a brand new conversation).
@@ -1630,6 +1651,23 @@ async function getConversationProgress(session, imageMinAssistantIndex = null) {
         sendDisabled: sendButton ? (!!sendButton.disabled || sendButton.getAttribute('aria-disabled') === 'true') : null,
         looksLikeLogin: /Log in|Sign in|Continue with|登录|登入/.test(bodyText),
         looksRateLimited: /too many requests|please wait a moment|slow down|rate limit|请稍候|请求过多/i.test(bodyText),
+        interrupted: (() => {
+          // Interruption/failure markers live in alert banners, error-styled
+          // text, or a "continue generating" affordance — never in the
+          // assistant body (quoted text must not false-positive).
+          const visible = (el) => { const r = el.getBoundingClientRect(); const s = window.getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+          const failRe = /出了点问题|出现问题|发生了错误|出了点差错|出了些问题|无法生成|生成失败|回复中断|已停止生成|停止生成了|内容可能违反|something went wrong|an? error occurred|network error|unable to generate|generation (?:was )?(?:stopped|interrupted)/i;
+          const els = [
+            ...document.querySelectorAll('[role="alert"],[role="status"]'),
+            ...document.querySelectorAll('[class*="text-danger"],[class*="text-error"],[class*="text-token-text-error"]'),
+          ].filter(visible);
+          const texts = els.map((el) => [textOf(el), el.getAttribute('aria-label') || ''].join(' ')).filter((t) => failRe.test(t));
+          const contBtn = [...document.querySelectorAll('button,[role="button"]')].filter(visible)
+            .find((el) => /^(继续生成|Continue generating)$/i.test(textOf(el).trim()));
+          if (contBtn) texts.push('continue-generating-button');
+          const detail = [...new Set(texts.map((t) => t.slice(0, 80)))].join(' | ');
+          return detail ? detail.slice(0, 240) : false;
+        })(),
         url: location.href,
         title: document.title
       });
@@ -1972,6 +2010,135 @@ return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.vi
     })()`
   );
   return v || { selectedTool: '', selectedSource: '', selectedCount: 0, selectedTools: [], activeTools: [], menuOpen: false, radios: [] };
+}
+
+// In-page fallback for selecting a menu row by exact first-line label match:
+// opens the menu if needed, then dispatches the pointer-event sequence.
+async function clickMenuRowInPage(session, labels) {
+  const picked = await evaluate(
+    session,
+    `(async () => {
+      const wanted = ${JSON.stringify(labels || [])};
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      const visible = (el) => { const r = el.getBoundingClientRect(); const s = window.getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const firstLine = (el) => norm(String(textOf(el) || '').split('\\n').map((p) => p.trim()).find((p) => p) || '');
+      const SEL = '[role="menuitemradio"],[role="menuitem"],[tabindex="0"],div.group.__menu-item,button.__menu-item';
+      const findRow = () => [...document.querySelectorAll(SEL)]
+        .filter((el) => visible(el) && textOf(el).length < 200 && !el.closest('nav,aside'))
+        .find((el) => wanted.some((w) => norm(w) === firstLine(el)));
+      const clickEl = (el) => {
+        const r = el.getBoundingClientRect();
+        for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          el.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, clientX: r.x + 5, clientY: r.y + 5, button: 0 }));
+        }
+      };
+      let item = findRow();
+      if (!item) {
+        const btn = document.querySelector('[data-testid="composer-plus-btn"]') ||
+          document.querySelector('button[aria-label*="Add files"]') ||
+          document.querySelector('button[aria-label*="添加"]');
+        if (!btn) return JSON.stringify({ clicked: false, reason: 'button_not_found' });
+        clickEl(btn);
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          item = findRow();
+          if (item) break;
+        }
+      }
+      if (!item) return JSON.stringify({ clicked: false, reason: 'row_not_found' });
+      clickEl(item);
+      return JSON.stringify({ clicked: true, text: textOf(item).split('\\n')[0] });
+    })()`
+  ).catch(() => null);
+  return (picked && typeof picked === 'object') ? picked : { clicked: false };
+}
+
+// Inline selection pills render in the composer for tools/connectors picked
+// from the "Add files and more" menu (Create image, MCPs, ...).
+async function detectInlinePills(session) {
+  const v = await evaluate(
+    session,
+    `(() => {
+      const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').trim();
+      return JSON.stringify([...document.querySelectorAll('[data-inline-selection-pill]')].map((el) => textOf(el)));
+    })()`
+  ).catch(() => null);
+  return Array.isArray(v) ? v.map((t) => String(t || '')) : [];
+}
+
+async function stageEnsureConnector(state, opts) {
+  const target = String(state.connector || '').trim();
+  if (!target) {
+    return { skipped: true, data: { reason: 'no_connector_requested' } };
+  }
+  const wantsClear = normLabelText(target) === 'none';
+  const prior = state.stages.ensureConnector;
+  if (!opts.continueMode && prior && prior.done && prior.data && prior.data.target === target) {
+    return { skipped: true, data: prior.data };
+  }
+  const pills = await detectInlinePills(state.session);
+  if (wantsClear) {
+    if (pills.length) {
+      await clearInlineToolPills(state.session);
+      await sleep(400);
+    }
+    const data = { target, cleared: pills.length };
+    markStage(state, 'ensureConnector', data);
+    saveState(state);
+    return { skipped: false, data };
+  }
+  if (pills.some((pill) => normLabelText(pill).includes(normLabelText(target)))) {
+    const data = { target, selected: target, changed: false, alreadySelected: true };
+    markStage(state, 'ensureConnector', data);
+    saveState(state);
+    return { skipped: false, data };
+  }
+  // Select the connector from the composer tools menu. Its rows are the same
+  // div[tabindex=0] style as Deep research / Create image, so reuse that
+  // machinery with dynamic labels.
+  const labels = [target];
+  let picked = { clicked: false };
+  if (ACTIVE_BROWSER_BACKEND === 'ego') {
+    const snap = await snapshotToolMenuEgo(state.session, { clickRowLabels: labels, clickMatchedRow: true });
+    picked = { clicked: !!snap.rowClicked, ref: snap.rowRef, items: snap.items, error: snap.rowClickError || '' };
+  } else {
+    const snap = await snapshotToolMenu(state.session, { clickRowLabels: labels });
+    if (snap.rowRef) {
+      await runOpencli(['browser', state.session, 'click', String(snap.rowRef)], 'click connector row');
+      picked = { clicked: true, ref: snap.rowRef, items: snap.items };
+    } else {
+      picked = { clicked: false, items: snap.items };
+    }
+  }
+  if (!picked.clicked) {
+    // Fallback: in-page synthetic pointer sequence (works when the popover
+    // survives long enough to be scripted from the page itself).
+    picked = await clickMenuRowInPage(state.session, labels);
+  }
+  let verified = false;
+  for (let i = 0; i < 8 && !verified; i++) {
+    await sleep(600);
+    const now = await detectInlinePills(state.session);
+    verified = now.some((pill) => normLabelText(pill).includes(normLabelText(target)));
+  }
+  if (!verified) {
+    const menuItems = (picked.items || []).map((item) => item.text || item.tool || '').filter(Boolean);
+    const e = new Error(`could not select connector "${target}" from the tools menu${menuItems.length ? ` (menu rows: ${menuItems.join(' / ')})` : ''}. Open Add files and more, pick it manually, then re-run with --resume.`);
+    e.code = 'connector_select_failed';
+    e.stageData = { target, picked };
+    throw e;
+  }
+  const data = { target, selected: target, changed: true, ref: picked.ref || '' };
+  clearStage(state, 'send');
+  clearStage(state, 'wait');
+  clearStage(state, 'extract');
+  clearStage(state, 'extractImages');
+  clearStage(state, 'extractFiles');
+  markStage(state, 'ensureConnector', data);
+  saveState(state);
+  return { skipped: false, data };
 }
 
 async function readToolsMenu(session) {
@@ -2815,6 +2982,55 @@ async function fillComposerPreservingInlineTools(session, prompt) {
   );
 }
 
+// Append a short continuation turn (e.g. "继续") to the current conversation
+// and confirm acceptance. Used by the wait stage's auto-recovery when a reply
+// was interrupted; submit escalation mirrors stageSend's send ladder.
+async function appendTurnToConversation(session, text, uploadNames = []) {
+  const before = await getConversationProgress(session).catch(() => ({}));
+  const focused = await evaluate(
+    session,
+    `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return false; ce.focus(); return true; })()`
+  ).catch(() => false);
+  if (!focused) return { ok: false, error: 'composer not found' };
+  const inserted = await evaluate(
+    session,
+    `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return false; const s = window.getSelection(); const r = document.createRange(); r.selectNodeContents(ce); r.collapse(false); s.removeAllRanges(); s.addRange(r); return document.execCommand('insertText', false, ${JSON.stringify(text)}); })()`
+  ).catch(() => false);
+  if (!inserted) return { ok: false, error: 'insert failed' };
+  await sleep(400);
+  let lastError = '';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let sendReady = null;
+    try {
+      sendReady = await waitForSendButtonReady(session, [], 10);
+      if (!sendReady.ok) return { ok: false, error: 'send button not ready' };
+      unwrap(await cmd('click', { selector: sendClickSelector(sendReady) }, session), 'click send');
+    } catch (e) {
+      lastError = e.message;
+    }
+    let accepted = await waitForPromptAccepted(session, before, text, 4000, uploadNames);
+    if (!accepted.ok) {
+      await evaluate(
+        session,
+        `(() => { ${SEND_PICK_JS} const b = pickSendButton().el; if (!b) return false; b.click(); return true; })()`
+      ).catch(() => false);
+      accepted = await waitForPromptAccepted(session, before, text, 3000, uploadNames);
+    }
+    if (!accepted.ok) {
+      const enterArmed = await evaluate(
+        session,
+        `(() => { ${COMPOSER_PICK_JS} const ce = pickComposer().el; if (!ce) return false; ce.focus(); return true; })()`
+      ).catch(() => false);
+      if (enterArmed) {
+        try { unwrap(await cmd('keys', { key: 'Enter' }, session), 'enter submit'); } catch (e) { lastError = e.message; }
+        accepted = await waitForPromptAccepted(session, before, text, 3000, uploadNames);
+      }
+    }
+    if (accepted.ok) return { ok: true, attempts: attempt };
+  }
+  return { ok: false, error: 'continuation turn not accepted' + (lastError ? ` (${lastError})` : '') };
+}
+
 async function stageUpload(state, opts) {
   const files = uploadFilesForState(state);
   if (!files.length) {
@@ -3278,6 +3494,9 @@ async function stageWait(state, opts) {
     intervalSec: interval,
     refreshSec,
     ...criteria,
+    autoContinue: opts.autoContinue !== false,
+    autoContinueMax: opts.autoContinueMax,
+    autoContinueText: opts.autoContinueText,
     onProgress: recordWaitProgress,
   });
   log(`wait result: ${result.status} (${result.elapsed}s)`);
@@ -3291,8 +3510,17 @@ async function stageWait(state, opts) {
     minChars: criteria.minChars,
     stableSec: criteria.stableSec,
     assistantBefore: criteria.assistantBefore,
+    autoContinues: result.autoContinues || 0,
+    interrupted: result.interrupted || false,
     last: result.last,
   };
+  if (result.status === 'interrupted') {
+    recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
+    const e = new Error(`generation is interrupted and auto-continue attempts are exhausted (${result.interrupted || 'interruption marker'}); the partial reply stays in the conversation - append a follow-up with --continue "继续" or re-run with --resume --until-complete`);
+    e.code = 'generation_interrupted';
+    e.stageData = data;
+    throw e;
+  }
   if (result.status === 'login_required') {
     recordWaitProgress({ status: result.status, elapsed: result.elapsed, last: result.last });
     const e = new Error('login wall appeared during generation - log in then re-run');
@@ -4735,6 +4963,10 @@ async function waitForCompletion(session, config) {
   let stableSince = Date.now();
   let lastPage = null;
   let lastRefreshAt = 0;
+  let autoLeft = config.autoContinue === false
+    ? 0
+    : Math.max(0, Number.isFinite(config.autoContinueMax) ? config.autoContinueMax : DEFAULT_AUTO_CONTINUE_MAX);
+  let autoContinues = 0;
   while (true) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
     const page = await getConversationProgress(session);
@@ -4782,6 +5014,37 @@ async function waitForCompletion(session, config) {
       return { status: 'rate_limited', elapsed };
     }
 
+    // Interruption/failure recovery: when the page shows an error banner or a
+    // continue affordance and generation has settled, append a continuation
+    // turn ("继续") in the same conversation instead of failing the run.
+    if (page.interrupted && !generating && stableFor >= 5) {
+      if (autoLeft > 0) {
+        log(`wait: interruption detected (${String(page.interrupted).slice(0, 100)}); appending continuation turn (${autoLeft} left)`);
+        const appended = await appendTurnToConversation(session, config.autoContinueText || DEFAULT_AUTO_CONTINUE_TEXT);
+        if (appended.ok) {
+          autoLeft -= 1;
+          autoContinues += 1;
+          criteria.requireNewAssistant = true;
+          criteria.assistantBefore = page.assistantCount || 0;
+          prevSig = '';
+          stableSince = Date.now();
+          await sleep(4000);
+          continue;
+        }
+        log(`wait: auto-continue append failed: ${appended.error}`);
+      } else {
+        return {
+          status: 'interrupted',
+          elapsed,
+          length: text.length,
+          assistantCount: page.assistantCount || 0,
+          interrupted: page.interrupted,
+          autoContinues,
+          url: page.url || '',
+        };
+      }
+    }
+
     if (substantive && !generating && stableFor >= criteria.stableSec) {
       return {
         status: 'complete',
@@ -4790,6 +5053,7 @@ async function waitForCompletion(session, config) {
         assistantCount: page.assistantCount || 0,
         stableFor,
         minChars: criteria.minChars,
+        autoContinues,
         url: page.url || '',
       };
     }
@@ -5443,8 +5707,8 @@ async function prepareImageGenerationPlan(state, opts) {
 
 // --- Sub-command pipeline ---------------------------------------------------
 
-const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extract', 'extractFiles'];
-const IMAGE_PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'upload', 'send', 'wait', 'extractImages', 'extractFiles'];
+const PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'ensureConnector', 'upload', 'send', 'wait', 'extract', 'extractFiles'];
+const IMAGE_PIPELINE = ['open', 'loginCheck', 'ensureModel', 'ensureTool', 'ensureConnector', 'upload', 'send', 'wait', 'extractImages', 'extractFiles'];
 
 async function runPipeline(state, opts, pipeline = PIPELINE) {
   const results = {};
@@ -5481,6 +5745,7 @@ const STAGE_FNS = {
   loginCheck: stageLoginCheck,
   ensureModel: stageEnsureModel,
   ensureTool: stageEnsureTool,
+  ensureConnector: stageEnsureConnector,
   upload: stageUpload,
   send: stageSend,
   wait: stageWait,
@@ -5491,6 +5756,7 @@ const STAGE_FNS = {
 
 // Map kebab-case subcommand names to stage function keys.
 const SUBCOMMAND_TO_STAGE = {
+  'ensure-connector': 'ensureConnector',
   open: 'open',
   'login-check': 'loginCheck',
   'ensure-model': 'ensureModel',
@@ -5563,6 +5829,13 @@ Global flags (can appear before or after the subcommand):
   -i, --interval SEC   Poll interval (default: ${DEFAULT_INTERVAL_SECONDS})
       --refresh SEC    Refresh the same ChatGPT tab during wait (default: ${DEFAULT_WAIT_REFRESH_SECONDS}; 0 disables)
       --min-chars N    Min assistant chars before "complete" (default: ${DEFAULT_MIN_RESPONSE_CHARS}; use 0 for terse answers)
+      --no-auto-continue
+                       Do not auto-append a continuation turn when the reply
+                       was interrupted (default: up to ${DEFAULT_AUTO_CONTINUE_MAX} auto-continues)
+      --auto-continue-max N
+                       Max auto-continuation appends per run (default: ${DEFAULT_AUTO_CONTINUE_MAX})
+      --continue-text TEXT
+                       Text appended on interruption auto-recovery (default: ${DEFAULT_AUTO_CONTINUE_TEXT})
       --stable SEC     Assistant text must be unchanged this long (default: ${DEFAULT_STABLE_SECONDS})
       --upload PATH    Upload a local file before sending (repeatable)
       --upload-selector CSS
@@ -5576,7 +5849,9 @@ Global flags (can appear before or after the subcommand):
       --all-files      Extract file buttons from all loaded assistant messages
       --max-files N    Max files to extract (default: ${DEFAULT_MAX_FILES})
       --conversation-url URL
-                       Conversation URL to recover before extract-files
+                       Conversation URL to recover before extract-files; with
+                       --continue, enter THAT conversation and send the prompt
+                       as a follow-up question
       --image-prefix P Filename prefix for saved images (default: gpt-image-<createdAt>)
       --image-count N  Images to wait for from ONE prompt (optional; up to
                        ${DEFAULT_IMAGE_EXTENDED_MAX_COUNT}). Without it the run completes when
@@ -5739,6 +6014,10 @@ function parseArgs(argv) {
     else if (a === '--image-prefix') { opts.imagePrefix = argv[++i] || ''; }
     else if (a === '--file-dir') { opts.fileDir = argv[++i] || DEFAULT_FILE_DIR; }
     else if (a === '--conversation-url' || a === '--url') { opts.conversationUrl = argv[++i] || ''; }
+    else if (a === '--connector') { opts.connector = argv[++i] || ''; opts.connectorExplicit = true; }
+    else if (a === '--no-auto-continue') opts.autoContinue = false;
+    else if (a === '--auto-continue-max') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.autoContinueMax = Math.max(0, n); }
+    else if (a === '--continue-text') opts.autoContinueText = argv[++i] || ''; 
     else if (a === '--image-count' || a === '--images') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageCount = n; }
     else if (a === '--image-concurrency') { const n = parseInt(argv[++i], 10); if (Number.isFinite(n)) opts.imageConcurrency = n; }
     else if (a === '--allow-image-model-fallback') opts.imageModelFallback = true;
@@ -5769,6 +6048,10 @@ function parseArgs(argv) {
         else if (k === 'refresh' || k === 'refresh-seconds') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.refreshSec = n; }
         else if (k === 'min-chars') { opts.minChars = parseInt(v, 10); opts.minCharsExplicit = true; if (!Number.isFinite(opts.minChars)) opts.minChars = DEFAULT_MIN_RESPONSE_CHARS; }
         else if (k === 'stable' || k === 'stable-seconds') { opts.stableSec = parseInt(v, 10); if (!Number.isFinite(opts.stableSec)) opts.stableSec = DEFAULT_STABLE_SECONDS; }
+        else if (k === 'no-auto-continue') opts.autoContinue = false;
+        else if (k === 'auto-continue-max') { const n = parseInt(v, 10); if (Number.isFinite(n)) opts.autoContinueMax = Math.max(0, n); }
+        else if (k === 'continue-text') opts.autoContinueText = String(v || '');
+        else if (k === 'connector') { opts.connector = String(v || ''); opts.connectorExplicit = true; }
         else if (k === 'image') opts.imageMode = !/^(0|false|no)$/i.test(v);
         else if (k === 'image-dir') opts.imageDir = v;
         else if (k === 'image-prefix') opts.imagePrefix = v;
@@ -5944,6 +6227,7 @@ async function main() {
       effort: normalizeEffort(opts.effort),
       browserBackend: ACTIVE_BROWSER_BACKEND,
       tool: opts.tool,
+      connector: opts.connector || '',
     });
   }
   if (state.model) state.model = normalizeModelName(state.model);
@@ -6024,6 +6308,20 @@ async function main() {
       clearStage(state, 'extractFiles');
     }
     state.tool = nextTool;
+  }
+  if (opts.connectorExplicit) {
+    const nextConnector = String(opts.connector || '').trim();
+    if (String(state.connector || '').trim() !== nextConnector) {
+      state.connector = nextConnector;
+      clearStage(state, 'ensureConnector');
+      clearStage(state, 'send');
+      clearStage(state, 'wait');
+      clearStage(state, 'extract');
+      clearStage(state, 'extractImages');
+      clearStage(state, 'extractFiles');
+    } else {
+      state.connector = nextConnector;
+    }
   }
   if (opts.imageMode) {
     const nextTool = normalizeToolName(opts.tool);
